@@ -1,14 +1,14 @@
 [project]
-name = "template-rust-project"
+name = "disvm-rs"
 version = "0.1.0"
-description = "Python environment for the template-rust-project"
+description = "The Python environment for the DisVM-RS project."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [
-    { name = "Hassan Abedi", email = "hassan.abedi.t+rust@gmail.com" }
+    { name = "Hassan Abedi", email = "hassan.abedi.t+disvm@gmail.com" }
 ]
 maintainers = [
-    { name = "Hassan Abedi", email = "hassan.abedi.t+rust@gmail.com" }
+    { name = "Hassan Abedi", email = "hassan.abedi.t+disvm@gmail.com" }
 ]
 
 requires-python = ">=3.10,<4.0"

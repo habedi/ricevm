@@ -1,0 +1,11 @@
+[package]
+name = "rice-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Core crate for Rice"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true

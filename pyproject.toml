@@ -1,7 +1,7 @@
 [project]
-name = "disvm-rs"
+name = "rice-vm"
 version = "0.1.0"
-description = "The Python environment for the DisVM-RS project."
+description = "The Python environment for the Dis VM project."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [

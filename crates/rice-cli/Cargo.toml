@@ -1,0 +1,16 @@
+[package]
+name = "rice-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Command line interface for Rice"
+
+[dependencies]
+rice_core.workspace = true
+rice_loader.workspace = true
+rice_execute.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

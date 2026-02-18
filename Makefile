@@ -1,13 +1,5 @@
-# Load environment variables from .env file
-ifneq (,$(wildcard ./.env))
-    include .env
-    export $(shell sed 's/=.*//' .env)
-else
-    $(warning .env file not found. Environment variables not loaded.)
-endif
-
 # Variables
-PROJ_REPO = github.com/habedi/template-rust-project
+PROJ_REPO = github.com/habedi/rice-vm
 BINARY_NAME := $(or $(PROJ_BINARY), $(notdir $(PROJ_REPO)))
 BINARY := target/release/$(BINARY_NAME)
 PATH := /snap/bin:$(PATH)

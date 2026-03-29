@@ -86,13 +86,35 @@ pub struct Handler {
 /// interprets them to initialize the module pointer (MP) before execution.
 #[derive(Debug, Clone)]
 pub enum DataItem {
-    Bytes { offset: Word, values: Vec<u8> },
-    Words { offset: Word, values: Vec<Word> },
-    Bigs { offset: Word, values: Vec<i64> },
-    Reals { offset: Word, values: Vec<f64> },
-    String { offset: Word, value: String },
-    Array { offset: Word, element_type: Word, length: Word },
-    SetArray { offset: Word, index: Word },
+    Bytes {
+        offset: Word,
+        values: Vec<u8>,
+    },
+    Words {
+        offset: Word,
+        values: Vec<Word>,
+    },
+    Bigs {
+        offset: Word,
+        values: Vec<i64>,
+    },
+    Reals {
+        offset: Word,
+        values: Vec<f64>,
+    },
+    String {
+        offset: Word,
+        value: String,
+    },
+    Array {
+        offset: Word,
+        element_type: Word,
+        length: Word,
+    },
+    SetArray {
+        offset: Word,
+        index: Word,
+    },
     RestoreBase,
 }
 

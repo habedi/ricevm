@@ -15,6 +15,12 @@ pub enum LoadError {
     #[error("obsolete module format (deprecated import flag)")]
     ObsoleteModule,
 
+    #[error("invalid data item type: {0:#x}")]
+    InvalidDataType(u8),
+
+    #[error("invalid address mode: {0:#x}")]
+    InvalidAddressMode(u8),
+
     #[error("{0}")]
     Other(String),
 }

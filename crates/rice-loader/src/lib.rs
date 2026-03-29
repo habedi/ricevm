@@ -3,6 +3,10 @@
 //! Parses `.dis` binary module files into the [`Module`] representation
 //! defined in `ricevm-core`.
 
+mod decode;
+mod reader;
+
+use reader::Reader;
 use ricevm_core::{LoadError, Module};
 
 /// Parse a Dis module from its binary representation.
@@ -13,9 +17,8 @@ pub fn load(data: &[u8]) -> Result<Module, LoadError> {
     if data.is_empty() {
         return Err(LoadError::UnexpectedEof { section: "header" });
     }
-    tracing::info!("Loading program of size: {} bytes", data.len());
-    // TODO: implement binary format parsing
-    Err(LoadError::Other("loader not yet implemented".to_string()))
+    let mut r = Reader::new(data);
+    decode::parse_module(&mut r)
 }
 
 #[cfg(test)]
@@ -29,9 +32,9 @@ mod tests {
     }
 
     #[test]
-    fn stub_returns_not_implemented() {
-        let data = [0u8; 4];
-        let result = load(&data);
-        assert!(result.is_err());
+    fn invalid_magic_returns_error() {
+        // 0x01 is a single-byte operand (value=1), which is not a valid magic number
+        let result = load(&[0x01]);
+        assert!(matches!(result, Err(LoadError::InvalidMagic(1))));
     }
 }

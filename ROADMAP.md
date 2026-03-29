@@ -7,10 +7,10 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 ### Module Loading
 
-- [ ] `.dis` binary format parsing (header, code, type descriptors, data, and module name)
-- [ ] Operand address decoding (immediate, indirect, and double-indirect modes)
-- [ ] Type descriptor parsing with pointer map reconstruction
-- [ ] Link and import section loading
+- [x] `.dis` binary format parsing (header, code, type descriptors, data, and module name)
+- [x] Operand address decoding (immediate, indirect, and double-indirect modes)
+- [x] Type descriptor parsing with pointer map reconstruction
+- [x] Link and import section loading
 - [ ] Module signature and runtime flag validation
 - [ ] Module resolver with configurable probing paths
 - [ ] Built-in module registration and dispatch
@@ -65,7 +65,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 - [x] Argument parsing via `clap`
 - [x] Tracing and logging setup via `tracing-subscriber`
-- [ ] `run` subcommand to execute a `.dis` module file
+- [x] `run` subcommand to execute a `.dis` module file
 - [ ] `--dis-gc` flag to enable or disable mark-and-sweep garbage collection
 - [ ] `--threads` flag to configure scheduler thread pool size
 - [ ] `--probe` flag to add module probing paths
@@ -76,9 +76,9 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Cargo workspace with modular crate structure (`rice-core`, `rice-loader`, `rice-execute`, `rice-cli`)
 - [x] CI pipeline with automated tests
 - [x] Dual license (MIT and Apache 2.0)
-- [ ] Unit tests for instruction decoding and execution
+- [x] Unit tests for instruction decoding and execution
 - [ ] Integration tests with precompiled `.dis` modules
-- [ ] Property-based tests for binary format parsing
+- [x] Property-based tests for binary format parsing
 - [ ] Fuzz testing for the module loader
 - [ ] Benchmarks against the reference C++ DisVM implementation
 

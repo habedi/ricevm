@@ -41,8 +41,6 @@ Priorities, in order:
 - `Makefile`: GNU Make wrapper around `cargo` commands (`make test`, `make build`, `make lint`, etc.).
 - `Cargo.toml`: Workspace root defining all four crate members and shared dependencies.
 - `rust-toolchain.toml`: Pinned Rust toolchain (1.92.0) with `rustfmt`, `clippy`, and `rust-analyzer`.
-- `tmp/disvm/`: Reference C++ Dis VM implementation used for cross-checking behavior.
-- `tmp/awesome-inferno/`: Curated list of Inferno OS, Limbo, and Dis resources.
 
 ## Architecture
 

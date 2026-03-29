@@ -1,5 +1,5 @@
 [project]
-name = "rice-vm"
+name = "ricevm"
 version = "0.1.0"
 description = "The Python environment for the RiceVM project"
 

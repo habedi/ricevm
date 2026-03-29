@@ -1,11 +1,22 @@
-use clap::Parser;
-use dis_core;
+use std::fs;
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(name = "ricevm", version, about = "Dis virtual machine")]
 struct Cli {
-    /// Optional name to operate on
-    name: Option<String>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Execute a .dis module file
+    Run {
+        /// Path to the .dis module file
+        path: PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -13,17 +24,13 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    tracing::info!("Starting Dis VM CLI");
-    dis_core::init();
-
-    if let Some(name) = cli.name {
-        println!("Hello, {}!", name);
-        // Simulate loading/execution flow
-        let dummy_program = [0u8; 4];
-        dis_loader::load(&dummy_program)?;
-        dis_execute::execute()?;
-    } else {
-        println!("Hello, Dis VM!");
+    match cli.command {
+        Command::Run { path } => {
+            let bytes = fs::read(&path)?;
+            let module = ricevm_loader::load(&bytes)?;
+            tracing::info!(name = %module.name, "Module loaded");
+            ricevm_execute::execute(&module)?;
+        }
     }
 
     Ok(())

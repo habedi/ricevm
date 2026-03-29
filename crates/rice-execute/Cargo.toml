@@ -1,5 +1,5 @@
 [package]
-name = "rice-execute"
+name = "ricevm-execute"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 description = "Execution engine for Rice bytecode"
 
 [dependencies]
-rice_core.workspace = true
+ricevm_core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

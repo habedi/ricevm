@@ -1,5 +1,5 @@
 [package]
-name = "rice-cli"
+name = "ricevm-cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,9 +7,9 @@ license.workspace = true
 description = "Command line interface for Rice"
 
 [dependencies]
-rice_core.workspace = true
-rice_loader.workspace = true
-rice_execute.workspace = true
+ricevm_core.workspace = true
+ricevm_loader.workspace = true
+ricevm_execute.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true

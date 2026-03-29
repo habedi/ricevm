@@ -11,13 +11,13 @@ members = [
 version = "0.1.0-alpha.1"
 edition = "2024"
 authors = ["Hassan Abedi <hassan.abedi.t@gmail.com>"]
-repository = "https://github.com/habedi/rice-vm"
+repository = "https://github.com/habedi/ricevm"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-dis_core = { path = "crates/rice-core" }
-dis_loader = { path = "crates/rice-loader" }
-dis_execute = { path = "crates/rice-execute" }
+ricevm_core = { path = "crates/rice-core", package = "ricevm-core" }
+ricevm_loader = { path = "crates/rice-loader", package = "ricevm-loader" }
+ricevm_execute = { path = "crates/rice-execute", package = "ricevm-execute" }
 anyhow = "1.0"
 thiserror = "2.0.18"
 clap = { version = "4.4", features = ["derive"] }

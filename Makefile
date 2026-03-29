@@ -1,5 +1,5 @@
 # Variables
-PROJ_REPO = github.com/habedi/rice-vm
+PROJ_REPO = github.com/habedi/ricevm
 BINARY_NAME := $(or $(PROJ_BINARY), $(notdir $(PROJ_REPO)))
 BINARY := target/release/$(BINARY_NAME)
 PATH := /snap/bin:$(PATH)

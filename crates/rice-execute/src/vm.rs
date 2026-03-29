@@ -11,15 +11,23 @@ use crate::memory;
 use crate::ops;
 use crate::sys;
 
+/// A Dis module loaded from a .dis file at runtime.
+pub(crate) struct LoadedModule {
+    pub module: ricevm_core::Module,
+    pub mp: Vec<u8>,
+}
+
 pub(crate) struct VmState<'m> {
     pub module: &'m Module,
     pub mp: Vec<u8>,
     pub frames: FrameStack,
     pub heap: Heap,
     pub modules: ModuleRegistry,
+    pub loaded_modules: Vec<LoadedModule>,
     pub pc: usize,
     pub next_pc: usize,
     pub halted: bool,
+    pub trace: bool,
 
     // Resolved operand targets for the current instruction.
     pub src: AddrTarget,
@@ -30,6 +38,9 @@ pub(crate) struct VmState<'m> {
     pub imm_src: Word,
     pub imm_mid: Word,
     pub imm_dst: Word,
+
+    // Heap array reference table for indx results.
+    pub heap_refs: Vec<(heap::HeapId, usize)>,
 }
 
 impl<'m> VmState<'m> {
@@ -50,6 +61,9 @@ impl<'m> VmState<'m> {
 
         let mut modules = ModuleRegistry::new();
         modules.register(sys::create_sys_module());
+        modules.register(crate::math::create_math_module());
+
+        let trace = std::env::var("RICEVM_TRACE").is_ok();
 
         Ok(Self {
             module,
@@ -57,15 +71,18 @@ impl<'m> VmState<'m> {
             frames,
             heap,
             modules,
+            loaded_modules: Vec::new(),
             pc: module.header.entry_pc as usize,
             next_pc: 0,
             halted: false,
+            trace,
             src: AddrTarget::None,
             mid: AddrTarget::None,
             dst: AddrTarget::None,
             imm_src: 0,
             imm_mid: 0,
             imm_dst: 0,
+            heap_refs: Vec::new(),
         })
     }
 
@@ -75,6 +92,9 @@ impl<'m> VmState<'m> {
                 return Err(ExecError::InvalidPc(self.pc as Pc));
             }
             let inst = self.module.code[self.pc].clone();
+            if self.trace {
+                self.trace_instruction(&inst);
+            }
             self.resolve_operands(&inst)?;
             self.next_pc = self.pc + 1;
             ops::dispatch(self, &inst)?;
@@ -83,23 +103,85 @@ impl<'m> VmState<'m> {
         Ok(())
     }
 
-    fn resolve_operands(&mut self, inst: &Instruction) -> Result<(), ExecError> {
+    pub(crate) fn trace_instruction(&self, inst: &Instruction) {
+        use ricevm_core::{AddressMode, MiddleMode};
+        let mut parts = Vec::new();
+        parts.push(format!("{:4}: {:?}", self.pc, inst.opcode));
+
+        if inst.source.mode != AddressMode::None {
+            parts.push(format_operand("src", &inst.source));
+        }
+        if inst.middle.mode != MiddleMode::None {
+            parts.push(format_mid("mid", &inst.middle));
+        }
+        if inst.destination.mode != AddressMode::None {
+            parts.push(format_operand("dst", &inst.destination));
+        }
+        eprintln!("{}", parts.join(" "));
+    }
+
+    pub(crate) fn resolve_operands(&mut self, inst: &Instruction) -> Result<(), ExecError> {
         let fp_base = self.frames.current_data_offset();
 
         self.imm_src = inst.source.register1;
-        self.src = address::resolve_operand(&inst.source, fp_base, &self.frames.data, &self.mp)?;
+        self.src = address::resolve_operand(
+            &inst.source,
+            fp_base,
+            &self.frames.data,
+            &self.mp,
+            &self.heap_refs,
+        )?;
 
         self.imm_mid = inst.middle.register1;
         self.mid = address::resolve_middle(&inst.middle, fp_base)?;
 
         self.imm_dst = inst.destination.register1;
-        self.dst =
-            address::resolve_operand(&inst.destination, fp_base, &self.frames.data, &self.mp)?;
+        self.dst = address::resolve_operand(
+            &inst.destination,
+            fp_base,
+            &self.frames.data,
+            &self.mp,
+            &self.heap_refs,
+        )?;
 
         Ok(())
     }
 
     // --- Value read helpers ---
+
+    /// Get a read-only copy of bytes from a heap object at the given offset.
+    pub(crate) fn heap_slice(
+        &self,
+        id: heap::HeapId,
+        offset: usize,
+        len: usize,
+    ) -> Option<Vec<u8>> {
+        let obj = self.heap.get(id)?;
+        match &obj.data {
+            heap::HeapData::Array { data, .. } | heap::HeapData::Record(data) => {
+                if offset + len <= data.len() {
+                    Some(data[offset..offset + len].to_vec())
+                } else {
+                    Some(vec![0u8; len])
+                }
+            }
+            _ => Some(vec![0u8; len]),
+        }
+    }
+
+    /// Write bytes to a heap array element.
+    fn heap_write(&mut self, id: heap::HeapId, offset: usize, bytes: &[u8]) {
+        if let Some(obj) = self.heap.get_mut(id) {
+            match &mut obj.data {
+                heap::HeapData::Array { data, .. } | heap::HeapData::Record(data) => {
+                    if offset + bytes.len() <= data.len() {
+                        data[offset..offset + bytes.len()].copy_from_slice(bytes);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 
     pub(crate) fn read_word_at(&self, target: AddrTarget, imm: Word) -> Result<Word, ExecError> {
         match target {
@@ -107,6 +189,10 @@ impl<'m> VmState<'m> {
             AddrTarget::Mp(off) => Ok(memory::read_word(&self.mp, off)),
             AddrTarget::Immediate => Ok(imm),
             AddrTarget::None => Ok(0),
+            AddrTarget::HeapArray { id, offset } => Ok(self
+                .heap_slice(id, offset, 4)
+                .map(|b| memory::read_word(&b, 0))
+                .unwrap_or(0)),
         }
     }
 
@@ -122,6 +208,12 @@ impl<'m> VmState<'m> {
             }
             AddrTarget::Immediate => Err(ExecError::Other("cannot write to immediate".to_string())),
             AddrTarget::None => Ok(()),
+            AddrTarget::HeapArray { id, offset } => {
+                let mut buf = [0u8; 4];
+                memory::write_word(&mut buf, 0, val);
+                self.heap_write(id, offset, &buf);
+                Ok(())
+            }
         }
     }
 
@@ -131,6 +223,10 @@ impl<'m> VmState<'m> {
             AddrTarget::Mp(off) => Ok(memory::read_big(&self.mp, off)),
             AddrTarget::Immediate => Ok(imm as Big),
             AddrTarget::None => Ok(0),
+            AddrTarget::HeapArray { id, offset } => Ok(self
+                .heap_slice(id, offset, 8)
+                .map(|b| memory::read_big(&b, 0))
+                .unwrap_or(0)),
         }
     }
 
@@ -146,6 +242,12 @@ impl<'m> VmState<'m> {
             }
             AddrTarget::Immediate => Err(ExecError::Other("cannot write to immediate".to_string())),
             AddrTarget::None => Ok(()),
+            AddrTarget::HeapArray { id, offset } => {
+                let mut buf = [0u8; 8];
+                memory::write_big(&mut buf, 0, val);
+                self.heap_write(id, offset, &buf);
+                Ok(())
+            }
         }
     }
 
@@ -155,6 +257,10 @@ impl<'m> VmState<'m> {
             AddrTarget::Mp(off) => Ok(memory::read_real(&self.mp, off)),
             AddrTarget::Immediate => Ok(0.0),
             AddrTarget::None => Ok(0.0),
+            AddrTarget::HeapArray { id, offset } => Ok(self
+                .heap_slice(id, offset, 8)
+                .map(|b| memory::read_real(&b, 0))
+                .unwrap_or(0.0)),
         }
     }
 
@@ -170,6 +276,12 @@ impl<'m> VmState<'m> {
             }
             AddrTarget::Immediate => Err(ExecError::Other("cannot write to immediate".to_string())),
             AddrTarget::None => Ok(()),
+            AddrTarget::HeapArray { id, offset } => {
+                let mut buf = [0u8; 8];
+                memory::write_real(&mut buf, 0, val);
+                self.heap_write(id, offset, &buf);
+                Ok(())
+            }
         }
     }
 
@@ -179,6 +291,9 @@ impl<'m> VmState<'m> {
             AddrTarget::Mp(off) => Ok(memory::read_byte(&self.mp, off)),
             AddrTarget::Immediate => Ok(imm as Byte),
             AddrTarget::None => Ok(0),
+            AddrTarget::HeapArray { id, offset } => {
+                Ok(self.heap_slice(id, offset, 1).map(|b| b[0]).unwrap_or(0))
+            }
         }
     }
 
@@ -194,6 +309,10 @@ impl<'m> VmState<'m> {
             }
             AddrTarget::Immediate => Err(ExecError::Other("cannot write to immediate".to_string())),
             AddrTarget::None => Ok(()),
+            AddrTarget::HeapArray { id, offset } => {
+                self.heap_write(id, offset, &[val]);
+                Ok(())
+            }
         }
     }
 
@@ -284,5 +403,32 @@ impl<'m> VmState<'m> {
     #[allow(dead_code)]
     pub(crate) fn write_ptr_stack(&mut self, abs_offset: usize, id: HeapId) {
         memory::write_word(&mut self.frames.data, abs_offset, id as Word);
+    }
+}
+
+fn format_operand(label: &str, op: &ricevm_core::Operand) -> String {
+    use ricevm_core::AddressMode;
+    match op.mode {
+        AddressMode::OffsetIndirectFp => format!("{label}={}(fp)", op.register1),
+        AddressMode::OffsetIndirectMp => format!("{label}={}(mp)", op.register1),
+        AddressMode::Immediate => format!("{label}=${}", op.register1),
+        AddressMode::None => String::new(),
+        AddressMode::OffsetDoubleIndirectFp => {
+            format!("{label}={}({}(fp))", op.register2, op.register1)
+        }
+        AddressMode::OffsetDoubleIndirectMp => {
+            format!("{label}={}({}(mp))", op.register2, op.register1)
+        }
+        AddressMode::Reserved1 | AddressMode::Reserved2 => format!("{label}=reserved"),
+    }
+}
+
+fn format_mid(label: &str, op: &ricevm_core::MiddleOperand) -> String {
+    use ricevm_core::MiddleMode;
+    match op.mode {
+        MiddleMode::None => String::new(),
+        MiddleMode::SmallImmediate => format!("{label}=${}", op.register1),
+        MiddleMode::SmallOffsetFp => format!("{label}={}(fp)", op.register1),
+        MiddleMode::SmallOffsetMp => format!("{label}={}(mp)", op.register1),
     }
 }

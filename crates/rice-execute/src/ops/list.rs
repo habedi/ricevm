@@ -29,6 +29,11 @@ fn cons_bytes(vm: &mut VmState<'_>, size: usize) -> Result<(), ExecError> {
             }
         }
         crate::address::AddrTarget::None => {}
+        crate::address::AddrTarget::HeapArray { id, offset } => {
+            if let Some(bytes) = vm.heap_slice(id, offset, size) {
+                head[..size].copy_from_slice(&bytes[..size]);
+            }
+        }
     }
 
     if tail_id != heap::NIL {

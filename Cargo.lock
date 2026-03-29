@@ -213,6 +213,7 @@ dependencies = [
  "anyhow",
  "libc",
  "ricevm-core",
+ "ricevm-loader",
  "thiserror",
  "tracing",
 ]

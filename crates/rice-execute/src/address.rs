@@ -7,6 +7,11 @@ use ricevm_core::{AddressMode, ExecError, MiddleMode, MiddleOperand, Operand};
 
 use crate::memory;
 
+use crate::heap::HeapId;
+
+/// Sentinel bit in a frame word indicating it's a heap array reference.
+pub(crate) const HEAP_REF_FLAG: i32 = i32::MIN; // 0x80000000
+
 /// Resolved location of an operand value.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AddrTarget {
@@ -18,6 +23,8 @@ pub(crate) enum AddrTarget {
     Immediate,
     /// No operand (unused slot).
     None,
+    /// A reference into a heap array object's data buffer.
+    HeapArray { id: HeapId, offset: usize },
 }
 
 /// Resolve a source or destination operand.
@@ -29,6 +36,7 @@ pub(crate) fn resolve_operand(
     fp_base: usize,
     stack_data: &[u8],
     mp_data: &[u8],
+    heap_refs: &[(HeapId, usize)],
 ) -> Result<AddrTarget, ExecError> {
     match op.mode {
         AddressMode::OffsetIndirectFp => Ok(AddrTarget::Frame(fp_base + op.register1 as usize)),
@@ -37,12 +45,31 @@ pub(crate) fn resolve_operand(
         AddressMode::None => Ok(AddrTarget::None),
         AddressMode::OffsetDoubleIndirectFp => {
             let base_addr = fp_base + op.register1 as usize;
-            let indirect = memory::read_word(stack_data, base_addr) as usize;
-            Ok(AddrTarget::Frame(indirect + op.register2 as usize))
+            let base_val = memory::read_word(stack_data, base_addr);
+            // Check if the base value is a heap array reference
+            if base_val & HEAP_REF_FLAG != 0 {
+                let ref_idx = (base_val & !HEAP_REF_FLAG) as usize;
+                if let Some(&(id, byte_offset)) = heap_refs.get(ref_idx) {
+                    return Ok(AddrTarget::HeapArray {
+                        id,
+                        offset: byte_offset + op.register2 as usize,
+                    });
+                }
+            }
+            Ok(AddrTarget::Frame(base_val as usize + op.register2 as usize))
         }
         AddressMode::OffsetDoubleIndirectMp => {
-            let indirect = memory::read_word(mp_data, op.register1 as usize) as usize;
-            Ok(AddrTarget::Mp(indirect + op.register2 as usize))
+            let base_val = memory::read_word(mp_data, op.register1 as usize);
+            if base_val & HEAP_REF_FLAG != 0 {
+                let ref_idx = (base_val & !HEAP_REF_FLAG) as usize;
+                if let Some(&(id, byte_offset)) = heap_refs.get(ref_idx) {
+                    return Ok(AddrTarget::HeapArray {
+                        id,
+                        offset: byte_offset + op.register2 as usize,
+                    });
+                }
+            }
+            Ok(AddrTarget::Mp(base_val as usize + op.register2 as usize))
         }
         AddressMode::Reserved1 | AddressMode::Reserved2 => {
             Err(ExecError::Other("reserved address mode".to_string()))
@@ -73,7 +100,7 @@ mod tests {
             register1: 8,
             register2: 0,
         };
-        let target = resolve_operand(&op, 16, &[], &[]).unwrap();
+        let target = resolve_operand(&op, 16, &[], &[], &[]).unwrap();
         assert!(matches!(target, AddrTarget::Frame(24)));
     }
 
@@ -84,7 +111,7 @@ mod tests {
             register1: 4,
             register2: 0,
         };
-        let target = resolve_operand(&op, 0, &[], &[]).unwrap();
+        let target = resolve_operand(&op, 0, &[], &[], &[]).unwrap();
         assert!(matches!(target, AddrTarget::Mp(4)));
     }
 
@@ -95,13 +122,13 @@ mod tests {
             register1: 42,
             register2: 0,
         };
-        let target = resolve_operand(&op, 0, &[], &[]).unwrap();
+        let target = resolve_operand(&op, 0, &[], &[], &[]).unwrap();
         assert!(matches!(target, AddrTarget::Immediate));
     }
 
     #[test]
     fn resolve_none() {
-        let target = resolve_operand(&Operand::UNUSED, 0, &[], &[]).unwrap();
+        let target = resolve_operand(&Operand::UNUSED, 0, &[], &[], &[]).unwrap();
         assert!(matches!(target, AddrTarget::None));
     }
 

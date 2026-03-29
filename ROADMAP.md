@@ -12,7 +12,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Type descriptor parsing with pointer map reconstruction
 - [x] Link and import section loading
 - [ ] Module signature and runtime flag validation
-- [ ] Module resolver with configurable probing paths
+- [x] File-based module loading (load .dis files from disk at runtime)
 - [x] Built-in module registration and dispatch
 
 ### Instruction Set
@@ -39,7 +39,6 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Control flow (`goto`, `casew`, `casec`, `casel`, `raise`, `runt`, `eclr`, `brkpt`)
 - [x] Fixed-point arithmetic (`mulx`, `divx`, `cvtxx`, `mulx0`, `divx0`, `cvtxx0`, `cvtfx`, `cvtxf`)
 - [x] Remaining conversions (`cvtrf` and `cvtfr`)
-- [x] **All 176 opcodes covered** (concurrency opcodes return stub errors until scheduler is implemented)
 
 ### Type System
 
@@ -71,10 +70,13 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 ### Built-in Modules
 
-- [x] `Sys` module (partial): `print` with format string support
-- [ ] `Sys` module: `fprint`, `open`, `read`, `write`, `seek`, `filstat`, `fd2path`, etc.
-- [ ] `Math` module (partial): basic floating point operations
-- [x] `$Sys` module type descriptors and entry points
+- [x] `Sys` module: `print`, `fprint`, `sprint`, `aprint` with format string support
+- [x] `Sys` module: `open`, `create`, `read`, `write`, `fildes`, `fd2path`, `dup` (file I/O)
+- [x] `Sys` module: `millisec`, `sleep`, `pctl`, `tokenize`, `byte2char`, `char2byte`, `utfbytes`
+- [x] Exception handler table lookup for `raise` opcode
+- [ ] `Sys` module: `seek`, `fstat`, `stat`, `bind`, `mount`, `pipe`, `dial`, etc.
+- [x] `Math` module: trig, log, exp, pow, sqrt, floor, ceil, hypot, bit conversions (66 functions)
+- [x] `$Sys` and `$Math` module type descriptors and entry points
 - [x] Extension mechanism for registering custom built-in modules
 
 ### CLI
@@ -97,7 +99,6 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [ ] Integration tests with Limbo-compiled `.dis` modules
 - [x] Property-based tests for binary format parsing
 - [ ] Fuzz testing for the module loader
-- [ ] Benchmarks against the reference C++ DisVM implementation
 
 ### Documentation
 

@@ -8,6 +8,7 @@ description = "Execution engine for Rice bytecode"
 
 [dependencies]
 ricevm_core.workspace = true
+ricevm_loader.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

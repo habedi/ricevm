@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use ricevm_core::{AddressMode, MiddleMode, Module};
 
 #[derive(Parser)]
 #[command(name = "ricevm", version, about = "Dis virtual machine")]
@@ -14,6 +15,11 @@ struct Cli {
 enum Command {
     /// Execute a .dis module file
     Run {
+        /// Path to the .dis module file
+        path: PathBuf,
+    },
+    /// Disassemble a .dis module file
+    Dis {
         /// Path to the .dis module file
         path: PathBuf,
     },
@@ -31,7 +37,166 @@ fn main() -> anyhow::Result<()> {
             tracing::info!(name = %module.name, "Module loaded");
             ricevm_execute::execute(&module)?;
         }
+        Command::Dis { path } => {
+            let bytes = fs::read(&path)?;
+            let module = ricevm_loader::load(&bytes)?;
+            disassemble(&module);
+        }
     }
 
     Ok(())
+}
+
+fn disassemble(module: &Module) {
+    println!("Module: {}", module.name);
+    println!(
+        "  magic={:#x} flags={:#x} stack_extent={} entry_pc={} entry_type={}",
+        module.header.magic,
+        module.header.runtime_flags.0,
+        module.header.stack_extent,
+        module.header.entry_pc,
+        module.header.entry_type
+    );
+    println!(
+        "  code={} types={} data={} exports={} imports={} handlers={}",
+        module.code.len(),
+        module.types.len(),
+        module.data.len(),
+        module.exports.len(),
+        module.imports.len(),
+        module.handlers.len()
+    );
+    println!();
+
+    // Type descriptors
+    if !module.types.is_empty() {
+        println!("Types:");
+        for td in &module.types {
+            println!(
+                "  [{}] size={} ptrmap={} bytes",
+                td.id,
+                td.size,
+                td.pointer_map.bytes.len()
+            );
+        }
+        println!();
+    }
+
+    // Code
+    println!("Code:");
+    for (i, inst) in module.code.iter().enumerate() {
+        let mut line = format!("  {:4}: {:?}", i, inst.opcode);
+        if inst.source.mode != AddressMode::None {
+            line.push_str(&format!(" {}", fmt_op(&inst.source)));
+        }
+        if inst.middle.mode != MiddleMode::None {
+            line.push_str(&format!(", {}", fmt_mid(&inst.middle)));
+        }
+        if inst.destination.mode != AddressMode::None {
+            line.push_str(&format!(", {}", fmt_op(&inst.destination)));
+        }
+        println!("{line}");
+    }
+    println!();
+
+    // Exports
+    if !module.exports.is_empty() {
+        println!("Exports:");
+        for e in &module.exports {
+            println!(
+                "  {} pc={} frame_type={} sig={:#x}",
+                e.name, e.pc, e.frame_type, e.signature
+            );
+        }
+        println!();
+    }
+
+    // Imports
+    for (i, imp) in module.imports.iter().enumerate() {
+        println!("Import module [{}]:", i);
+        for f in &imp.functions {
+            println!("  {} sig={:#x}", f.name, f.signature);
+        }
+        println!();
+    }
+
+    // Handlers
+    if !module.handlers.is_empty() {
+        println!("Handlers:");
+        for h in &module.handlers {
+            println!(
+                "  pc=[{}..{}) exc_offset={} type={:?}",
+                h.begin_pc, h.end_pc, h.exception_offset, h.type_descriptor
+            );
+            for c in &h.cases {
+                match &c.name {
+                    Some(name) => println!("    \"{}\" -> pc={}", name, c.pc),
+                    None => println!("    * -> pc={}", c.pc),
+                }
+            }
+        }
+        println!();
+    }
+
+    // Data
+    if !module.data.is_empty() {
+        println!("Data:");
+        for item in &module.data {
+            match item {
+                ricevm_core::DataItem::Bytes { offset, values } => {
+                    println!("  @{offset}: bytes[{}]", values.len());
+                }
+                ricevm_core::DataItem::Words { offset, values } => {
+                    println!("  @{offset}: words{values:?}");
+                }
+                ricevm_core::DataItem::Bigs { offset, values } => {
+                    println!("  @{offset}: bigs{values:?}");
+                }
+                ricevm_core::DataItem::Reals { offset, values } => {
+                    println!("  @{offset}: reals{values:?}");
+                }
+                ricevm_core::DataItem::String { offset, value } => {
+                    println!("  @{offset}: \"{value}\"");
+                }
+                ricevm_core::DataItem::Array {
+                    offset,
+                    element_type,
+                    length,
+                } => {
+                    println!("  @{offset}: array[{length}] of type {element_type}");
+                }
+                ricevm_core::DataItem::SetArray { offset, index } => {
+                    println!("  @{offset}: set_array[{index}]");
+                }
+                ricevm_core::DataItem::RestoreBase => {
+                    println!("  restore_base");
+                }
+            }
+        }
+    }
+}
+
+fn fmt_op(op: &ricevm_core::Operand) -> String {
+    match op.mode {
+        AddressMode::OffsetIndirectFp => format!("{}(fp)", op.register1),
+        AddressMode::OffsetIndirectMp => format!("{}(mp)", op.register1),
+        AddressMode::Immediate => format!("${}", op.register1),
+        AddressMode::None => "-".to_string(),
+        AddressMode::OffsetDoubleIndirectFp => {
+            format!("{}({}(fp))", op.register2, op.register1)
+        }
+        AddressMode::OffsetDoubleIndirectMp => {
+            format!("{}({}(mp))", op.register2, op.register1)
+        }
+        AddressMode::Reserved1 | AddressMode::Reserved2 => "?".to_string(),
+    }
+}
+
+fn fmt_mid(op: &ricevm_core::MiddleOperand) -> String {
+    match op.mode {
+        MiddleMode::None => "-".to_string(),
+        MiddleMode::SmallImmediate => format!("${}", op.register1),
+        MiddleMode::SmallOffsetFp => format!("{}(fp)", op.register1),
+        MiddleMode::SmallOffsetMp => format!("{}(mp)", op.register1),
+    }
 }

@@ -19,19 +19,50 @@ the [Limbo programming language](https://en.wikipedia.org/wiki/Limbo_(programmin
 
 ### Features
 
-To be added.
+- **Full instruction set**: All 176 Dis VM opcodes implemented (arithmetic, branching, control flow, string, list,
+  pointer, heap allocation, type conversions, fixed-point math, and module operations)
+- **Binary loader**: Parses `.dis` module files (header, code, type descriptors, data, exports, imports, and handlers)
+- **Heap with reference counting**: Typed records, strings, arrays, lists, and module references with automatic
+  memory management
+- **Built-in Sys module**: `print`/`fprint`/`sprint` with printf-style formatting, file I/O (`open`, `read`, `write`,
+  `create`), `tokenize`, `millisec`, `sleep`, `byte2char`, `utfbytes`, and more
+- **Exception handling**: Handler table lookup with named and wildcard exception matching
+- **Disassembler**: `ricevm dis` prints human-readable module contents
+- **Instruction tracing**: Set `RICEVM_TRACE=1` for step-by-step execution output
 
 ---
 
 ### Quickstart
 
-To be added.
+```bash
+# Build
+cargo build --release
+
+# Run a .dis module
+cargo run -p ricevm-cli -- run program.dis
+
+# Disassemble a .dis module
+cargo run -p ricevm-cli -- dis program.dis
+
+# Run with instruction tracing
+RICEVM_TRACE=1 cargo run -p ricevm-cli -- run program.dis
+```
 
 ---
 
-### Documentation
+### Architecture
 
-To be added.
+RiceVM is organized as a Cargo workspace with four crates:
+
+| Crate | Purpose |
+|---|---|
+| `ricevm-core` | Shared types: `Module`, `Opcode`, `Instruction`, `TypeDescriptor`, error types |
+| `ricevm-loader` | `.dis` binary format parser: `load(&[u8]) -> Result<Module, LoadError>` |
+| `ricevm-execute` | Execution engine: `execute(&Module) -> Result<(), ExecError>` |
+| `ricevm-cli` | CLI with `run` and `dis` subcommands |
+
+Data flows through the `Module` struct defined in `ricevm-core`. The loader produces it from bytes;
+the executor consumes it. Neither depends on the other.
 
 ---
 

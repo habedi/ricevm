@@ -22,6 +22,11 @@ pub(crate) fn op_lea(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 /// indx src, mid, dst — array index: mid = &src[dst]
 /// src = array pointer, dst = index, mid = result (address of element)
+///
+/// Stores a heap array reference in the frame slot pointed to by mid.
+/// The reference is encoded as a flagged index into VmState.heap_refs.
+/// Subsequent double-indirect addressing through this slot will resolve
+/// to the actual array element in heap memory.
 pub(crate) fn op_indx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let arr_id = vm.src_ptr()?;
     let index = vm.dst_word()? as usize;
@@ -40,15 +45,13 @@ pub(crate) fn op_indx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     "array index out of bounds: {index} >= {length}"
                 )));
             }
-            // Store a "fat pointer": heap_id in upper bits and byte offset.
-            // For simplicity, we store the array HeapId and offset separately.
-            // The mid operand gets the element's base address as an encoded value.
-            // This is a simplification: we encode (heap_id, byte_offset) as two words.
-            // For now, store the heap_id at mid and the caller uses indw/indf/indb to access.
-            let _byte_offset = index * elem_size;
-            // TODO: proper indx implementation requires richer pointer model
-            // For milestone 2, store the heap_id in mid
-            vm.write_word_at(vm.mid, arr_id as i32)?;
+            let byte_offset = index * elem_size;
+            // Store (arr_id, byte_offset) in the heap_refs table
+            let ref_idx = vm.heap_refs.len();
+            vm.heap_refs.push((arr_id, byte_offset));
+            // Write the encoded reference to the mid slot
+            let encoded = crate::address::HEAP_REF_FLAG | (ref_idx as i32);
+            vm.write_word_at(vm.mid, encoded)?;
             Ok(())
         }
         _ => Err(ExecError::ThreadFault("indx on non-array".to_string())),

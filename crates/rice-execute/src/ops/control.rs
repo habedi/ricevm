@@ -52,19 +52,59 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let path_id = vm.src_ptr()?;
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
 
-    // Look up built-in module
-    let module_id = match vm.modules.find_builtin(&path) {
-        Some(id) => id,
-        None => {
-            // Module not found: set dst to nil (like the C++ impl)
-            vm.move_ptr_to_dst(heap::NIL)?;
-            return Ok(());
-        }
-    };
+    // 1. Try built-in module first
+    if let Some(module_id) = vm.modules.find_builtin(&path) {
+        let ref_id = vm.heap.alloc(0, HeapData::ModuleRef { module_id });
+        return vm.move_ptr_to_dst(ref_id);
+    }
 
-    // Allocate a ModuleRef on the heap
-    let ref_id = vm.heap.alloc(0, HeapData::ModuleRef { module_id });
-    vm.move_ptr_to_dst(ref_id)
+    // 2. Try loading from filesystem
+    // Search paths: exact path, path + ".dis", "/dis/" + path + ".dis"
+    let candidates = vec![
+        path.clone(),
+        format!("{path}.dis"),
+        format!("/dis/{path}.dis"),
+        format!("./{path}.dis"),
+    ];
+
+    for candidate in &candidates {
+        if let Ok(bytes) = std::fs::read(candidate)
+            && let Ok(module) = ricevm_loader::load(&bytes)
+        {
+            tracing::info!(name = %module.name, path = %candidate, "Loaded module from file");
+            let mp =
+                crate::data::init_mp(module.header.data_size as usize, &module.data, &mut vm.heap);
+            let module_idx = vm.loaded_modules.len();
+            vm.loaded_modules
+                .push(crate::vm::LoadedModule { module, mp });
+            let ref_id = vm.heap.alloc(0, HeapData::LoadedModule { module_idx });
+            return vm.move_ptr_to_dst(ref_id);
+        }
+    }
+
+    // Module not found: set dst to nil
+    vm.move_ptr_to_dst(heap::NIL)
+}
+
+/// Resolved module reference: either a built-in or a loaded .dis module.
+enum ModuleKind {
+    Builtin { module_id: u32 },
+    Loaded { module_idx: usize },
+}
+
+fn resolve_module_ref(vm: &VmState<'_>, heap_id: heap::HeapId) -> Result<ModuleKind, ExecError> {
+    match vm.heap.get(heap_id) {
+        Some(obj) => match &obj.data {
+            HeapData::ModuleRef { module_id } => Ok(ModuleKind::Builtin {
+                module_id: *module_id,
+            }),
+            HeapData::LoadedModule { module_idx } => Ok(ModuleKind::Loaded {
+                module_idx: *module_idx,
+            }),
+            _ => Err(ExecError::ThreadFault("not a module ref".to_string())),
+        },
+        None => Err(ExecError::ThreadFault("nil module".to_string())),
+    }
 }
 
 /// mframe src, mid, dst — create frame for module call
@@ -73,27 +113,31 @@ pub(crate) fn op_mframe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let mod_ref_id = vm.src_ptr()?;
     let func_idx = vm.mid_word()? as u32;
 
-    let module_id = match vm.heap.get(mod_ref_id) {
-        Some(obj) => match &obj.data {
-            HeapData::ModuleRef { module_id } => *module_id,
-            _ => {
-                return Err(ExecError::ThreadFault(
-                    "mframe: not a module ref".to_string(),
-                ));
+    let frame_size = match resolve_module_ref(vm, mod_ref_id)? {
+        ModuleKind::Builtin { module_id } => vm
+            .modules
+            .get_func(module_id, func_idx)
+            .map(|f| f.frame_size)
+            .ok_or_else(|| {
+                ExecError::Other(format!(
+                    "builtin function not found: module={module_id}, func={func_idx}"
+                ))
+            })?,
+        ModuleKind::Loaded { module_idx } => {
+            // For loaded modules, get frame size from the module's export + type section
+            let loaded = &vm.loaded_modules[module_idx];
+            if (func_idx as usize) < loaded.module.exports.len() {
+                let frame_type = loaded.module.exports[func_idx as usize].frame_type as usize;
+                if frame_type < loaded.module.types.len() {
+                    loaded.module.types[frame_type].size as usize
+                } else {
+                    64 // default
+                }
+            } else {
+                64 // default
             }
-        },
-        None => return Err(ExecError::ThreadFault("mframe: nil module".to_string())),
+        }
     };
-
-    let frame_size = vm
-        .modules
-        .get_func(module_id, func_idx)
-        .map(|f| f.frame_size)
-        .ok_or_else(|| {
-            ExecError::Other(format!(
-                "builtin function not found: module={module_id}, func={func_idx}"
-            ))
-        })?;
 
     let pending_data_offset = vm.frames.alloc_pending(frame_size)?;
     vm.set_dst_word(pending_data_offset as i32)
@@ -106,40 +150,84 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let func_idx = vm.mid_word()? as u32;
     let mod_ref_id = vm.dst_ptr()?;
 
-    let module_id = match vm.heap.get(mod_ref_id) {
-        Some(obj) => match &obj.data {
-            HeapData::ModuleRef { module_id } => *module_id,
-            _ => {
-                return Err(ExecError::ThreadFault(
-                    "mcall: not a module ref".to_string(),
-                ));
-            }
-        },
-        None => return Err(ExecError::ThreadFault("mcall: nil module".to_string())),
-    };
+    let kind = resolve_module_ref(vm, mod_ref_id)?;
 
     // Activate the pending frame
     vm.frames
         .activate_pending(frame_data_offset, vm.next_pc as i32)?;
 
-    // Get and call the built-in handler
-    let handler = vm
-        .modules
-        .get_func(module_id, func_idx)
-        .map(|f| f.handler)
-        .ok_or_else(|| {
-            ExecError::Other(format!(
-                "builtin function not found: module={module_id}, func={func_idx}"
-            ))
-        })?;
+    match kind {
+        ModuleKind::Builtin { module_id } => {
+            // Call built-in handler directly
+            let handler = vm
+                .modules
+                .get_func(module_id, func_idx)
+                .map(|f| f.handler)
+                .ok_or_else(|| {
+                    ExecError::Other(format!(
+                        "builtin function not found: module={module_id}, func={func_idx}"
+                    ))
+                })?;
+            handler(vm)?;
+            // Auto-return from built-in call
+            let prev_pc = vm.frames.pop()?;
+            if prev_pc >= 0 {
+                vm.next_pc = prev_pc as usize;
+            }
+        }
+        ModuleKind::Loaded { module_idx } => {
+            // For loaded Limbo modules: we would need to switch the execution
+            // context to the loaded module's code. This requires saving the
+            // current module/mp/pc and running the loaded module's code.
+            // For now, this is a simplified implementation that doesn't support
+            // re-entrant execution across modules.
+            let entry_pc = {
+                let loaded = &vm.loaded_modules[module_idx];
+                if (func_idx as usize) < loaded.module.exports.len() {
+                    loaded.module.exports[func_idx as usize].pc as usize
+                } else {
+                    return Err(ExecError::Other(format!(
+                        "export function {func_idx} not found in loaded module"
+                    )));
+                }
+            };
 
-    handler(vm)?;
+            // Save current execution context
+            let saved_pc = vm.pc;
+            let saved_next_pc = vm.next_pc;
+            let saved_mp = std::mem::take(&mut vm.mp);
 
-    // Auto-return from built-in call
-    let prev_pc = vm.frames.pop()?;
-    if prev_pc >= 0 {
-        vm.next_pc = prev_pc as usize;
+            // Switch to loaded module's context
+            // Safety: we need to borrow the loaded module's code section
+            // This is a temporary pointer swap — the module lives in loaded_modules
+            let loaded_code_len = vm.loaded_modules[module_idx].module.code.len();
+            vm.mp = vm.loaded_modules[module_idx].mp.clone();
+            vm.pc = entry_pc;
+            vm.halted = false;
+
+            // Execute the loaded module's code until it returns
+            while !vm.halted && vm.pc < loaded_code_len {
+                let inst = vm.loaded_modules[module_idx].module.code[vm.pc].clone();
+                if vm.trace {
+                    vm.trace_instruction(&inst);
+                }
+                vm.resolve_operands(&inst)?;
+                vm.next_pc = vm.pc + 1;
+                crate::ops::dispatch(vm, &inst)?;
+                vm.pc = vm.next_pc;
+
+                // Check if we've returned (frame popped back to caller)
+                // The saved_pc in the frame header will be the return address
+            }
+
+            // Restore context
+            vm.mp = saved_mp;
+            vm.pc = saved_pc;
+            vm.next_pc = saved_next_pc;
+            vm.halted = false;
+        }
     }
+
     Ok(())
 }
 
@@ -155,29 +243,156 @@ pub(crate) fn op_goto(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// casew src, mid, dst — word case dispatch.
-/// src = value to match, dst = pointer to case table.
-/// Case table format: N pairs of (value, pc), then a default pc.
-/// For simplicity, we just read the default target from dst.
+/// casew src, dst — word case dispatch.
+/// src = value to match, dst = pointer to case table in frame/MP.
+///
+/// Case table format (words):
+///   [0]     = N (number of entries)
+///   [1..3N] = N triples of (lo, hi, target_pc) — matches if lo <= value < hi
+///   [3N+1]  = default_pc
 pub(crate) fn op_casew(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    // In the full VM, casew reads a case table from memory.
-    // For now, treat as a computed jump to the value at dst.
-    let target = vm.dst_word()?;
-    vm.next_pc = target as usize;
+    let value = vm.src_word()?;
+
+    // Read the case table from the dst location
+    let table_base = vm.dst;
+    let count = vm.read_word_at(table_base, vm.imm_dst)?;
+
+    // Helper to read the i-th word from the table
+    let read_table = |vm: &VmState<'_>, idx: usize| -> Result<i32, ExecError> {
+        match table_base {
+            crate::address::AddrTarget::Frame(off) => {
+                Ok(crate::memory::read_word(&vm.frames.data, off + idx * 4))
+            }
+            crate::address::AddrTarget::Mp(off) => {
+                Ok(crate::memory::read_word(&vm.mp, off + idx * 4))
+            }
+            _ => Ok(0),
+        }
+    };
+
+    // Default PC is after all entries
+    let default_pc = read_table(vm, 1 + count as usize * 3)?;
+    let mut target_pc = default_pc;
+
+    // Search entries
+    for i in 0..count as usize {
+        let base = 1 + i * 3;
+        let lo = read_table(vm, base)?;
+        let hi = read_table(vm, base + 1)?;
+        let pc = read_table(vm, base + 2)?;
+        if lo <= value && value < hi {
+            target_pc = pc;
+            break;
+        }
+    }
+
+    vm.next_pc = target_pc as usize;
     Ok(())
 }
 
-/// casec — string case dispatch (same stub as casew)
+/// casec src, dst — string case dispatch.
+///
+/// Same table format as casew, but lo/hi are string pointer HeapIds.
+/// Matches if value == lo, or (value > lo && value == hi).
 pub(crate) fn op_casec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let target = vm.dst_word()?;
-    vm.next_pc = target as usize;
+    let value_id = vm.src_ptr()?;
+    let value_str = vm.heap.get_string(value_id).unwrap_or("").to_string();
+
+    let table_base = vm.dst;
+    let count = vm.read_word_at(table_base, vm.imm_dst)?;
+
+    let read_table = |vm: &VmState<'_>, idx: usize| -> Result<i32, ExecError> {
+        match table_base {
+            crate::address::AddrTarget::Frame(off) => {
+                Ok(crate::memory::read_word(&vm.frames.data, off + idx * 4))
+            }
+            crate::address::AddrTarget::Mp(off) => {
+                Ok(crate::memory::read_word(&vm.mp, off + idx * 4))
+            }
+            _ => Ok(0),
+        }
+    };
+
+    let default_pc = read_table(vm, 1 + count as usize * 3)?;
+    let mut target_pc = default_pc;
+
+    for i in 0..count as usize {
+        let base = 1 + i * 3;
+        let lo_id = read_table(vm, base)? as heap::HeapId;
+        let hi_id = read_table(vm, base + 1)? as heap::HeapId;
+        let pc = read_table(vm, base + 2)?;
+
+        let lo_str = vm.heap.get_string(lo_id).unwrap_or("");
+        let cmp = value_str.as_str().cmp(lo_str);
+
+        if cmp == std::cmp::Ordering::Equal {
+            target_pc = pc;
+            break;
+        }
+        if cmp == std::cmp::Ordering::Greater {
+            let hi_str = vm.heap.get_string(hi_id).unwrap_or("");
+            if !hi_str.is_empty() && value_str.as_str() == hi_str {
+                target_pc = pc;
+                break;
+            }
+        }
+    }
+
+    vm.next_pc = target_pc as usize;
     Ok(())
 }
 
-/// casel — big case dispatch (same stub as casew)
+/// casel src, dst — big case dispatch.
+/// Same table format as casew but values are big (i64, 8 bytes each).
+/// Table entries: count(word), then N triples of (lo_big, hi_big, pc_word).
 pub(crate) fn op_casel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let target = vm.dst_word()?;
-    vm.next_pc = target as usize;
+    let value = vm.src_big()?;
+
+    let table_base = vm.dst;
+    let count = vm.read_word_at(table_base, vm.imm_dst)?;
+
+    let read_word = |vm: &VmState<'_>, byte_off: usize| -> Result<i32, ExecError> {
+        match table_base {
+            crate::address::AddrTarget::Frame(off) => {
+                Ok(crate::memory::read_word(&vm.frames.data, off + byte_off))
+            }
+            crate::address::AddrTarget::Mp(off) => {
+                Ok(crate::memory::read_word(&vm.mp, off + byte_off))
+            }
+            _ => Ok(0),
+        }
+    };
+
+    let read_big = |vm: &VmState<'_>, byte_off: usize| -> Result<i64, ExecError> {
+        match table_base {
+            crate::address::AddrTarget::Frame(off) => {
+                Ok(crate::memory::read_big(&vm.frames.data, off + byte_off))
+            }
+            crate::address::AddrTarget::Mp(off) => {
+                Ok(crate::memory::read_big(&vm.mp, off + byte_off))
+            }
+            _ => Ok(0),
+        }
+    };
+
+    // Layout: count(4 bytes), then N * (lo_big(8) + hi_big(8) + pc(4)) = 20 bytes per entry, then default_pc(4)
+    let entry_size = 20; // 8 + 8 + 4
+    let default_off = 4 + count as usize * entry_size;
+    let default_pc = read_word(vm, default_off)?;
+    let mut target_pc = default_pc;
+
+    for i in 0..count as usize {
+        let base = 4 + i * entry_size;
+        let lo = read_big(vm, base)?;
+        let hi = read_big(vm, base + 8)?;
+        let pc = read_word(vm, base + 16)?;
+        if lo <= value && value < hi {
+            target_pc = pc;
+            break;
+        }
+    }
+
+    vm.next_pc = target_pc as usize;
     Ok(())
 }
 
@@ -227,7 +442,9 @@ pub(crate) fn op_raise(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 
     // No handler found
-    Err(ExecError::ThreadFault(format!("unhandled exception: {msg}")))
+    Err(ExecError::ThreadFault(format!(
+        "unhandled exception: {msg}"
+    )))
 }
 
 /// runt src — runtime check (module type validation). Stub: no-op.

@@ -52,11 +52,7 @@ impl<'a> Reader<'a> {
             0x80 => {
                 // 2-byte: sign-extend from bit 5 of first byte, then shift and combine
                 let b2 = self.read_byte(section)? as i32;
-                let high = if b & 0x20 != 0 {
-                    b | !0x3F
-                } else {
-                    b & 0x3F
-                };
+                let high = if b & 0x20 != 0 { b | !0x3F } else { b & 0x3F };
                 Ok((high << 8) | b2)
             }
             0xC0 => {
@@ -64,11 +60,7 @@ impl<'a> Reader<'a> {
                 let b2 = self.read_byte(section)? as i32;
                 let b3 = self.read_byte(section)? as i32;
                 let b4 = self.read_byte(section)? as i32;
-                let high = if b & 0x20 != 0 {
-                    b | !0x3F
-                } else {
-                    b & 0x3F
-                };
+                let high = if b & 0x20 != 0 { b | !0x3F } else { b & 0x3F };
                 Ok((high << 24) | (b2 << 16) | (b3 << 8) | b4)
             }
             _ => unreachable!(),

@@ -13,26 +13,41 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Link and import section loading
 - [ ] Module signature and runtime flag validation
 - [ ] Module resolver with configurable probing paths
-- [ ] Built-in module registration and dispatch
+- [x] Built-in module registration and dispatch
 
 ### Instruction Set
 
-- [ ] Arithmetic operations (`addi`, `subi`, `muli`, `divi`, `modi`, and float/big variants)
-- [ ] Comparison and branching (`beqi`, `bnei`, `blti`, `bgti`, `jmp`, `casew`)
-- [ ] Load and store operations (`movb`, `movw`, `movf`, `movp`, `movm`)
-- [ ] String operations (`insc`, `headc`, `lenc`, `addsc`, `slicec`, etc.)
-- [ ] Array and list operations (`newa`, `lena`, `headb`, `headw`, `headp`, `cons`, `slice`, etc.)
-- [ ] Channel operations (`send`, `recv`, `alt`, `nbalt`, `newc`)
-- [ ] Control flow (`call`, `ret`, `frame`, `spawn`, `mspawn`, `mcall`, `mframe`, `exit`)
-- [ ] Memory allocation (`new`, `newz`, `newa`, `newcb`, `newcw`, `newcf`, `newcp`, `newcm`, `newcmp`)
-- [ ] Exception handling (`raisex`, `rescued`, `casel`, `caseh`)
+- [x] Arithmetic operations (`addw`, `subw`, `mulw`, `divw`, `modw`, and float/big/byte variants)
+- [x] Comparison and branching (`beqw`, `bnew`, `bltw`, `bgtw`, `jmp`, and float/big/byte variants)
+- [x] Load and store operations (`movb`, `movw`, `movf`, `movl`)
+- [x] Type conversions (`cvtbw`, `cvtwb`, `cvtfw`, `cvtwf`, `cvtwl`, `cvtlw`, `cvtlf`, `cvtfl`)
+- [x] Bitwise operations (`andw`, `orw`, `xorw`, `shlw`, `shrw`, `lsrw`)
+- [x] Control flow (`call`, `ret`, `frame`, `jmp`, `exit`, `nop`)
+- [x] String operations (`lenc`, `indc`, `insc`, `addc`, `slicec`, `cvtca`, `cvtac`)
+- [x] Module operations (`load`, `mcall`, `mframe`)
+- [x] Memory allocation (`new`, `newz`, `newa`, `newaz`)
+- [x] Pointer operations (`movp`, `lea`, `indx`, `indw`, `indf`, `indb`, `indl`, `lena`)
+- [x] String comparisons (`beqc`, `bnec`, `bltc`, `blec`, `bgtc`, `bgec`)
+- [x] List operations (`consb`, `consw`, `consp`, `consf`, `consl`, `consm`, `consmp`, `headb`, `headw`, `headp`, `headf`, `headl`, `headm`, `headmp`, `tail`)
+- [x] Memory block operations (`movm`, `movmp`, `movpc`)
+- [x] Channel allocation stubs (`newcb`, `newcw`, `newcf`, `newcp`, `newcm`, `newcmp`, `newcl`)
+- [x] Additional conversions (`cvtwc`, `cvtcw`, `cvtfc`, `cvtcf`, `cvtlc`, `cvtcl`, `cvtws`, `cvtsw`)
+- [x] Additional bitwise (`andb`, `orb`, `xorb`, `shlb`, `shrb`, `andl`, `orl`, `xorl`, `shll`, `shrl`, `lsrl`)
+- [x] Exponentiation (`expw`, `expl`, `expf`)
+- [x] Misc (`tcmp`, `self_`, `mnewz`, `lenl`)
+- [ ] Array slice operations (`slicea`, `slicela`)
+- [ ] Channel operations (`send`, `recv`, `alt`, `nbalt`)
+- [ ] Thread operations (`spawn`, `mspawn`)
+- [ ] Exception handling (`raise`, `rescued`, `casel`, `casew`, `casec`)
+- [ ] Remaining opcodes (`goto`, `runt`, `casew`, `casec`, `casel`, `eclr`, `cvtrf`, `cvtfr`, `cvtxx`, `mulx`, `divx`, `brkpt`)
 
 ### Type System
 
-- [ ] Dis primitive types (byte, word, big, real, pointer)
-- [ ] String type with full Unicode support
-- [ ] Array type with bounds checking
-- [ ] List type (singly linked)
+- [x] Dis primitive types (byte, word, big, real)
+- [x] Pointer type with heap object tracking
+- [x] String type with full Unicode support
+- [x] Array type with bounds checking
+- [x] List type (singly linked)
 - [ ] Channel type with synchronous send and receive
 - [ ] ADT (abstract data type) support
 - [ ] Tuple and reference types
@@ -40,9 +55,9 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 ### Memory Management
 
-- [ ] Stack frame allocation and deallocation
-- [ ] Heap allocation for dynamic types (arrays, lists, strings, channels, and ADTs)
-- [ ] Reference counting for deterministic destruction
+- [x] Stack frame allocation and deallocation
+- [x] Heap allocation for dynamic types (arrays, strings)
+- [x] Reference counting for deterministic destruction
 - [ ] Mark-and-sweep garbage collector for cyclic reference detection
 - [ ] Optional toggle to disable mark-and-sweep collection
 
@@ -56,10 +71,11 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 ### Built-in Modules
 
-- [ ] `Sys` module (partial): `print`, `fprint`, `open`, `read`, `write`, `seek`, `filstat`, `fd2path`, etc.
+- [x] `Sys` module (partial): `print` with format string support
+- [ ] `Sys` module: `fprint`, `open`, `read`, `write`, `seek`, `filstat`, `fd2path`, etc.
 - [ ] `Math` module (partial): basic floating point operations
-- [ ] `$Sys` and `$Math` module type descriptors and entry points
-- [ ] Extension mechanism for registering custom built-in modules
+- [x] `$Sys` module type descriptors and entry points
+- [x] Extension mechanism for registering custom built-in modules
 
 ### CLI
 
@@ -77,7 +93,8 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] CI pipeline with automated tests
 - [x] Dual license (MIT and Apache 2.0)
 - [x] Unit tests for instruction decoding and execution
-- [ ] Integration tests with precompiled `.dis` modules
+- [x] End-to-end pipeline tests (loader → executor) with hand-crafted `.dis` binaries
+- [ ] Integration tests with Limbo-compiled `.dis` modules
 - [x] Property-based tests for binary format parsing
 - [ ] Fuzz testing for the module loader
 - [ ] Benchmarks against the reference C++ DisVM implementation

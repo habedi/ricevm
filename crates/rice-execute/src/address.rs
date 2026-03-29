@@ -31,18 +31,10 @@ pub(crate) fn resolve_operand(
     mp_data: &[u8],
 ) -> Result<AddrTarget, ExecError> {
     match op.mode {
-        AddressMode::OffsetIndirectFp => {
-            Ok(AddrTarget::Frame(fp_base + op.register1 as usize))
-        }
-        AddressMode::OffsetIndirectMp => {
-            Ok(AddrTarget::Mp(op.register1 as usize))
-        }
-        AddressMode::Immediate => {
-            Ok(AddrTarget::Immediate)
-        }
-        AddressMode::None => {
-            Ok(AddrTarget::None)
-        }
+        AddressMode::OffsetIndirectFp => Ok(AddrTarget::Frame(fp_base + op.register1 as usize)),
+        AddressMode::OffsetIndirectMp => Ok(AddrTarget::Mp(op.register1 as usize)),
+        AddressMode::Immediate => Ok(AddrTarget::Immediate),
+        AddressMode::None => Ok(AddrTarget::None),
         AddressMode::OffsetDoubleIndirectFp => {
             let base_addr = fp_base + op.register1 as usize;
             let indirect = memory::read_word(stack_data, base_addr) as usize;
@@ -65,12 +57,8 @@ pub(crate) fn resolve_middle(op: &MiddleOperand, fp_base: usize) -> Result<AddrT
     match op.mode {
         MiddleMode::None => Ok(AddrTarget::None),
         MiddleMode::SmallImmediate => Ok(AddrTarget::Immediate),
-        MiddleMode::SmallOffsetFp => {
-            Ok(AddrTarget::Frame(fp_base + op.register1 as usize))
-        }
-        MiddleMode::SmallOffsetMp => {
-            Ok(AddrTarget::Mp(op.register1 as usize))
-        }
+        MiddleMode::SmallOffsetFp => Ok(AddrTarget::Frame(fp_base + op.register1 as usize)),
+        MiddleMode::SmallOffsetMp => Ok(AddrTarget::Mp(op.register1 as usize)),
     }
 }
 

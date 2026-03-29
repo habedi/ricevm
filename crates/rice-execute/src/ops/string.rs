@@ -1,0 +1,166 @@
+use ricevm_core::ExecError;
+
+use crate::heap::{self, HeapData};
+use crate::vm::VmState;
+
+/// lenc src, dst — string length in characters
+pub(crate) fn op_lenc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let str_id = vm.src_ptr()?;
+    let len = match vm.heap.get_string(str_id) {
+        Some(s) => s.chars().count() as i32,
+        None => 0,
+    };
+    vm.set_dst_word(len)
+}
+
+/// indc src, mid, dst — get character at index: dst = src[mid]
+pub(crate) fn op_indc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let str_id = vm.src_ptr()?;
+    let index = vm.mid_word()? as usize;
+    let s = vm
+        .heap
+        .get_string(str_id)
+        .ok_or_else(|| ExecError::ThreadFault("nil string dereference".to_string()))?;
+    let ch = s
+        .chars()
+        .nth(index)
+        .ok_or_else(|| ExecError::ThreadFault(format!("string index out of bounds: {index}")))?;
+    vm.set_dst_word(ch as i32)
+}
+
+/// insc src, mid, dst — insert character: dst[mid] = src (rune)
+pub(crate) fn op_insc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let rune_val = vm.src_word()? as u32;
+    let index = vm.mid_word()? as usize;
+    let str_id = vm.dst_ptr()?;
+
+    let ch = char::from_u32(rune_val).unwrap_or('\u{FFFD}');
+
+    if str_id == heap::NIL {
+        // Create a new string
+        let mut s = String::new();
+        while s.chars().count() < index {
+            s.push('\0');
+        }
+        if index == s.chars().count() {
+            s.push(ch);
+        }
+        let new_id = vm.heap.alloc(0, HeapData::Str(s));
+        vm.set_dst_ptr(new_id)?;
+    } else {
+        // Copy-on-write
+        let (new_id, s) = vm
+            .heap
+            .cow_string(str_id)
+            .ok_or_else(|| ExecError::ThreadFault("insc on non-string".to_string()))?;
+        // Extend if needed
+        while s.chars().count() <= index {
+            s.push('\0');
+        }
+        // Replace character at index
+        let byte_start = s
+            .char_indices()
+            .nth(index)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        let byte_end = s
+            .char_indices()
+            .nth(index + 1)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        s.replace_range(byte_start..byte_end, &ch.to_string());
+
+        if new_id != str_id {
+            vm.set_dst_ptr(new_id)?;
+        }
+    }
+    Ok(())
+}
+
+/// addc src, mid, dst — string concatenation: dst = mid + src
+pub(crate) fn op_addc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s2_id = vm.src_ptr()?;
+    let s1_id = vm.mid_ptr()?;
+
+    let s1 = vm.heap.get_string(s1_id).unwrap_or("").to_string();
+    let s2 = vm.heap.get_string(s2_id).unwrap_or("").to_string();
+
+    let result = format!("{s1}{s2}");
+    let new_id = vm.heap.alloc(0, HeapData::Str(result));
+
+    // dec_ref old dst, set new
+    let old_dst = vm.dst_ptr()?;
+    vm.set_dst_ptr(new_id)?;
+    vm.heap.dec_ref(old_dst);
+    Ok(())
+}
+
+/// slicec src, mid, dst — string slice: dst = dst[src..mid]
+pub(crate) fn op_slicec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let start = vm.src_word()? as usize;
+    let end = vm.mid_word()? as usize;
+    let str_id = vm.dst_ptr()?;
+
+    if str_id == heap::NIL {
+        if start == 0 && end == 0 {
+            return Ok(()); // nil slice of nil is nil
+        }
+        return Err(ExecError::ThreadFault("slice of nil string".to_string()));
+    }
+
+    let s = vm
+        .heap
+        .get_string(str_id)
+        .ok_or_else(|| ExecError::ThreadFault("slicec on non-string".to_string()))?
+        .to_string();
+
+    let sliced: String = s.chars().skip(start).take(end - start).collect();
+    let new_id = vm.heap.alloc(0, HeapData::Str(sliced));
+    vm.set_dst_ptr(new_id)?;
+    vm.heap.dec_ref(str_id);
+    Ok(())
+}
+
+/// cvtca src, dst — convert string to byte array
+pub(crate) fn op_cvtca(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let str_id = vm.src_ptr()?;
+    let bytes = match vm.heap.get_string(str_id) {
+        Some(s) => s.as_bytes().to_vec(),
+        None => Vec::new(),
+    };
+    let length = bytes.len();
+    let id = vm.heap.alloc(
+        0,
+        HeapData::Array {
+            elem_type: 0,
+            elem_size: 1,
+            data: bytes,
+            length,
+        },
+    );
+    vm.move_ptr_to_dst(id)
+}
+
+/// cvtac src, dst — convert byte array to string
+pub(crate) fn op_cvtac(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let arr_id = vm.src_ptr()?;
+    let s = if arr_id == heap::NIL {
+        String::new()
+    } else {
+        match vm.heap.get(arr_id) {
+            Some(obj) => match &obj.data {
+                HeapData::Array { data, .. } => String::from_utf8_lossy(data).into_owned(),
+                _ => String::new(),
+            },
+            None => String::new(),
+        }
+    };
+    let new_id = vm.heap.alloc(0, HeapData::Str(s));
+    vm.move_ptr_to_dst(new_id)
+}
+
+/// lenl src, dst — list length (stub: lists not yet implemented)
+pub(crate) fn op_lenl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let _src = vm.src_ptr()?;
+    vm.set_dst_word(0) // nil list has length 0
+}

@@ -115,3 +115,101 @@ pub(crate) fn op_lsrw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let m = vm.mid_word()?;
     vm.set_dst_word(s.wrapping_shr(m as u32) as i32)
 }
+
+// Byte bitwise
+
+pub(crate) fn op_andb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_byte()?;
+    let m = vm.mid_byte()?;
+    vm.set_dst_byte(s & m)
+}
+
+pub(crate) fn op_orb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_byte()?;
+    let m = vm.mid_byte()?;
+    vm.set_dst_byte(s | m)
+}
+
+pub(crate) fn op_xorb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_byte()?;
+    let m = vm.mid_byte()?;
+    vm.set_dst_byte(s ^ m)
+}
+
+pub(crate) fn op_shlb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_byte()?;
+    let m = vm.mid_byte()?;
+    vm.set_dst_byte(s.wrapping_shl(m as u32))
+}
+
+pub(crate) fn op_shrb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_byte()?;
+    let m = vm.mid_byte()?;
+    vm.set_dst_byte(s.wrapping_shr(m as u32))
+}
+
+// Big bitwise and shift
+
+pub(crate) fn op_andl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_big()?;
+    let m = vm.mid_big()?;
+    vm.set_dst_big(s & m)
+}
+
+pub(crate) fn op_orl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_big()?;
+    let m = vm.mid_big()?;
+    vm.set_dst_big(s | m)
+}
+
+pub(crate) fn op_xorl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_big()?;
+    let m = vm.mid_big()?;
+    vm.set_dst_big(s ^ m)
+}
+
+pub(crate) fn op_shll(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_big()?;
+    let m = vm.mid_word()?;
+    vm.set_dst_big(s.wrapping_shl(m as u32))
+}
+
+pub(crate) fn op_shrl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_big()?;
+    let m = vm.mid_word()?;
+    vm.set_dst_big(s.wrapping_shr(m as u32))
+}
+
+pub(crate) fn op_lsrl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let s = vm.src_big()? as u64;
+    let m = vm.mid_word()?;
+    vm.set_dst_big(s.wrapping_shr(m as u32) as i64)
+}
+
+// Exponentiation
+
+pub(crate) fn op_expw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let base = vm.src_word()?;
+    let exp = vm.mid_word()?;
+    if exp < 0 {
+        vm.set_dst_word(0)
+    } else {
+        vm.set_dst_word(base.wrapping_pow(exp as u32))
+    }
+}
+
+pub(crate) fn op_expl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let base = vm.src_big()?;
+    let exp = vm.mid_word()?;
+    if exp < 0 {
+        vm.set_dst_big(0)
+    } else {
+        vm.set_dst_big(base.wrapping_pow(exp as u32))
+    }
+}
+
+pub(crate) fn op_expf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let base = vm.src_real()?;
+    let exp = vm.mid_real()?;
+    vm.set_dst_real(base.powf(exp))
+}

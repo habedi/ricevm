@@ -1,7 +1,7 @@
 use ricevm_core::{
     AddressMode, DataItem, ExceptionCase, ExportEntry, Handler, Header, ImportEntry, ImportModule,
     Instruction, LoadError, MiddleMode, MiddleOperand, Module, Opcode, Operand, PointerMap,
-    RuntimeFlags, TypeDescriptor, SMAGIC, XMAGIC,
+    RuntimeFlags, SMAGIC, TypeDescriptor, XMAGIC,
 };
 
 use crate::reader::Reader;
@@ -44,10 +44,7 @@ pub(crate) fn parse_header(r: &mut Reader<'_>) -> Result<Header, LoadError> {
     })
 }
 
-fn parse_src_dst_operand(
-    r: &mut Reader<'_>,
-    mode_bits: u8,
-) -> Result<Operand, LoadError> {
+fn parse_src_dst_operand(r: &mut Reader<'_>, mode_bits: u8) -> Result<Operand, LoadError> {
     let mode = match mode_bits {
         0 => AddressMode::OffsetIndirectMp,
         1 => AddressMode::OffsetIndirectFp,
@@ -236,10 +233,7 @@ pub(crate) fn parse_name(r: &mut Reader<'_>) -> Result<String, LoadError> {
     r.read_cstring("module name")
 }
 
-pub(crate) fn parse_exports(
-    r: &mut Reader<'_>,
-    count: i32,
-) -> Result<Vec<ExportEntry>, LoadError> {
+pub(crate) fn parse_exports(r: &mut Reader<'_>, count: i32) -> Result<Vec<ExportEntry>, LoadError> {
     let mut entries = Vec::with_capacity(count as usize);
 
     for _ in 0..count {
@@ -385,9 +379,9 @@ mod tests {
 
     /// Helper: encode an i32 as a Dis operand (variable-length).
     fn encode_operand(value: i32) -> Vec<u8> {
-        if value >= 0 && value <= 63 {
+        if (0..=63).contains(&value) {
             vec![value as u8]
-        } else if value >= -64 && value <= -1 {
+        } else if (-64..=-1).contains(&value) {
             // 0x40 range: byte = value & 0xFF, which will have bits[7:6] = 01
             vec![(value & 0xFF) as u8]
         } else {

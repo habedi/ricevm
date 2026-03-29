@@ -9,9 +9,9 @@
 
 [![Tests](https://img.shields.io/github/actions/workflow/status/habedi/rice-vm/tests.yml?label=tests&style=flat&labelColor=282c34&color=4caf50&logo=github)](https://github.com/habedi/rice-vm/actions/workflows/tests.yml)
 [![Code Coverage](https://img.shields.io/codecov/c/github/habedi/rice-vm?style=flat&labelColor=282c34&color=ffca28&logo=codecov)](https://codecov.io/gh/habedi/rice-vm)
-[![Docs.rs](https://img.shields.io/badge/docs.rs-template--rust--project-66c2a5?style=flat&labelColor=282c34&logo=docs.rs)](https://docs.rs/disvm)
 [![Docs](https://img.shields.io/badge/docs-latest-007ec6?style=flat&labelColor=282c34&logo=readthedocs)](docs)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/habedi/rice-vm)
+[![Release](https://img.shields.io/github/release/habedi/rice-vm.svg?label=release&style=flat&labelColor=282c34&logo=github)](https://github.com/habedi/rice-vm/releases/latest)
 
 Rice (or RiceVM) is an implementation of the [Dis virtual machine](https://en.wikipedia.org/wiki/Limbo_(programming_language)#Virtual_machine) in
 Rust.

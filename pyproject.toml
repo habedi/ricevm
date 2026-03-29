@@ -1,99 +1,14 @@
 [project]
 name = "rice-vm"
 version = "0.1.0"
-description = "The Python environment for the Dis VM project."
-readme = "README.md"
-license = { text = "MIT" }
-authors = [
-    { name = "Hassan Abedi", email = "hassan.abedi.t+disvm@gmail.com" }
-]
-maintainers = [
-    { name = "Hassan Abedi", email = "hassan.abedi.t+disvm@gmail.com" }
-]
+description = "The Python environment for the RiceVM project"
 
 requires-python = ">=3.10,<4.0"
 dependencies = [
-    "maturin[zig] (>=1.8.3,<2.0.0)",
-    "numpy (>=2.2.6,<3.0.0)",
+  "pre-commit (>=4.2.0,<5.0.0)",
+  "icecream (>=2.1.4,<3.0.0)",
+  "mkdocs (>=1.6.1,<2.0.0)",
+  "mkdocs-material (>=9.6.12,<10.0.0)",
+  "mkdocstrings-python (>=1.16.10,<2.0.0)",
+  "pyyaml (>=6.0.1,<7.0.0)",
 ]
-
-[project.optional-dependencies]
-dev = [
-    "pytest (>=8.3.5,<9.0.0)",
-    "pytest-cov (>=6.0.0,<7.0.0)",
-    "pytest-mock (>=3.14.0,<4.0.0)",
-    "mypy (>=1.11.1,<2.0.0)",
-    "ruff (>=0.11.0,<0.12.0)",
-    "twine (>=6.1.0,<7.0.0)",
-    "mkdocs (>=1.6.1,<2.0.0)",
-    "mkdocs-material (>=9.6.12,<10.0.0)",
-    "mkdocstrings-python (>=1.16.10,<2.0.0)",
-    "pyyaml (>=6.0.1,<7.0.0)",
-    "rundoc (>=0.2.3,<0.3.0)",
-    "hypothesis (>=6.150.2,<7.0.0)",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["python/tests"]
-addopts = [
-    "--tb=short",
-    "--cov=python",
-    "--cov-branch",
-    "--cov-report=term",
-    "--cov-report=xml",
-    "-rs"
-]
-
-[tool.coverage.run]
-branch = true
-parallel = true
-source = ["."]
-omit = ["tests/*"]
-
-[tool.coverage.report]
-show_missing = false
-skip_empty = true
-precision = 2
-
-[tool.mypy]
-python_version = "3.10"
-ignore_missing_imports = true
-disallow_untyped_defs = true
-disallow_untyped_calls = true
-disallow_incomplete_defs = true
-check_untyped_defs = true
-warn_return_any = true
-strict_optional = true
-warn_redundant_casts = true
-exclude = "^(tests/)"
-
-[tool.ruff]
-exclude = [
-    ".bzr", ".direnv", ".eggs", ".git", ".git-rewrite", ".hg", ".mypy_cache",
-    ".nox", ".pants.d", ".pytype", ".ruff_cache", ".svn", ".tox", ".venv",
-    "__pypackages__", "_build", "buck-out", "build", "dist", "node_modules",
-    "venv", "tests"
-]
-line-length = 100
-indent-width = 4
-src = ["python"]
-target-version = "py310"
-
-[tool.ruff.lint]
-select = ["ANN", "E", "F", "I", "W", "B", "RUF", "SIM", "C90", "D"]
-ignore = ["D100", "D101", "D102", "D103", "D104", "D105", "D106", "D107"]
-fixable = ["ALL"]
-unfixable = []
-dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
-
-[tool.ruff.format]
-quote-style = "double"
-indent-style = "space"
-skip-magic-trailing-comma = false
-line-ending = "auto"
-
-[tool.ruff.lint.pydocstyle]
-convention = "google"
-
-[tool.ruff.lint.per-file-ignores]
-"python/tests/**/*.py" = []

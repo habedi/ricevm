@@ -47,9 +47,7 @@ pub(crate) fn op_cvtwc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let rune = vm.src_word()? as u32;
     let ch = char::from_u32(rune).unwrap_or('\u{FFFD}');
     let s = ch.to_string();
-    let id = vm
-        .heap
-        .alloc(0, crate::heap::HeapData::Str(s));
+    let id = vm.heap.alloc(0, crate::heap::HeapData::Str(s));
     vm.move_ptr_to_dst(id)
 }
 
@@ -67,9 +65,7 @@ pub(crate) fn op_cvtfc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     // float to string
     let val = vm.src_real()?;
     let s = val.to_string();
-    let id = vm
-        .heap
-        .alloc(0, crate::heap::HeapData::Str(s));
+    let id = vm.heap.alloc(0, crate::heap::HeapData::Str(s));
     vm.move_ptr_to_dst(id)
 }
 
@@ -87,9 +83,7 @@ pub(crate) fn op_cvtlc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     // big to string
     let val = vm.src_big()?;
     let s = val.to_string();
-    let id = vm
-        .heap
-        .alloc(0, crate::heap::HeapData::Str(s));
+    let id = vm.heap.alloc(0, crate::heap::HeapData::Str(s));
     vm.move_ptr_to_dst(id)
 }
 

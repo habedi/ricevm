@@ -109,9 +109,10 @@ pub(crate) fn op_slicea(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         return Err(ExecError::ThreadFault("slice of nil array".to_string()));
     }
 
-    let obj = vm.heap.get(arr_id).ok_or_else(|| {
-        ExecError::ThreadFault("slicea: invalid array".to_string())
-    })?;
+    let obj = vm
+        .heap
+        .get(arr_id)
+        .ok_or_else(|| ExecError::ThreadFault("slicea: invalid array".to_string()))?;
 
     match &obj.data {
         heap::HeapData::Array {

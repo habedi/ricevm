@@ -29,10 +29,7 @@ pub(crate) enum HeapData {
     /// A Dis list node (head + tail).
     /// `head` is a raw byte buffer holding the element value.
     /// `tail` is the HeapId of the next list node (NIL = end of list).
-    List {
-        head: Vec<u8>,
-        tail: HeapId,
-    },
+    List { head: Vec<u8>, tail: HeapId },
     /// A loaded module handle.
     ModuleRef { module_id: u32 },
     /// A Dis channel (stub for milestone 3).

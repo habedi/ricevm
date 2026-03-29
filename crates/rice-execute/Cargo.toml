@@ -11,3 +11,4 @@ ricevm_core.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+libc = "0.2"

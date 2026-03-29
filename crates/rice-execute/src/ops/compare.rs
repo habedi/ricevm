@@ -239,36 +239,48 @@ fn get_str_pair<'a>(vm: &'a VmState<'_>) -> Result<(&'a str, &'a str), ExecError
 
 pub(crate) fn op_beqc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let (s, d) = get_str_pair(vm)?;
-    if s == d { vm.next_pc = vm.mid_word()? as usize; }
+    if s == d {
+        vm.next_pc = vm.mid_word()? as usize;
+    }
     Ok(())
 }
 
 pub(crate) fn op_bnec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let (s, d) = get_str_pair(vm)?;
-    if s != d { vm.next_pc = vm.mid_word()? as usize; }
+    if s != d {
+        vm.next_pc = vm.mid_word()? as usize;
+    }
     Ok(())
 }
 
 pub(crate) fn op_bltc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let (s, d) = get_str_pair(vm)?;
-    if s < d { vm.next_pc = vm.mid_word()? as usize; }
+    if s < d {
+        vm.next_pc = vm.mid_word()? as usize;
+    }
     Ok(())
 }
 
 pub(crate) fn op_blec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let (s, d) = get_str_pair(vm)?;
-    if s <= d { vm.next_pc = vm.mid_word()? as usize; }
+    if s <= d {
+        vm.next_pc = vm.mid_word()? as usize;
+    }
     Ok(())
 }
 
 pub(crate) fn op_bgtc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let (s, d) = get_str_pair(vm)?;
-    if s > d { vm.next_pc = vm.mid_word()? as usize; }
+    if s > d {
+        vm.next_pc = vm.mid_word()? as usize;
+    }
     Ok(())
 }
 
 pub(crate) fn op_bgec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let (s, d) = get_str_pair(vm)?;
-    if s >= d { vm.next_pc = vm.mid_word()? as usize; }
+    if s >= d {
+        vm.next_pc = vm.mid_word()? as usize;
+    }
     Ok(())
 }

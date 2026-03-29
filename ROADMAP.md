@@ -34,12 +34,12 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Additional conversions (`cvtwc`, `cvtcw`, `cvtfc`, `cvtcf`, `cvtlc`, `cvtcl`, `cvtws`, `cvtsw`)
 - [x] Additional bitwise (`andb`, `orb`, `xorb`, `shlb`, `shrb`, `andl`, `orl`, `xorl`, `shll`, `shrl`, `lsrl`)
 - [x] Exponentiation (`expw`, `expl`, `expf`)
-- [x] Misc (`tcmp`, `self_`, `mnewz`, `lenl`)
-- [ ] Array slice operations (`slicea`, `slicela`)
-- [ ] Channel operations (`send`, `recv`, `alt`, `nbalt`)
-- [ ] Thread operations (`spawn`, `mspawn`)
-- [ ] Exception handling (`raise`, `rescued`, `casel`, `casew`, `casec`)
-- [ ] Remaining opcodes (`goto`, `runt`, `casew`, `casec`, `casel`, `eclr`, `cvtrf`, `cvtfr`, `cvtxx`, `mulx`, `divx`, `brkpt`)
+- [x] Misc (`tcmp`, `self_`, `mnewz`, and `lenl`)
+- [x] Array slice operations (`slicea` and `slicela`)
+- [x] Control flow (`goto`, `casew`, `casec`, `casel`, `raise`, `runt`, `eclr`, `brkpt`)
+- [x] Fixed-point arithmetic (`mulx`, `divx`, `cvtxx`, `mulx0`, `divx0`, `cvtxx0`, `cvtfx`, `cvtxf`)
+- [x] Remaining conversions (`cvtrf` and `cvtfr`)
+- [x] **All 176 opcodes covered** (concurrency opcodes return stub errors until scheduler is implemented)
 
 ### Type System
 

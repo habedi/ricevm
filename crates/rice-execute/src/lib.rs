@@ -357,10 +357,15 @@ mod tests {
             },
             code: vec![
                 // addc: dst = mid + src → fp[0] = mp[0] + mp[4]
-                make_inst(Opcode::Addc, mp(4), MiddleOperand {
-                    mode: MiddleMode::SmallOffsetMp,
-                    register1: 0,
-                }, fp(0)),
+                make_inst(
+                    Opcode::Addc,
+                    mp(4),
+                    MiddleOperand {
+                        mode: MiddleMode::SmallOffsetMp,
+                        register1: 0,
+                    },
+                    fp(0),
+                ),
                 make_inst(Opcode::Lenc, fp(0), mid_none(), fp(4)),
                 exit_inst(),
             ],

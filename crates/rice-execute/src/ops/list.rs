@@ -112,9 +112,10 @@ pub(crate) fn op_consmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 // headX src, dst: dst = hd(src)
 
 fn head_read<'a>(vm: &'a VmState<'_>, list_id: HeapId) -> Result<&'a [u8], ExecError> {
-    let obj = vm.heap.get(list_id).ok_or_else(|| {
-        ExecError::ThreadFault("nil list dereference (head)".to_string())
-    })?;
+    let obj = vm
+        .heap
+        .get(list_id)
+        .ok_or_else(|| ExecError::ThreadFault("nil list dereference (head)".to_string()))?;
     match &obj.data {
         HeapData::List { head, .. } => Ok(head.as_slice()),
         _ => Err(ExecError::ThreadFault("head on non-list".to_string())),
@@ -203,9 +204,10 @@ pub(crate) fn op_headmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// tail src, dst: dst = tl(src)
 pub(crate) fn op_tail(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let list_id = vm.src_ptr()?;
-    let obj = vm.heap.get(list_id).ok_or_else(|| {
-        ExecError::ThreadFault("nil list dereference (tail)".to_string())
-    })?;
+    let obj = vm
+        .heap
+        .get(list_id)
+        .ok_or_else(|| ExecError::ThreadFault("nil list dereference (tail)".to_string()))?;
     let tail_id = match &obj.data {
         HeapData::List { tail, .. } => *tail,
         _ => return Err(ExecError::ThreadFault("tail on non-list".to_string())),

@@ -182,11 +182,52 @@ pub(crate) fn op_casel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 /// raise src — raise an exception.
-/// src = pointer to exception string.
+/// Searches the handler table for a matching handler at the current PC.
+/// If found, jumps to the handler. If not, returns a ThreadFault.
 pub(crate) fn op_raise(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let str_id = vm.src_ptr()?;
-    let msg = vm.heap.get_string(str_id).unwrap_or("unknown exception").to_string();
-    Err(ExecError::ThreadFault(format!("exception: {msg}")))
+    let msg = vm
+        .heap
+        .get_string(str_id)
+        .unwrap_or("unknown exception")
+        .to_string();
+
+    let current_pc = vm.pc as i32;
+
+    // Search the handler table for a matching handler
+    for handler in &vm.module.handlers {
+        if current_pc < handler.begin_pc || current_pc >= handler.end_pc {
+            continue;
+        }
+        // Found a handler covering this PC. Search cases.
+        for case in &handler.cases {
+            match &case.name {
+                Some(name) if *name == msg => {
+                    vm.next_pc = case.pc as usize;
+                    let frame_base = vm.frames.current_data_offset();
+                    let off = frame_base + handler.exception_offset as usize;
+                    if off + 4 <= vm.frames.data.len() {
+                        crate::memory::write_word(&mut vm.frames.data, off, str_id as i32);
+                    }
+                    return Ok(());
+                }
+                None => {
+                    // Wildcard handler
+                    vm.next_pc = case.pc as usize;
+                    let frame_base = vm.frames.current_data_offset();
+                    let off = frame_base + handler.exception_offset as usize;
+                    if off + 4 <= vm.frames.data.len() {
+                        crate::memory::write_word(&mut vm.frames.data, off, str_id as i32);
+                    }
+                    return Ok(());
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    // No handler found
+    Err(ExecError::ThreadFault(format!("unhandled exception: {msg}")))
 }
 
 /// runt src — runtime check (module type validation). Stub: no-op.

@@ -1,9 +1,11 @@
 pub(crate) mod arith;
 pub(crate) mod big;
 pub(crate) mod compare;
+pub(crate) mod concurrency;
 pub(crate) mod control;
 pub(crate) mod convert;
 pub(crate) mod data_move;
+pub(crate) mod fixedpoint;
 pub(crate) mod float;
 pub(crate) mod heap;
 pub(crate) mod list;
@@ -221,13 +223,29 @@ pub(crate) fn dispatch(vm: &mut VmState<'_>, inst: &Instruction) -> Result<(), E
         Opcode::Eclr => control::op_eclr(vm),
         Opcode::Brkpt => control::op_brkpt(vm),
 
+        // Fixed-point arithmetic
+        Opcode::Mulx => fixedpoint::op_mulx(vm),
+        Opcode::Mulx0 => fixedpoint::op_mulx0(vm),
+        Opcode::Mulx1 => fixedpoint::op_mulx1(vm),
+        Opcode::Divx => fixedpoint::op_divx(vm),
+        Opcode::Divx0 => fixedpoint::op_divx0(vm),
+        Opcode::Divx1 => fixedpoint::op_divx1(vm),
+        Opcode::Cvtxx => fixedpoint::op_cvtxx(vm),
+        Opcode::Cvtxx0 => fixedpoint::op_cvtxx0(vm),
+        Opcode::Cvtxx1 => fixedpoint::op_cvtxx1(vm),
+        Opcode::Cvtfx => fixedpoint::op_cvtfx(vm),
+        Opcode::Cvtxf => fixedpoint::op_cvtxf(vm),
+
+        // Concurrency (stubs)
+        Opcode::Spawn => concurrency::op_spawn(vm),
+        Opcode::Mspawn => concurrency::op_mspawn(vm),
+        Opcode::Send => concurrency::op_send(vm),
+        Opcode::Recv => concurrency::op_recv(vm),
+        Opcode::Alt => concurrency::op_alt(vm),
+        Opcode::Nbalt => concurrency::op_nbalt(vm),
+
         // Misc
         Opcode::Tcmp => data_move::op_tcmp(vm),
         Opcode::Self_ => data_move::op_self_(vm),
-
-        _ => Err(ExecError::Other(format!(
-            "unimplemented opcode: {:?}",
-            inst.opcode
-        ))),
     }
 }

@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description = "Command line interface for Rice"
 
+[features]
+default = []
+gui = ["ricevm_execute/gui"]
+
 [dependencies]
 ricevm_core.workspace = true
 ricevm_loader.workspace = true

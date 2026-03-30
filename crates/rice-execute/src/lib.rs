@@ -6,6 +6,8 @@ mod address;
 mod builtin;
 mod channel;
 mod data;
+#[allow(unused_imports, unused_variables, dead_code)]
+mod draw;
 mod filetab;
 mod frame;
 mod gc;

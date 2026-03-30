@@ -87,6 +87,7 @@ impl<'m> VmState<'m> {
         let mut modules = ModuleRegistry::new();
         modules.register(sys::create_sys_module());
         modules.register(crate::math::create_math_module());
+        modules.register(crate::draw::create_draw_module());
 
         let trace = std::env::var("RICEVM_TRACE").is_ok();
         let gc_enabled = std::env::var("RICEVM_NO_GC").is_err();

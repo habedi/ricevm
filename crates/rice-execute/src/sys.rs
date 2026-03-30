@@ -105,48 +105,48 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
         name: "$Sys",
         funcs: vec![
             bf("announce", 0x0b7c4ac0, 40, sys_stub),
-            bf("aprint",   0x77442d46, 64, sys_aprint),
-            bf("bind",     0x66326d91, 48, sys_stub),
-            bf("byte2char",0x3d6094f9, 40, sys_byte2char),
-            bf("char2byte",0x2ba5ab41, 48, sys_char2byte),
-            bf("chdir",    0xc6935858, 40, sys_chdir),
-            bf("create",   0x54db77d9, 48, sys_create),
-            bf("dial",     0x29e90174, 40, sys_stub),
-            bf("dirread",  0x72210d71, 40, sys_stub),
-            bf("dup",      0x6584767b, 40, sys_dup),
-            bf("export",   0x6fc6dc03, 48, sys_stub),
-            bf("fauth",    0x20ccc34b, 40, sys_stub),
-            bf("fd2path",  0x749c6042, 40, sys_fd2path),
-            bf("fildes",   0x1478f993, 40, sys_fildes),
+            bf("aprint", 0x77442d46, 64, sys_aprint),
+            bf("bind", 0x66326d91, 48, sys_stub),
+            bf("byte2char", 0x3d6094f9, 40, sys_byte2char),
+            bf("char2byte", 0x2ba5ab41, 48, sys_char2byte),
+            bf("chdir", 0xc6935858, 40, sys_chdir),
+            bf("create", 0x54db77d9, 48, sys_create),
+            bf("dial", 0x29e90174, 40, sys_stub),
+            bf("dirread", 0x72210d71, 40, sys_stub),
+            bf("dup", 0x6584767b, 40, sys_dup),
+            bf("export", 0x6fc6dc03, 48, sys_stub),
+            bf("fauth", 0x20ccc34b, 40, sys_stub),
+            bf("fd2path", 0x749c6042, 40, sys_fd2path),
+            bf("fildes", 0x1478f993, 40, sys_fildes),
             bf("file2chan", 0x9f34d686, 40, sys_stub),
-            bf("fprint",   0xf46486c8, 64, sys_fprint),
-            bf("fstat",    0xda4499c2, 40, sys_stub),
+            bf("fprint", 0xf46486c8, 64, sys_fprint),
+            bf("fstat", 0xda4499c2, 40, sys_stub),
             bf("fversion", 0xfe9c0a06, 48, sys_stub),
-            bf("fwstat",   0x50a6c7e0, 104, sys_stub),
-            bf("iounit",   0x5583b730, 40, sys_iounit),
-            bf("listen",   0xb97416e0, 48, sys_stub),
+            bf("fwstat", 0x50a6c7e0, 104, sys_stub),
+            bf("iounit", 0x5583b730, 40, sys_iounit),
+            bf("listen", 0xb97416e0, 48, sys_stub),
             bf("millisec", 0x616977e8, 32, sys_millisec),
-            bf("mount",    0x74c17b3a, 56, sys_stub),
-            bf("open",     0x8f477f99, 40, sys_open),
-            bf("pctl",     0x05df27fb, 40, sys_pctl),
-            bf("pipe",     0x1f2c52ea, 40, sys_pipe),
-            bf("pread",    0x09d8aac6, 56, sys_stub),
-            bf("print",    0xac849033, 64, sys_print),
-            bf("pwrite",   0x09d8aac6, 56, sys_stub),
-            bf("read",     0x7cfef557, 48, sys_read),
-            bf("readn",    0x7cfef557, 48, sys_read),
-            bf("remove",   0xc6935858, 40, sys_remove),
-            bf("seek",     0xaeccaddb, 56, sys_seek),
-            bf("sleep",    0xe67bf126, 40, sys_sleep),
-            bf("sprint",   0x4c0624b6, 64, sys_sprint),
-            bf("stat",     0x319328dd, 40, sys_stub),
-            bf("stream",   0xb9e8f9ea, 48, sys_stub),
+            bf("mount", 0x74c17b3a, 56, sys_stub),
+            bf("open", 0x8f477f99, 40, sys_open),
+            bf("pctl", 0x05df27fb, 40, sys_pctl),
+            bf("pipe", 0x1f2c52ea, 40, sys_pipe),
+            bf("pread", 0x09d8aac6, 56, sys_stub),
+            bf("print", 0xac849033, 64, sys_print),
+            bf("pwrite", 0x09d8aac6, 56, sys_stub),
+            bf("read", 0x7cfef557, 48, sys_read),
+            bf("readn", 0x7cfef557, 48, sys_read),
+            bf("remove", 0xc6935858, 40, sys_remove),
+            bf("seek", 0xaeccaddb, 56, sys_seek),
+            bf("sleep", 0xe67bf126, 40, sys_sleep),
+            bf("sprint", 0x4c0624b6, 64, sys_sprint),
+            bf("stat", 0x319328dd, 40, sys_stub),
+            bf("stream", 0xb9e8f9ea, 48, sys_stub),
             bf("tokenize", 0x57338f20, 40, sys_tokenize),
-            bf("unmount",  0x21e337e3, 40, sys_stub),
+            bf("unmount", 0x21e337e3, 40, sys_stub),
             bf("utfbytes", 0x01d4a1f4, 40, sys_utfbytes),
-            bf("werrstr",  0xc6935858, 40, sys_werrstr),
-            bf("write",    0x7cfef557, 48, sys_write),
-            bf("wstat",    0x56b02096, 104, sys_stub),
+            bf("werrstr", 0xc6935858, 40, sys_werrstr),
+            bf("write", 0x7cfef557, 48, sys_write),
+            bf("wstat", 0x56b02096, 104, sys_stub),
         ],
     }
 }
@@ -187,36 +187,12 @@ fn sys_print(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_fprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    // arg at offset 16 = fd pointer, offset 20 = format string, offset 24 = args
     let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let fd_num = if fd_id == heap::NIL as HeapId {
-        1 // default to stdout
-    } else {
-        // Read fd number from the FD adt (first field is the int fd)
-        match vm.heap.get(fd_id) {
-            Some(obj) => match &obj.data {
-                HeapData::Record(data) => {
-                    if data.len() >= 4 {
-                        memory::read_word(data, 0)
-                    } else {
-                        1
-                    }
-                }
-                _ => 1,
-            },
-            None => 1,
-        }
-    };
+    let fd_num = get_fd_num(vm, fd_id);
+    let fd_num = if fd_num < 0 { 1 } else { fd_num }; // default to stdout
     let output = format_string(vm, frame_base, 20, 24);
     let len = output.len() as i32;
-    match fd_num {
-        2 => {
-            eprint!("{output}");
-        }
-        _ => {
-            print!("{output}");
-        }
-    }
+    let _ = vm.files.write(fd_num, output.as_bytes());
     memory::write_word(&mut vm.frames.data, frame_base, len);
     Ok(())
 }
@@ -248,7 +224,7 @@ fn sys_aprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-// --- File I/O ---
+// --- File I/O (portable, no libc) ---
 
 fn sys_open(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
@@ -257,27 +233,15 @@ fn sys_open(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
 
-    let file = match mode & 0x3 {
-        0 => std::fs::File::open(&path),                          // OREAD
-        1 => std::fs::OpenOptions::new().write(true).open(&path), // OWRITE
-        _ => std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path), // ORDWR
-    };
-
-    match file {
-        Ok(f) => {
-            use std::os::unix::io::IntoRawFd;
-            let raw_fd = f.into_raw_fd();
-            // Allocate an FD adt on the heap (single word: the fd number)
+    match vm.files.open(&path, mode) {
+        Ok(fd) => {
             let mut fd_data = vec![0u8; 4];
-            memory::write_word(&mut fd_data, 0, raw_fd);
+            memory::write_word(&mut fd_data, 0, fd);
             let fd_id = vm.heap.alloc(0, HeapData::Record(fd_data));
             memory::write_word(&mut vm.frames.data, frame_base, fd_id as i32);
         }
         Err(_) => {
-            memory::write_word(&mut vm.frames.data, frame_base, 0); // nil
+            memory::write_word(&mut vm.frames.data, frame_base, 0);
         }
     }
     Ok(())
@@ -286,17 +250,13 @@ fn sys_open(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn sys_create(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let path_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let _mode = memory::read_word(&vm.frames.data, frame_base + 20);
-    let _perm = memory::read_word(&vm.frames.data, frame_base + 24);
 
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
 
-    match std::fs::File::create(&path) {
-        Ok(f) => {
-            use std::os::unix::io::IntoRawFd;
-            let raw_fd = f.into_raw_fd();
+    match vm.files.create(&path) {
+        Ok(fd) => {
             let mut fd_data = vec![0u8; 4];
-            memory::write_word(&mut fd_data, 0, raw_fd);
+            memory::write_word(&mut fd_data, 0, fd);
             let fd_id = vm.heap.alloc(0, HeapData::Record(fd_data));
             memory::write_word(&mut vm.frames.data, frame_base, fd_id as i32);
         }
@@ -314,10 +274,8 @@ fn sys_read(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let count = memory::read_word(&vm.frames.data, frame_base + 24) as usize;
 
     let fd_num = get_fd_num(vm, fd_id);
-
-    // Read into a temporary buffer
     let mut tmp = vec![0u8; count];
-    let n = unsafe { libc::read(fd_num, tmp.as_mut_ptr() as *mut libc::c_void, count) };
+    let n = vm.files.read(fd_num, &mut tmp).unwrap_or(-1_i32 as usize) as i32;
 
     if n > 0
         && let Some(obj) = vm.heap.get_mut(buf_id)
@@ -327,7 +285,7 @@ fn sys_read(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         data[..copy_len].copy_from_slice(&tmp[..copy_len]);
     }
 
-    memory::write_word(&mut vm.frames.data, frame_base, n as i32);
+    memory::write_word(&mut vm.frames.data, frame_base, n);
     Ok(())
 }
 
@@ -338,28 +296,30 @@ fn sys_write(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let count = memory::read_word(&vm.frames.data, frame_base + 24) as usize;
 
     let fd_num = get_fd_num(vm, fd_id);
-
-    let bytes = match vm.heap.get(buf_id) {
+    let bytes: Vec<u8> = match vm.heap.get(buf_id) {
         Some(obj) => match &obj.data {
-            HeapData::Array { data, .. } => &data[..count.min(data.len())],
-            _ => &[],
+            HeapData::Array { data, .. } => data[..count.min(data.len())].to_vec(),
+            _ => Vec::new(),
         },
-        None => &[],
+        None => Vec::new(),
     };
 
-    let n = unsafe { libc::write(fd_num, bytes.as_ptr() as *const libc::c_void, bytes.len()) };
-
-    memory::write_word(&mut vm.frames.data, frame_base, n as i32);
+    let n = vm.files.write(fd_num, &bytes).unwrap_or(0) as i32;
+    memory::write_word(&mut vm.frames.data, frame_base, n);
     Ok(())
 }
 
 fn sys_fildes(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let fd_num = memory::read_word(&vm.frames.data, frame_base + 16);
-    let mut fd_data = vec![0u8; 4];
-    memory::write_word(&mut fd_data, 0, fd_num);
-    let fd_id = vm.heap.alloc(0, HeapData::Record(fd_data));
-    memory::write_word(&mut vm.frames.data, frame_base, fd_id as i32);
+    if vm.files.fildes(fd_num) {
+        let mut fd_data = vec![0u8; 4];
+        memory::write_word(&mut fd_data, 0, fd_num);
+        let fd_id = vm.heap.alloc(0, HeapData::Record(fd_data));
+        memory::write_word(&mut vm.frames.data, frame_base, fd_id as i32);
+    } else {
+        memory::write_word(&mut vm.frames.data, frame_base, 0);
+    }
     Ok(())
 }
 
@@ -367,12 +327,8 @@ fn sys_fd2path(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
     let fd_num = get_fd_num(vm, fd_id);
-
-    let path = format!("/proc/self/fd/{fd_num}");
-    let result = std::fs::read_link(&path)
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
+    // Portable: return a placeholder since we can't resolve fd→path without OS-specific APIs
+    let result = format!("/fd/{fd_num}");
     let str_id = vm.heap.alloc(0, HeapData::Str(result));
     memory::write_word(&mut vm.frames.data, frame_base, str_id as i32);
     Ok(())
@@ -382,13 +338,7 @@ fn sys_dup(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let old_fd = memory::read_word(&vm.frames.data, frame_base + 16);
     let new_fd = memory::read_word(&vm.frames.data, frame_base + 20);
-    let result = unsafe {
-        if new_fd < 0 {
-            libc::dup(old_fd)
-        } else {
-            libc::dup2(old_fd, new_fd)
-        }
-    };
+    let result = vm.files.dup(old_fd, new_fd);
     memory::write_word(&mut vm.frames.data, frame_base, result);
     Ok(())
 }
@@ -589,34 +539,20 @@ fn sys_seek(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let whence = memory::read_word(&vm.frames.data, frame_base + 28);
     let fd_num = get_fd_num(vm, fd_id);
 
-    let seek_whence = match whence {
-        0 => libc::SEEK_SET,
-        1 => libc::SEEK_CUR,
-        2 => libc::SEEK_END,
-        _ => libc::SEEK_SET,
-    };
-    let result = unsafe { libc::lseek(fd_num, offset, seek_whence) };
+    let result = vm
+        .files
+        .seek(fd_num, offset, whence)
+        .map(|p| p as i64)
+        .unwrap_or(-1);
     memory::write_big(&mut vm.frames.data, frame_base, result);
     Ok(())
 }
 
 fn sys_pipe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let mut fds = [0i32; 2];
-    let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
-
-    if result == 0 {
-        let arr_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-        // Write FD objects into the array
-        if let Some(obj) = vm.heap.get_mut(arr_id)
-            && let HeapData::Array { data, .. } = &mut obj.data
-            && data.len() >= 8
-        {
-            memory::write_word(data, 0, fds[0]);
-            memory::write_word(data, 4, fds[1]);
-        }
-    }
-    memory::write_word(&mut vm.frames.data, frame_base, result);
+    // Portable pipe is not available in std without platform-specific code.
+    // Return -1 (error) as a stub.
+    memory::write_word(&mut vm.frames.data, frame_base, -1);
     Ok(())
 }
 

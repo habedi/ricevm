@@ -73,15 +73,18 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         } else {
             Vec::new()
         };
-        let ref_id = vm.heap.alloc(0, HeapData::ModuleRef { module_id, func_map });
+        let ref_id = vm.heap.alloc(
+            0,
+            HeapData::ModuleRef {
+                module_id,
+                func_map,
+            },
+        );
         return vm.move_ptr_to_dst(ref_id);
     }
 
     // 2. Try loading from filesystem
-    let mut candidates = vec![
-        path.clone(),
-        format!("{path}.dis"),
-    ];
+    let mut candidates = vec![path.clone(), format!("{path}.dis")];
     // Add probe paths from RICEVM_PROBE env var
     if let Ok(probe) = std::env::var("RICEVM_PROBE") {
         for dir in probe.split(':') {
@@ -296,9 +299,7 @@ pub(crate) fn op_goto(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         crate::address::AddrTarget::Frame(off) => {
             crate::memory::read_word(&vm.frames.data, off + index * 4)
         }
-        crate::address::AddrTarget::Mp(off) => {
-            crate::memory::read_word(&vm.mp, off + index * 4)
-        }
+        crate::address::AddrTarget::Mp(off) => crate::memory::read_word(&vm.mp, off + index * 4),
         _ => vm.dst_word()?,
     };
     vm.next_pc = target as usize;

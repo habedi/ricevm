@@ -118,28 +118,72 @@ fn math_stub_int(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-fn math_acos(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::acos) }
-fn math_acosh(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::acosh) }
-fn math_asin(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::asin) }
-fn math_asinh(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::asinh) }
-fn math_atan(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::atan) }
-fn math_atanh(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::atanh) }
-fn math_cbrt(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::cbrt) }
-fn math_ceil(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::ceil) }
-fn math_cos(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::cos) }
-fn math_cosh(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::cosh) }
-fn math_exp(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::exp) }
-fn math_fabs(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::abs) }
-fn math_floor(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::floor) }
-fn math_log(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::ln) }
-fn math_log10(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::log10) }
-fn math_log1p(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::ln_1p) }
-fn math_rint(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::round) }
-fn math_sin(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::sin) }
-fn math_sinh(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::sinh) }
-fn math_sqrt(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::sqrt) }
-fn math_tan(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::tan) }
-fn math_tanh(vm: &mut VmState<'_>) -> Result<(), ExecError> { unary_real(vm, f64::tanh) }
+fn math_acos(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::acos)
+}
+fn math_acosh(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::acosh)
+}
+fn math_asin(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::asin)
+}
+fn math_asinh(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::asinh)
+}
+fn math_atan(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::atan)
+}
+fn math_atanh(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::atanh)
+}
+fn math_cbrt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::cbrt)
+}
+fn math_ceil(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::ceil)
+}
+fn math_cos(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::cos)
+}
+fn math_cosh(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::cosh)
+}
+fn math_exp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::exp)
+}
+fn math_fabs(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::abs)
+}
+fn math_floor(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::floor)
+}
+fn math_log(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::ln)
+}
+fn math_log10(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::log10)
+}
+fn math_log1p(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::ln_1p)
+}
+fn math_rint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::round)
+}
+fn math_sin(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::sin)
+}
+fn math_sinh(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::sinh)
+}
+fn math_sqrt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::sqrt)
+}
+fn math_tan(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::tan)
+}
+fn math_tanh(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::tanh)
+}
 
 fn unary_real(vm: &mut VmState<'_>, f: fn(f64) -> f64) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
@@ -234,7 +278,11 @@ fn math_finite(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn math_ilogb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
-    let result = if x == 0.0 { i32::MIN } else { x.abs().log2().floor() as i32 };
+    let result = if x == 0.0 {
+        i32::MIN
+    } else {
+        x.abs().log2().floor() as i32
+    };
     memory::write_word(&mut vm.frames.data, base, result);
     Ok(())
 }
@@ -295,6 +343,10 @@ fn math_fdim(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, if x > y { x - y } else { 0.0 });
+    memory::write_real(
+        &mut vm.frames.data,
+        base + RET_OFF,
+        if x > y { x - y } else { 0.0 },
+    );
     Ok(())
 }

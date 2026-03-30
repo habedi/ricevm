@@ -24,6 +24,7 @@ pub(crate) struct VmState<'m> {
     pub heap: Heap,
     pub modules: ModuleRegistry,
     pub loaded_modules: Vec<LoadedModule>,
+    pub files: crate::filetab::FileTable,
     pub pc: usize,
     pub next_pc: usize,
     pub halted: bool,
@@ -61,6 +62,28 @@ impl<'m> VmState<'m> {
         };
         frames.push_entry(frame_size, -1); // -1 sentinel for "no caller"
 
+        // Set up entry frame args for the Limbo init() convention:
+        // fp[32] = ref Draw->Context (nil)
+        // fp[36] = list of string (program name)
+        if frame_size >= 40 {
+            let prog_name = heap.alloc(0, heap::HeapData::Str(module.name.clone()));
+            let mut head = vec![0u8; 4];
+            memory::write_word(&mut head, 0, prog_name as i32);
+            let args_list = heap.alloc(
+                0,
+                heap::HeapData::List {
+                    head,
+                    tail: heap::NIL,
+                },
+            );
+            let fp_base = frames.current_data_offset();
+            // fp[32] = nil (already 0)
+            // fp[36] = args list
+            if fp_base + 40 <= frames.data.len() {
+                memory::write_word(&mut frames.data, fp_base + 36, args_list as i32);
+            }
+        }
+
         let mut modules = ModuleRegistry::new();
         modules.register(sys::create_sys_module());
         modules.register(crate::math::create_math_module());
@@ -75,6 +98,7 @@ impl<'m> VmState<'m> {
             heap,
             modules,
             loaded_modules: Vec::new(),
+            files: crate::filetab::FileTable::new(),
             pc: module.header.entry_pc as usize,
             next_pc: 0,
             halted: false,
@@ -363,6 +387,7 @@ impl<'m> VmState<'m> {
     pub(crate) fn mid_real(&self) -> Result<Real, ExecError> {
         self.read_real_at(self.mid, self.imm_mid)
     }
+    #[allow(dead_code)]
     pub(crate) fn dst_real(&self) -> Result<Real, ExecError> {
         self.read_real_at(self.dst, self.imm_dst)
     }

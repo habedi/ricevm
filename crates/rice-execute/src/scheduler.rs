@@ -132,13 +132,21 @@ impl<'m> Scheduler<'m> {
                 let fp_base = thread.frames.current_data_offset();
                 thread.imm_src = inst.source.register1;
                 thread.src = address::resolve_operand(
-                    &inst.source, fp_base, &thread.frames.data, &thread.mp, &thread.heap_refs,
+                    &inst.source,
+                    fp_base,
+                    &thread.frames.data,
+                    &thread.mp,
+                    &thread.heap_refs,
                 )?;
                 thread.imm_mid = inst.middle.register1;
                 thread.mid = address::resolve_middle(&inst.middle, fp_base)?;
                 thread.imm_dst = inst.destination.register1;
                 thread.dst = address::resolve_operand(
-                    &inst.destination, fp_base, &thread.frames.data, &thread.mp, &thread.heap_refs,
+                    &inst.destination,
+                    fp_base,
+                    &thread.frames.data,
+                    &thread.mp,
+                    &thread.heap_refs,
                 )?;
                 thread.next_pc = thread.pc + 1;
             }
@@ -167,6 +175,7 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
         heap: std::mem::replace(&mut sched.heap, Heap::new()),
         modules: std::mem::replace(&mut sched.modules, ModuleRegistry::new()),
         loaded_modules: std::mem::take(&mut sched.loaded_modules),
+        files: crate::filetab::FileTable::new(),
         pc: thread.pc,
         next_pc: thread.next_pc,
         halted: thread.halted,

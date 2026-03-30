@@ -100,7 +100,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Dual license (MIT and Apache 2.0)
 - [x] Unit tests for instruction decoding and execution
 - [x] End-to-end pipeline tests (loader → executor) with hand-crafted `.dis` binaries
-- [ ] Integration tests with Limbo-compiled `.dis` modules
+- [x] Integration tests with real Inferno OS `.dis` modules (`echo.dis` and `cat.dis`)
 - [x] Property-based tests for binary format parsing
 - [x] Fuzz testing setup for the module loader (`cargo-fuzz` with `libfuzzer`)
 

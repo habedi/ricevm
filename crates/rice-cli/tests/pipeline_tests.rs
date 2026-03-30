@@ -123,8 +123,59 @@ fn load_and_execute_arithmetic_module() {
     ricevm_execute::execute(&module).expect("should execute cleanly");
 }
 
+/// Test with a real Inferno OS .dis file (echo.dis from external/inferno-os).
+/// This is the acid test: a real Limbo-compiled program running on RiceVM.
 #[test]
-#[ignore = "requires real Limbo-compiled .dis file"]
-fn load_and_execute_hello_world() {
-    todo!()
+fn load_and_execute_real_echo_dis() {
+    // Try to find echo.dis in the external submodule
+    let paths = [
+        "external/inferno-os/dis/echo.dis",
+        "../external/inferno-os/dis/echo.dis",
+        "../../external/inferno-os/dis/echo.dis",
+    ];
+    let mut found = None;
+    for p in &paths {
+        if std::path::Path::new(p).exists() {
+            found = Some(*p);
+            break;
+        }
+    }
+    let Some(path) = found else {
+        eprintln!("echo.dis not found, skipping (run git submodule update --init)");
+        return;
+    };
+
+    let bytes = std::fs::read(path).expect("should read echo.dis");
+    let module = ricevm_loader::load(&bytes).expect("should parse echo.dis");
+    assert_eq!(module.name, "Echo");
+    assert_eq!(module.code.len(), 56);
+    assert_eq!(module.imports.len(), 1);
+    // Execute — echo with no args should print a newline and exit cleanly
+    ricevm_execute::execute(&module).expect("echo.dis should execute cleanly");
+}
+
+/// Test with cat.dis — with no args, cat reads stdin (which is empty), exits cleanly.
+#[test]
+fn load_and_execute_real_cat_dis() {
+    let paths = [
+        "external/inferno-os/dis/cat.dis",
+        "../external/inferno-os/dis/cat.dis",
+        "../../external/inferno-os/dis/cat.dis",
+    ];
+    let mut found = None;
+    for p in &paths {
+        if std::path::Path::new(p).exists() {
+            found = Some(*p);
+            break;
+        }
+    }
+    let Some(path) = found else {
+        eprintln!("cat.dis not found, skipping");
+        return;
+    };
+
+    let bytes = std::fs::read(path).expect("should read cat.dis");
+    let module = ricevm_loader::load(&bytes).expect("should parse cat.dis");
+    assert_eq!(module.name, "Cat");
+    ricevm_execute::execute(&module).expect("cat.dis should execute cleanly");
 }

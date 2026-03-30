@@ -6,7 +6,8 @@ mod address;
 mod builtin;
 mod channel;
 mod data;
-#[allow(unused_imports, unused_variables, dead_code)]
+mod debugger;
+#[allow(unused_imports, unused_variables, dead_code, clippy::collapsible_if)]
 mod draw;
 mod filetab;
 mod frame;
@@ -17,6 +18,8 @@ mod memory;
 mod ops;
 mod scheduler;
 mod sys;
+#[allow(unused_imports, unused_variables, dead_code)]
+mod tk;
 mod vm;
 
 use ricevm_core::{ExecError, Module};
@@ -37,6 +40,16 @@ pub fn execute(module: &Module) -> Result<(), ExecError> {
     );
     let mut state = vm::VmState::new(module)?;
     state.run()
+}
+
+/// Run a loaded Dis module under the interactive debugger.
+pub fn debug(module: &Module) -> Result<(), ExecError> {
+    let entry_pc = module.header.entry_pc;
+    if entry_pc < 0 || entry_pc as usize >= module.code.len() {
+        return Err(ExecError::InvalidPc(entry_pc));
+    }
+    let mut dbg = debugger::Debugger::new(module)?;
+    dbg.run_interactive()
 }
 
 #[cfg(test)]
@@ -103,6 +116,7 @@ mod tests {
             id: 0,
             size,
             pointer_map: PointerMap { bytes: vec![] },
+            pointer_count: 0,
         }
     }
 
@@ -204,7 +218,9 @@ mod tests {
             handlers: vec![],
         };
         let result = execute(&module);
-        assert!(matches!(result, Err(ExecError::ThreadFault(_))));
+        // Division by zero now writes 0 to dst instead of faulting.
+        // The module has no Exit instruction so it falls off the end with InvalidPc.
+        assert!(matches!(result, Err(ExecError::InvalidPc(_))));
     }
 
     #[test]
@@ -534,6 +550,173 @@ mod tests {
             handlers: vec![],
         };
         assert!(execute(&module).is_ok());
+    }
+
+    #[test]
+    fn execute_load_self_and_mcall_main_module() {
+        let module = Module {
+            header: Header {
+                data_size: 8,
+                ..make_header(6, 2, 0)
+            },
+            code: vec![
+                make_inst(Opcode::Load, mp(0), mid_imm(0), fp(0)),
+                make_inst(Opcode::Mframe, fp(0), mid_imm(0), fp(4)),
+                make_inst(Opcode::Mcall, fp(4), mid_imm(0), fp(0)),
+                exit_inst(),
+                make_inst(Opcode::Movw, imm(42), mid_none(), mp(4)),
+                make_inst(Opcode::Ret, none(), mid_none(), none()),
+            ],
+            types: vec![type_desc(64), type_desc(32)],
+            data: vec![DataItem::String {
+                offset: 0,
+                value: "$self".to_string(),
+            }],
+            name: "test_load_self".to_string(),
+            exports: vec![ExportEntry {
+                pc: 4,
+                frame_type: 1,
+                signature: 0x1234,
+                name: "set_value".to_string(),
+            }],
+            imports: vec![],
+            handlers: vec![],
+        };
+
+        let mut state = vm::VmState::new(&module).expect("vm should initialize");
+        state.run().expect("self-load mcall should execute cleanly");
+        assert_eq!(crate::memory::read_word(&state.mp, 4), 42);
+    }
+
+    #[test]
+    fn execute_load_self_and_mspawn_main_module() {
+        let module = Module {
+            header: Header {
+                data_size: 8,
+                ..make_header(6, 2, 0)
+            },
+            code: vec![
+                make_inst(Opcode::Load, mp(0), mid_imm(0), fp(0)),
+                make_inst(Opcode::Mframe, fp(0), mid_imm(0), fp(4)),
+                make_inst(Opcode::Mspawn, fp(4), mid_imm(0), fp(0)),
+                exit_inst(),
+                make_inst(Opcode::Movw, imm(77), mid_none(), mp(4)),
+                make_inst(Opcode::Ret, none(), mid_none(), none()),
+            ],
+            types: vec![type_desc(64), type_desc(32)],
+            data: vec![DataItem::String {
+                offset: 0,
+                value: "$self".to_string(),
+            }],
+            name: "test_mspawn_self".to_string(),
+            exports: vec![ExportEntry {
+                pc: 4,
+                frame_type: 1,
+                signature: 0x4321,
+                name: "set_value".to_string(),
+            }],
+            imports: vec![],
+            handlers: vec![],
+        };
+
+        let mut state = vm::VmState::new(&module).expect("vm should initialize");
+        state
+            .run()
+            .expect("self-load mspawn should execute cleanly");
+        assert_eq!(crate::memory::read_word(&state.mp, 4), 77);
+    }
+
+    #[test]
+    fn direct_mspawn_executes_loaded_module_inline() {
+        let main_module = Module {
+            header: make_header(1, 1, 0),
+            code: vec![exit_inst()],
+            types: vec![type_desc(32)],
+            data: vec![],
+            name: "test_mspawn_main".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        };
+        let loaded_module = Module {
+            header: Header {
+                data_size: 4,
+                ..make_header(2, 2, 0)
+            },
+            code: vec![
+                make_inst(Opcode::Movw, imm(99), mid_none(), mp(0)),
+                make_inst(Opcode::Ret, none(), mid_none(), none()),
+            ],
+            types: vec![type_desc(64), type_desc(32)],
+            data: vec![],
+            name: "loaded_for_mspawn".to_string(),
+            exports: vec![ExportEntry {
+                pc: 0,
+                frame_type: 1,
+                signature: 0x9999,
+                name: "set_loaded".to_string(),
+            }],
+            imports: vec![],
+            handlers: vec![],
+        };
+
+        let mut state = vm::VmState::new(&main_module).expect("vm should initialize");
+        state.loaded_modules.push(vm::LoadedModule {
+            module: loaded_module,
+            mp: vec![0; 4],
+        });
+        let mod_ref_id = state.heap.alloc(
+            0,
+            crate::heap::HeapData::LoadedModule {
+                module_idx: 0,
+                func_map: Vec::new(),
+            },
+        );
+        let frame_ptr = state.frames.alloc_pending(32).expect("frame alloc");
+
+        state.src = crate::address::AddrTarget::Immediate;
+        state.imm_src = frame_ptr as i32;
+        state.mid = crate::address::AddrTarget::Immediate;
+        state.imm_mid = 0;
+        state.dst = crate::address::AddrTarget::Immediate;
+        state.imm_dst = mod_ref_id as i32;
+
+        crate::ops::concurrency::op_mspawn(&mut state).expect("mspawn should succeed");
+
+        assert_eq!(crate::memory::read_word(&state.loaded_modules[0].mp, 0), 99);
+        assert!(state.current_loaded_module.is_none());
+    }
+
+    #[test]
+    fn execute_self_opcode_returns_main_module_ref() {
+        let module = Module {
+            header: make_header(2, 1, 0),
+            code: vec![
+                make_inst(Opcode::Self_, none(), mid_none(), fp(0)),
+                exit_inst(),
+            ],
+            types: vec![type_desc(32)],
+            data: vec![],
+            name: "test_self_opcode".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        };
+
+        let mut state = vm::VmState::new(&module).expect("vm should initialize");
+        state.run().expect("self opcode should execute cleanly");
+
+        let ref_id =
+            crate::memory::read_word(&state.frames.data, state.frames.current_data_offset()) as u32;
+        match &state
+            .heap
+            .get(ref_id)
+            .expect("module ref should exist")
+            .data
+        {
+            crate::heap::HeapData::MainModule { func_map } => assert!(func_map.is_empty()),
+            other => panic!("expected main module ref, got {other:?}"),
+        }
     }
 
     #[test]

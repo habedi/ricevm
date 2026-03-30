@@ -62,7 +62,7 @@ impl FrameStack {
         data_area_offset: usize,
         saved_pc: Pc,
     ) -> Result<(), ExecError> {
-        let new_base = data_area_offset - FRAME_HEADER_SIZE;
+        let new_base = data_area_offset.saturating_sub(FRAME_HEADER_SIZE);
         let new_size = self.data.len() - new_base;
         // Write header
         memory::write_word(&mut self.data, new_base, saved_pc);
@@ -84,9 +84,12 @@ impl FrameStack {
         if self.data.is_empty() {
             self.current_base = 0;
             self.current_size = 0;
-        } else {
+        } else if self.current_base >= prev_base {
             self.current_size = self.current_base - prev_base;
             self.current_base = prev_base;
+        } else {
+            self.current_base = 0;
+            self.current_size = self.data.len();
         }
         Ok(prev_pc)
     }

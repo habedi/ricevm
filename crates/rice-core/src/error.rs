@@ -21,6 +21,9 @@ pub enum LoadError {
     #[error("invalid address mode: {0:#x}")]
     InvalidAddressMode(u8),
 
+    #[error("validation error: {0}")]
+    ValidationError(String),
+
     #[error("{0}")]
     Other(String),
 }

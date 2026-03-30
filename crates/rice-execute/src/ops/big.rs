@@ -24,7 +24,7 @@ pub(crate) fn op_divl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_big()?;
     let m = vm.mid_big()?;
     if m == 0 {
-        return Err(ExecError::ThreadFault("division by zero".to_string()));
+        return vm.set_dst_big(0);
     }
     vm.set_dst_big(s.wrapping_div(m))
 }
@@ -33,7 +33,7 @@ pub(crate) fn op_modl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_big()?;
     let m = vm.mid_big()?;
     if m == 0 {
-        return Err(ExecError::ThreadFault("modulo by zero".to_string()));
+        return vm.set_dst_big(0);
     }
     vm.set_dst_big(s.wrapping_rem(m))
 }

@@ -15,13 +15,9 @@ pub(crate) fn op_jmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 pub(crate) fn op_frame(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let type_idx = vm.src_word()? as usize;
-    let frame_size = if type_idx < vm.module.types.len() {
-        vm.module.types[type_idx].size as usize
-    } else {
-        return Err(ExecError::Other(format!(
-            "invalid type descriptor index: {type_idx}"
-        )));
-    };
+    let frame_size = vm
+        .current_type_size(type_idx)
+        .ok_or_else(|| ExecError::Other(format!("invalid type index: {type_idx}")))?;
     let pending_data_offset = vm.frames.alloc_pending(frame_size)?;
     vm.set_dst_word(pending_data_offset as i32)
 }
@@ -55,12 +51,64 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     // Get the import table index to build function mapping
     let import_idx = vm.mid_word()? as usize;
 
-    // 1. Try built-in module first
+    // Resolve the caller's import table for this import index.
+    // Use the currently executing module's import table.
+    let imports = if let Some(lm_idx) = vm.current_loaded_module {
+        vm.loaded_modules
+            .get(lm_idx)
+            .and_then(|lm| lm.module.imports.get(import_idx))
+            .cloned()
+    } else if import_idx < vm.module.imports.len() {
+        Some(vm.module.imports[import_idx].clone())
+    } else {
+        None
+    };
+
+    // 1. Special case: "$self" returns a reference to the current module.
+    if path == "$self" {
+        let func_map = if let Some(imp_mod) = imports.as_ref() {
+            let exports = if let Some(module_idx) = vm.current_loaded_module {
+                &vm.loaded_modules[module_idx].module.exports
+            } else {
+                &vm.module.exports
+            };
+            imp_mod
+                .functions
+                .iter()
+                .map(|imp| {
+                    let sig = imp.signature as u32;
+                    exports.iter().position(|e| e.signature as u32 == sig)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let ref_id = if let Some(module_idx) = vm.current_loaded_module {
+            vm.heap.alloc(
+                0,
+                HeapData::LoadedModule {
+                    module_idx,
+                    func_map,
+                },
+            )
+        } else {
+            vm.heap.alloc(0, HeapData::MainModule { func_map })
+        };
+        return vm.move_ptr_to_dst(ref_id);
+    }
+
+    // 2. Try built-in module first
     if let Some(module_id) = vm.modules.find_builtin(&path) {
-        // Build function mapping from caller's import table signatures
-        // to builtin function indices
-        let func_map = if import_idx < vm.module.imports.len() {
-            vm.module.imports[import_idx]
+        tracing::trace!(
+            path = path,
+            import_idx = import_idx,
+            current_loaded = ?vm.current_loaded_module,
+            has_imports = imports.is_some(),
+            "load: building func_map"
+        );
+        let func_map = if let Some(imp_mod) = imports.as_ref() {
+            imp_mod
                 .functions
                 .iter()
                 .map(|imp| {
@@ -83,30 +131,71 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         return vm.move_ptr_to_dst(ref_id);
     }
 
-    // 2. Try loading from filesystem
+    // 3. Try loading from filesystem
     let mut candidates = vec![path.clone(), format!("{path}.dis")];
+
+    // Strip common Inferno prefixes for relative resolution
+    let stripped_paths: Vec<String> = ["/dis/lib/", "/dis/", "/"]
+        .iter()
+        .filter_map(|prefix| path.strip_prefix(prefix).map(|s| s.to_string()))
+        .collect();
+
     // Add probe paths from RICEVM_PROBE env var
     if let Ok(probe) = std::env::var("RICEVM_PROBE") {
         for dir in probe.split(':') {
             if !dir.is_empty() {
                 candidates.push(format!("{dir}/{path}"));
                 candidates.push(format!("{dir}/{path}.dis"));
+                // Also try stripped paths
+                for sp in &stripped_paths {
+                    candidates.push(format!("{dir}/{sp}"));
+                    candidates.push(format!("{dir}/{sp}.dis"));
+                }
             }
         }
     }
     candidates.push(format!("./{path}.dis"));
+    for sp in &stripped_paths {
+        candidates.push(sp.clone());
+        candidates.push(format!("{sp}.dis"));
+    }
 
     for candidate in &candidates {
         if let Ok(bytes) = std::fs::read(candidate)
             && let Ok(module) = ricevm_loader::load(&bytes)
         {
-            tracing::info!(name = %module.name, path = %candidate, "Loaded module from file");
+            tracing::trace!(name = %module.name, path = %candidate, "Loaded module from file");
             let mp =
                 crate::data::init_mp(module.header.data_size as usize, &module.data, &mut vm.heap);
+
+            // Build func_map: match caller's import function signatures
+            // against the loaded module's export signatures.
+            let func_map = if let Some(imp_mod) = imports.as_ref() {
+                imp_mod
+                    .functions
+                    .iter()
+                    .map(|imp| {
+                        let sig = imp.signature as u32;
+                        module
+                            .exports
+                            .iter()
+                            .position(|e| e.signature as u32 == sig)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
             let module_idx = vm.loaded_modules.len();
             vm.loaded_modules
                 .push(crate::vm::LoadedModule { module, mp });
-            let ref_id = vm.heap.alloc(0, HeapData::LoadedModule { module_idx });
+            let ref_id = vm.heap.alloc(
+                0,
+                HeapData::LoadedModule {
+                    module_idx,
+                    func_map,
+                },
+            );
             return vm.move_ptr_to_dst(ref_id);
         }
     }
@@ -116,17 +205,24 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 /// Resolved module reference: either a built-in or a loaded .dis module.
-enum ModuleKind {
+pub(crate) enum ModuleKind {
     Builtin {
         module_id: u32,
         func_map: Vec<Option<usize>>,
     },
+    Main {
+        func_map: Vec<Option<usize>>,
+    },
     Loaded {
         module_idx: usize,
+        func_map: Vec<Option<usize>>,
     },
 }
 
-fn resolve_module_ref(vm: &VmState<'_>, heap_id: heap::HeapId) -> Result<ModuleKind, ExecError> {
+pub(crate) fn resolve_module_ref(
+    vm: &VmState<'_>,
+    heap_id: heap::HeapId,
+) -> Result<ModuleKind, ExecError> {
     match vm.heap.get(heap_id) {
         Some(obj) => match &obj.data {
             HeapData::ModuleRef {
@@ -136,8 +232,15 @@ fn resolve_module_ref(vm: &VmState<'_>, heap_id: heap::HeapId) -> Result<ModuleK
                 module_id: *module_id,
                 func_map: func_map.clone(),
             }),
-            HeapData::LoadedModule { module_idx } => Ok(ModuleKind::Loaded {
+            HeapData::MainModule { func_map } => Ok(ModuleKind::Main {
+                func_map: func_map.clone(),
+            }),
+            HeapData::LoadedModule {
+                module_idx,
+                func_map,
+            } => Ok(ModuleKind::Loaded {
                 module_idx: *module_idx,
+                func_map: func_map.clone(),
             }),
             _ => Err(ExecError::ThreadFault("not a module ref".to_string())),
         },
@@ -171,18 +274,43 @@ pub(crate) fn op_mframe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     ))
                 })?
         }
-        ModuleKind::Loaded { module_idx } => {
-            // For loaded modules, get frame size from the module's export + type section
+        ModuleKind::Main { func_map } => {
+            let export_idx = func_map
+                .get(func_idx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(func_idx as usize);
+            if export_idx < vm.module.exports.len() {
+                let frame_type = vm.module.exports[export_idx].frame_type as usize;
+                if frame_type < vm.module.types.len() {
+                    vm.module.types[frame_type].size as usize
+                } else {
+                    64
+                }
+            } else {
+                64
+            }
+        }
+        ModuleKind::Loaded {
+            module_idx,
+            func_map,
+        } => {
+            // Map caller's import index to loaded module's export index
+            let export_idx = func_map
+                .get(func_idx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(func_idx as usize);
             let loaded = &vm.loaded_modules[module_idx];
-            if (func_idx as usize) < loaded.module.exports.len() {
-                let frame_type = loaded.module.exports[func_idx as usize].frame_type as usize;
+            if export_idx < loaded.module.exports.len() {
+                let frame_type = loaded.module.exports[export_idx].frame_type as usize;
                 if frame_type < loaded.module.types.len() {
                     loaded.module.types[frame_type].size as usize
                 } else {
-                    64 // default
+                    64
                 }
             } else {
-                64 // default
+                64
             }
         }
     };
@@ -231,19 +359,69 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 vm.next_pc = prev_pc as usize;
             }
         }
-        ModuleKind::Loaded { module_idx } => {
-            // For loaded Limbo modules: we would need to switch the execution
-            // context to the loaded module's code. This requires saving the
-            // current module/mp/pc and running the loaded module's code.
-            // For now, this is a simplified implementation that doesn't support
-            // re-entrant execution across modules.
+        ModuleKind::Main { func_map } => {
+            if vm.current_loaded_module.is_some() {
+                return Err(ExecError::Other(
+                    "calling main-module refs from loaded modules is unsupported".to_string(),
+                ));
+            }
+
+            let export_idx = func_map
+                .get(func_idx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(func_idx as usize);
+            let entry_pc = if export_idx < vm.module.exports.len() {
+                vm.module.exports[export_idx].pc as usize
+            } else {
+                return Err(ExecError::Other(format!(
+                    "export function {func_idx} (mapped to {export_idx}) not found in main module"
+                )));
+            };
+
+            let saved_pc = vm.pc;
+            let saved_next_pc = vm.next_pc;
+
+            vm.pc = entry_pc;
+            vm.halted = false;
+            let mcall_frame_base = vm.frames.current_data_offset();
+
+            while !vm.halted && vm.pc < vm.module.code.len() {
+                let inst = vm.module.code[vm.pc].clone();
+                if vm.trace {
+                    vm.trace_instruction(&inst);
+                }
+                vm.resolve_operands(&inst)?;
+                vm.next_pc = vm.pc + 1;
+                crate::ops::dispatch(vm, &inst)?;
+                vm.pc = vm.next_pc;
+
+                if vm.frames.current_data_offset() < mcall_frame_base {
+                    break;
+                }
+            }
+
+            vm.pc = saved_pc;
+            vm.next_pc = saved_next_pc;
+            vm.halted = false;
+        }
+        ModuleKind::Loaded {
+            module_idx,
+            func_map,
+        } => {
+            // Map caller's import index to loaded module's export index
+            let export_idx = func_map
+                .get(func_idx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(func_idx as usize);
             let entry_pc = {
                 let loaded = &vm.loaded_modules[module_idx];
-                if (func_idx as usize) < loaded.module.exports.len() {
-                    loaded.module.exports[func_idx as usize].pc as usize
+                if export_idx < loaded.module.exports.len() {
+                    loaded.module.exports[export_idx].pc as usize
                 } else {
                     return Err(ExecError::Other(format!(
-                        "export function {func_idx} not found in loaded module"
+                        "export function {func_idx} (mapped to {export_idx}) not found in loaded module"
                     )));
                 }
             };
@@ -251,17 +429,25 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             // Save current execution context
             let saved_pc = vm.pc;
             let saved_next_pc = vm.next_pc;
-            let saved_mp = std::mem::take(&mut vm.mp);
+            let saved_loaded_module = vm.current_loaded_module;
 
-            // Switch to loaded module's context
-            // Safety: we need to borrow the loaded module's code section
-            // This is a temporary pointer swap — the module lives in loaded_modules
+            // Swap MP with the loaded module's persistent MP.
+            // This ensures module refs stored during execution persist
+            // in the loaded module's MP for subsequent calls.
+            let loaded_mp = std::mem::take(&mut vm.loaded_modules[module_idx].mp);
+            let parent_mp = std::mem::replace(&mut vm.mp, loaded_mp);
+
             let loaded_code_len = vm.loaded_modules[module_idx].module.code.len();
-            vm.mp = vm.loaded_modules[module_idx].mp.clone();
+            vm.current_loaded_module = Some(module_idx);
             vm.pc = entry_pc;
             vm.halted = false;
 
-            // Execute the loaded module's code until it returns
+            // Track the frame stack state before entering the loaded module.
+            // The mcall frame was already activated above. Record the current
+            // frame base so we can detect when Ret pops past it.
+            let mcall_frame_base = vm.frames.current_data_offset();
+
+            // Execute the loaded module's code
             while !vm.halted && vm.pc < loaded_code_len {
                 let inst = vm.loaded_modules[module_idx].module.code[vm.pc].clone();
                 if vm.trace {
@@ -272,14 +458,19 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 crate::ops::dispatch(vm, &inst)?;
                 vm.pc = vm.next_pc;
 
-                // Check if we've returned (frame popped back to caller)
-                // The saved_pc in the frame header will be the return address
+                // If Ret popped our mcall frame (current frame's data area
+                // is now below where we started), the function returned.
+                if vm.frames.current_data_offset() < mcall_frame_base {
+                    break;
+                }
             }
 
-            // Restore context
-            vm.mp = saved_mp;
+            // Write back the loaded module's MP (preserving any changes),
+            // then restore the parent's MP.
+            vm.loaded_modules[module_idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
             vm.pc = saved_pc;
             vm.next_pc = saved_next_pc;
+            vm.current_loaded_module = saved_loaded_module;
             vm.halted = false;
         }
     }

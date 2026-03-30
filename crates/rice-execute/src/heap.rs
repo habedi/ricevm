@@ -36,10 +36,24 @@ pub(crate) enum HeapData {
         module_id: u32,
         func_map: Vec<Option<usize>>,
     },
+    /// A reference to the main module being executed by the VM.
+    /// `func_map` maps caller import indices to export indices.
+    MainModule { func_map: Vec<Option<usize>> },
     /// A loaded Dis module from a .dis file.
-    LoadedModule { module_idx: usize },
-    /// A Dis channel (stub for milestone 3).
-    Channel,
+    /// `func_map` maps caller's import function indices to loaded module's export indices.
+    LoadedModule {
+        module_idx: usize,
+        func_map: Vec<Option<usize>>,
+    },
+    /// A Dis channel with a single pending payload.
+    Channel {
+        elem_size: usize,
+        pending: Option<Vec<u8>>,
+    },
+    /// A Dis ADT (abstract data type) with a pick tag.
+    /// `tag` identifies which pick variant is active (0 = base fields only).
+    /// `data` contains the fields as a flat byte buffer, same layout as Record.
+    Adt { tag: u32, data: Vec<u8> },
 }
 
 /// A heap-allocated object with reference count.

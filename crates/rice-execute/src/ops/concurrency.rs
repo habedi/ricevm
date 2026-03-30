@@ -1,112 +1,642 @@
 //! Concurrency opcodes.
 //!
-//! spawn/send/recv are implemented with simplified semantics.
-//! In a single-threaded execution context (the current default), spawn
-//! creates a new thread that will be run by the scheduler, and send/recv
-//! operate on the channel's internal queues.
+//! `spawn` executes the spawned function inline (cooperative, not preemptive).
+//! Channels are modeled as single-slot buffers stored in heap objects.
+//! `alt` and `nbalt` scan a flat table of channel operations.
 
 use ricevm_core::ExecError;
 
-use crate::heap::{self, HeapData};
+use super::control::{ModuleKind, resolve_module_ref};
+use crate::address::AddrTarget;
+use crate::heap::{self, HeapData, HeapId};
+use crate::memory;
 use crate::vm::VmState;
+
+#[derive(Clone, Copy)]
+enum TableBase {
+    Frame,
+    Mp,
+}
+
+#[derive(Clone, Copy)]
+struct AltEntry {
+    channel_id: HeapId,
+    is_send: bool,
+    data_offset: usize,
+}
+
+enum AltOutcome {
+    Selected(usize),
+    NoneReady,
+}
 
 /// spawn src, dst — create a new thread in the current module.
 /// src = frame pointer (pre-allocated via `frame`), dst = target PC.
 ///
-/// In the current single-threaded model, we log a warning and
-/// execute the spawned code inline (not truly concurrent).
+/// Cooperative implementation: activates the pending frame and runs the
+/// spawned function inline until it returns, then continues the caller.
 pub(crate) fn op_spawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let _frame_ptr = vm.src_word()?;
-    let target_pc = vm.dst_word()?;
-    tracing::warn!(
-        target_pc = target_pc,
-        "spawn: concurrent threads not fully supported, executing inline"
-    );
-    // For now, record the spawn target but don't actually create a thread.
-    // A full implementation would fork the frame stack and create a new VmThread.
+    let frame_ptr = vm.src_word()? as usize;
+    let target_pc = vm.dst_word()? as usize;
+
+    vm.frames.activate_pending(frame_ptr, vm.next_pc as i32)?;
+
+    let saved_pc = vm.pc;
+    let saved_next_pc = vm.next_pc;
+    vm.pc = target_pc;
+
+    let code_len = vm.module.code.len();
+    let mut steps = 0;
+    const MAX_SPAWN_STEPS: usize = 1_000_000;
+
+    while !vm.halted && vm.pc < code_len && steps < MAX_SPAWN_STEPS {
+        let inst = vm.module.code[vm.pc].clone();
+        if vm.trace {
+            vm.trace_instruction(&inst);
+        }
+        vm.resolve_operands(&inst)?;
+        vm.next_pc = vm.pc + 1;
+        crate::ops::dispatch(vm, &inst)?;
+        vm.pc = vm.next_pc;
+        steps += 1;
+
+        if vm.pc == saved_next_pc {
+            break;
+        }
+    }
+
+    if vm.halted {
+        vm.halted = false;
+    }
+
+    vm.pc = saved_pc;
+    vm.next_pc = saved_next_pc;
+
     Ok(())
 }
 
 /// mspawn src, mid, dst — create a thread in a loaded module.
 pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let _frame_ptr = vm.src_word()?;
-    let _func_idx = vm.mid_word()?;
-    let _mod_ref = vm.dst_ptr()?;
-    tracing::warn!("mspawn: concurrent threads not fully supported");
+    let frame_ptr = vm.src_word()? as usize;
+    let func_idx = vm.mid_word()? as u32;
+    let mod_ref_id = vm.dst_ptr()?;
+    let kind = resolve_module_ref(vm, mod_ref_id)?;
+
+    vm.frames.activate_pending(frame_ptr, vm.next_pc as i32)?;
+
+    let saved_pc = vm.pc;
+    let saved_next_pc = vm.next_pc;
+    let spawn_frame_base = vm.frames.current_data_offset();
+
+    match kind {
+        ModuleKind::Builtin {
+            module_id,
+            func_map,
+        } => {
+            let builtin_idx = func_map
+                .get(func_idx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(func_idx as usize);
+            let handler = vm
+                .modules
+                .get_func(module_id, builtin_idx as u32)
+                .map(|f| f.handler)
+                .ok_or_else(|| {
+                    ExecError::Other(format!(
+                        "builtin function not found: module={module_id}, func={func_idx} (mapped to {builtin_idx})"
+                    ))
+                })?;
+            handler(vm)?;
+            let prev_pc = vm.frames.pop()?;
+            if prev_pc >= 0 {
+                vm.next_pc = prev_pc as usize;
+            }
+        }
+        ModuleKind::Main { func_map } => {
+            if vm.current_loaded_module.is_some() {
+                return Err(ExecError::Other(
+                    "spawning main-module refs from loaded modules is unsupported".to_string(),
+                ));
+            }
+
+            let export_idx = func_map
+                .get(func_idx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(func_idx as usize);
+            let entry_pc = if export_idx < vm.module.exports.len() {
+                vm.module.exports[export_idx].pc as usize
+            } else {
+                return Err(ExecError::Other(format!(
+                    "export function {func_idx} (mapped to {export_idx}) not found in main module"
+                )));
+            };
+
+            vm.pc = entry_pc;
+            vm.halted = false;
+
+            while !vm.halted && vm.pc < vm.module.code.len() {
+                let inst = vm.module.code[vm.pc].clone();
+                if vm.trace {
+                    vm.trace_instruction(&inst);
+                }
+                vm.resolve_operands(&inst)?;
+                vm.next_pc = vm.pc + 1;
+                crate::ops::dispatch(vm, &inst)?;
+                vm.pc = vm.next_pc;
+
+                if vm.frames.current_data_offset() < spawn_frame_base {
+                    break;
+                }
+            }
+
+            vm.halted = false;
+        }
+        ModuleKind::Loaded {
+            module_idx,
+            func_map,
+        } => {
+            let export_idx = func_map
+                .get(func_idx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(func_idx as usize);
+            let entry_pc = {
+                let loaded = &vm.loaded_modules[module_idx];
+                if export_idx < loaded.module.exports.len() {
+                    loaded.module.exports[export_idx].pc as usize
+                } else {
+                    return Err(ExecError::Other(format!(
+                        "export function {func_idx} (mapped to {export_idx}) not found in loaded module"
+                    )));
+                }
+            };
+
+            let saved_loaded_module = vm.current_loaded_module;
+            let loaded_mp = std::mem::take(&mut vm.loaded_modules[module_idx].mp);
+            let parent_mp = std::mem::replace(&mut vm.mp, loaded_mp);
+
+            let loaded_code_len = vm.loaded_modules[module_idx].module.code.len();
+            vm.current_loaded_module = Some(module_idx);
+            vm.pc = entry_pc;
+            vm.halted = false;
+
+            while !vm.halted && vm.pc < loaded_code_len {
+                let inst = vm.loaded_modules[module_idx].module.code[vm.pc].clone();
+                if vm.trace {
+                    vm.trace_instruction(&inst);
+                }
+                vm.resolve_operands(&inst)?;
+                vm.next_pc = vm.pc + 1;
+                crate::ops::dispatch(vm, &inst)?;
+                vm.pc = vm.next_pc;
+
+                if vm.frames.current_data_offset() < spawn_frame_base {
+                    break;
+                }
+            }
+
+            vm.loaded_modules[module_idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
+            vm.current_loaded_module = saved_loaded_module;
+            vm.halted = false;
+        }
+    }
+
+    vm.pc = saved_pc;
+    vm.next_pc = saved_next_pc;
     Ok(())
+}
+
+fn channel_ref(vm: &VmState<'_>, chan_id: HeapId) -> Result<(usize, Option<Vec<u8>>), ExecError> {
+    if chan_id == heap::NIL {
+        return Err(ExecError::ThreadFault("nil channel".to_string()));
+    }
+
+    let obj = vm
+        .heap
+        .get(chan_id)
+        .ok_or_else(|| ExecError::ThreadFault("dangling channel".to_string()))?;
+    match &obj.data {
+        HeapData::Channel { elem_size, pending } => Ok((*elem_size, pending.clone())),
+        _ => Err(ExecError::ThreadFault(
+            "operation on non-channel".to_string(),
+        )),
+    }
+}
+
+fn with_channel_mut<R>(
+    vm: &mut VmState<'_>,
+    chan_id: HeapId,
+    f: impl FnOnce(usize, &mut Option<Vec<u8>>) -> R,
+) -> Result<R, ExecError> {
+    if chan_id == heap::NIL {
+        return Err(ExecError::ThreadFault("nil channel".to_string()));
+    }
+
+    let obj = vm
+        .heap
+        .get_mut(chan_id)
+        .ok_or_else(|| ExecError::ThreadFault("dangling channel".to_string()))?;
+    match &mut obj.data {
+        HeapData::Channel { elem_size, pending } => Ok(f(*elem_size, pending)),
+        _ => Err(ExecError::ThreadFault(
+            "operation on non-channel".to_string(),
+        )),
+    }
+}
+
+fn read_addr_bytes(
+    vm: &VmState<'_>,
+    target: AddrTarget,
+    imm: i32,
+    size: usize,
+) -> Result<Vec<u8>, ExecError> {
+    let mut buf = vec![0u8; size];
+    match target {
+        AddrTarget::Frame(off) => {
+            if off < vm.frames.data.len() {
+                let copy_len = size.min(vm.frames.data.len() - off);
+                buf[..copy_len].copy_from_slice(&vm.frames.data[off..off + copy_len]);
+            }
+        }
+        AddrTarget::Mp(off) => {
+            if off < vm.mp.len() {
+                let copy_len = size.min(vm.mp.len() - off);
+                buf[..copy_len].copy_from_slice(&vm.mp[off..off + copy_len]);
+            }
+        }
+        AddrTarget::Immediate => match size {
+            1 => buf[0] = imm as u8,
+            8 => buf.copy_from_slice(&(imm as i64).to_ne_bytes()),
+            _ => {
+                let word = imm.to_ne_bytes();
+                let copy_len = size.min(word.len());
+                buf[..copy_len].copy_from_slice(&word[..copy_len]);
+            }
+        },
+        AddrTarget::None => {}
+        AddrTarget::HeapArray { id, offset } => {
+            if let Some(bytes) = vm.heap_slice(id, offset, size) {
+                buf.copy_from_slice(&bytes);
+            }
+        }
+    }
+    Ok(buf)
+}
+
+fn write_addr_bytes(
+    vm: &mut VmState<'_>,
+    target: AddrTarget,
+    data: &[u8],
+) -> Result<(), ExecError> {
+    match target {
+        AddrTarget::Frame(off) => {
+            if off < vm.frames.data.len() {
+                let copy_len = data.len().min(vm.frames.data.len() - off);
+                vm.frames.data[off..off + copy_len].copy_from_slice(&data[..copy_len]);
+            }
+            Ok(())
+        }
+        AddrTarget::Mp(off) => {
+            if off < vm.mp.len() {
+                let copy_len = data.len().min(vm.mp.len() - off);
+                vm.mp[off..off + copy_len].copy_from_slice(&data[..copy_len]);
+            }
+            Ok(())
+        }
+        AddrTarget::Immediate => Err(ExecError::Other("cannot write to immediate".to_string())),
+        AddrTarget::None => Ok(()),
+        AddrTarget::HeapArray { id, offset } => {
+            if let Some(obj) = vm.heap.get_mut(id) {
+                match &mut obj.data {
+                    HeapData::Array { data: buf, .. } | HeapData::Record(buf) => {
+                        if offset < buf.len() {
+                            let copy_len = data.len().min(buf.len() - offset);
+                            buf[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn read_table_word(vm: &VmState<'_>, base: TableBase, offset: usize) -> i32 {
+    match base {
+        TableBase::Frame => memory::read_word(&vm.frames.data, offset),
+        TableBase::Mp => memory::read_word(&vm.mp, offset),
+    }
+}
+
+fn read_table_bytes(vm: &VmState<'_>, base: TableBase, offset: usize, size: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; size];
+    match base {
+        TableBase::Frame => {
+            if offset < vm.frames.data.len() {
+                let copy_len = size.min(vm.frames.data.len() - offset);
+                buf[..copy_len].copy_from_slice(&vm.frames.data[offset..offset + copy_len]);
+            }
+        }
+        TableBase::Mp => {
+            if offset < vm.mp.len() {
+                let copy_len = size.min(vm.mp.len() - offset);
+                buf[..copy_len].copy_from_slice(&vm.mp[offset..offset + copy_len]);
+            }
+        }
+    }
+    buf
+}
+
+fn write_table_bytes(vm: &mut VmState<'_>, base: TableBase, offset: usize, data: &[u8]) {
+    match base {
+        TableBase::Frame => {
+            if offset < vm.frames.data.len() {
+                let copy_len = data.len().min(vm.frames.data.len() - offset);
+                vm.frames.data[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
+            }
+        }
+        TableBase::Mp => {
+            if offset < vm.mp.len() {
+                let copy_len = data.len().min(vm.mp.len() - offset);
+                vm.mp[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
+            }
+        }
+    }
+}
+
+fn parse_alt_table(vm: &VmState<'_>) -> Result<(TableBase, usize, Vec<AltEntry>), ExecError> {
+    let (base, table_offset) = match vm.src {
+        AddrTarget::Frame(off) => (TableBase::Frame, off),
+        AddrTarget::Mp(off) => (TableBase::Mp, off),
+        _ => {
+            return Err(ExecError::Other(
+                "alt table must live in frame or module memory".to_string(),
+            ));
+        }
+    };
+
+    let count = read_table_word(vm, base, table_offset).max(0) as usize;
+    let mut entries = Vec::with_capacity(count);
+    for idx in 0..count {
+        let base_off = table_offset + 4 + idx * 12;
+        let channel_id = read_table_word(vm, base, base_off) as HeapId;
+        let is_send = read_table_word(vm, base, base_off + 4) != 0;
+        let data_offset = read_table_word(vm, base, base_off + 8).max(0) as usize;
+        entries.push(AltEntry {
+            channel_id,
+            is_send,
+            data_offset,
+        });
+    }
+
+    Ok((base, count, entries))
+}
+
+fn execute_alt(vm: &mut VmState<'_>, select_first_if_none: bool) -> Result<AltOutcome, ExecError> {
+    let (base, count, entries) = parse_alt_table(vm)?;
+
+    for (idx, entry) in entries.iter().copied().enumerate() {
+        let (elem_size, pending) = channel_ref(vm, entry.channel_id)?;
+        let ready = if entry.is_send {
+            pending.is_none()
+        } else {
+            pending.is_some()
+        };
+        if !ready {
+            continue;
+        }
+
+        if entry.is_send {
+            let data = read_table_bytes(vm, base, entry.data_offset, elem_size);
+            with_channel_mut(vm, entry.channel_id, |_, pending| {
+                *pending = Some(data);
+            })?;
+        } else {
+            let data = with_channel_mut(vm, entry.channel_id, |_, pending| {
+                pending.take().unwrap_or_else(|| vec![0u8; elem_size])
+            })?;
+            write_table_bytes(vm, base, entry.data_offset, &data);
+        }
+
+        return Ok(AltOutcome::Selected(idx));
+    }
+
+    if select_first_if_none && count > 0 {
+        Ok(AltOutcome::Selected(0))
+    } else {
+        Ok(AltOutcome::NoneReady)
+    }
 }
 
 /// send src, dst — send data through a channel.
 /// src = data to send, dst = channel pointer.
-///
-/// In the simplified model, we store the data in the channel's sender queue.
 pub(crate) fn op_send(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let chan_id = vm.dst_ptr()?;
-    if chan_id == heap::NIL {
-        return Err(ExecError::ThreadFault("send on nil channel".to_string()));
+    let (elem_size, pending) = channel_ref(vm, chan_id)?;
+    if pending.is_some() {
+        return Err(ExecError::ThreadFault("channel busy".to_string()));
     }
 
-    // Read the data from src (word-sized for simplicity)
-    let data_val = vm.src_word()?;
-
-    // Store in channel — for the simplified model, just log it
-    tracing::debug!(channel = chan_id, value = data_val, "send");
-
-    // In a full implementation, this would queue the data and potentially
-    // wake a receiving thread. For now, we store the value in the channel's
-    // heap object as a simple buffer.
-    if let Some(obj) = vm.heap.get_mut(chan_id)
-        && let HeapData::Channel = &obj.data
-    {
-        let mut buf = vec![0u8; 4];
-        crate::memory::write_word(&mut buf, 0, data_val);
-        obj.data = HeapData::Record(buf);
-    }
-
-    Ok(())
+    let src_data = read_addr_bytes(vm, vm.src, vm.imm_src, elem_size)?;
+    with_channel_mut(vm, chan_id, |_, pending| {
+        *pending = Some(src_data);
+    })
 }
 
 /// recv src, dst — receive data from a channel.
 /// src = channel pointer, dst = destination for received data.
 pub(crate) fn op_recv(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let chan_id = vm.src_ptr()?;
-    if chan_id == heap::NIL {
-        return Err(ExecError::ThreadFault("recv on nil channel".to_string()));
-    }
+    let (elem_size, pending) = channel_ref(vm, chan_id)?;
+    let data = pending.unwrap_or_else(|| vec![0u8; elem_size]);
 
-    // In the simplified model, read the last sent value
-    let val = if let Some(obj) = vm.heap.get(chan_id) {
-        match &obj.data {
-            HeapData::Record(buf) => {
-                if buf.len() >= 4 {
-                    crate::memory::read_word(buf, 0)
-                } else {
-                    0
-                }
-            }
-            _ => 0,
-        }
-    } else {
-        0
+    with_channel_mut(vm, chan_id, |_, pending| {
+        *pending = None;
+    })?;
+
+    write_addr_bytes(vm, vm.dst, &data)
+}
+
+/// alt src, dst — simplified blocking channel select.
+/// The table layout is:
+///   [0] = entry count
+///   [1..] = triples of (channel pointer, send flag, data offset)
+///
+/// Send entries are ready when the single-slot channel buffer is empty.
+/// Receive entries are ready when the channel has a pending payload.
+/// If none are ready, this simplified implementation returns index 0.
+pub(crate) fn op_alt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    match execute_alt(vm, true)? {
+        AltOutcome::Selected(idx) => vm.set_dst_word(idx as i32),
+        AltOutcome::NoneReady => vm.set_dst_word(0),
+    }
+}
+
+/// nbalt src, dst — simplified non-blocking channel select.
+/// Returns the chosen index, or `N` when no entries are ready.
+pub(crate) fn op_nbalt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let count = match parse_alt_table(vm) {
+        Ok((_, count, _)) => count,
+        Err(err) => return Err(err),
     };
 
-    vm.set_dst_word(val)
+    match execute_alt(vm, false)? {
+        AltOutcome::Selected(idx) => vm.set_dst_word(idx as i32),
+        AltOutcome::NoneReady => vm.set_dst_word(count as i32),
+    }
 }
 
-/// alt src, dst — blocking channel select.
-/// In the simplified model, returns 0 (first channel ready).
-pub(crate) fn op_alt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    // The alt instruction reads a table of channel/operation pairs
-    // and blocks until one is ready. In our simplified model,
-    // we just return 0 (first alternative).
-    let _src = vm.src_word()?;
-    vm.set_dst_word(0)
-}
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap, RuntimeFlags,
+        TypeDescriptor, XMAGIC,
+    };
 
-/// nbalt src, dst — non-blocking channel select.
-/// Returns the index of the ready channel, or N (number of channels) if none ready.
-pub(crate) fn op_nbalt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let _src = vm.src_word()?;
-    // Return "no channel ready" by default
-    vm.set_dst_word(0)
+    use super::*;
+
+    fn test_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "concurrency_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    #[test]
+    fn send_recv_roundtrip_word_channel() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let channel_id = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 42;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = channel_id as i32;
+        op_send(&mut vm).expect("send should succeed");
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = channel_id as i32;
+        vm.dst = AddrTarget::Frame(fp_base);
+        op_recv(&mut vm).expect("recv should succeed");
+
+        assert_eq!(memory::read_word(&vm.frames.data, fp_base), 42);
+        match vm.heap.get(channel_id).expect("channel should exist").data {
+            HeapData::Channel { ref pending, .. } => assert!(pending.is_none()),
+            _ => panic!("expected channel after recv"),
+        }
+    }
+
+    #[test]
+    fn nbalt_selects_ready_receive_entry() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let chan_a = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let chan_b = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: Some(77_i32.to_ne_bytes().to_vec()),
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        memory::write_word(&mut vm.frames.data, table_off, 2);
+        memory::write_word(&mut vm.frames.data, table_off + 4, chan_a as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 8, 0);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 16, chan_b as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 20, 0);
+        memory::write_word(&mut vm.frames.data, table_off + 24, (fp_base + 44) as i32);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+        op_nbalt(&mut vm).expect("nbalt should succeed");
+
+        assert_eq!(memory::read_word(&vm.frames.data, fp_base), 1);
+        assert_eq!(memory::read_word(&vm.frames.data, fp_base + 44), 77);
+    }
+
+    #[test]
+    fn alt_performs_ready_send_entry() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let chan = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        memory::write_word(&mut vm.frames.data, fp_base + 32, 99);
+        memory::write_word(&mut vm.frames.data, table_off, 1);
+        memory::write_word(&mut vm.frames.data, table_off + 4, chan as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 8, 1);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 32) as i32);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+        op_alt(&mut vm).expect("alt should succeed");
+
+        assert_eq!(memory::read_word(&vm.frames.data, fp_base), 0);
+        match vm.heap.get(chan).expect("channel should exist").data {
+            HeapData::Channel {
+                ref pending,
+                elem_size,
+            } => {
+                assert_eq!(elem_size, 4);
+                assert_eq!(
+                    pending.as_ref().expect("send should fill channel"),
+                    &99_i32.to_ne_bytes().to_vec()
+                );
+            }
+            _ => panic!("expected channel after alt send"),
+        }
+    }
 }

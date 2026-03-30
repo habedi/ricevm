@@ -124,10 +124,13 @@ pub(crate) fn parse_types(
             Vec::new()
         };
 
+        let pointer_map = PointerMap { bytes };
+        let pointer_count = pointer_map.count_pointers();
         descriptors.push(TypeDescriptor {
             id,
             size,
-            pointer_map: PointerMap { bytes },
+            pointer_map,
+            pointer_count,
         });
     }
 
@@ -361,7 +364,7 @@ pub(crate) fn parse_module(r: &mut Reader<'_>) -> Result<Module, LoadError> {
         Vec::new()
     };
 
-    Ok(Module {
+    let module = Module {
         header,
         code,
         types,
@@ -370,7 +373,107 @@ pub(crate) fn parse_module(r: &mut Reader<'_>) -> Result<Module, LoadError> {
         exports,
         imports,
         handlers,
-    })
+    };
+
+    validate_module(&module)?;
+    Ok(module)
+}
+
+/// Post-parse validation of a loaded module.
+fn validate_module(module: &Module) -> Result<(), LoadError> {
+    let code_len = module.code.len() as i32;
+    let type_len = module.types.len() as i32;
+
+    // Entry PC must be within code bounds.
+    // entry_pc == -1 is valid for library modules with no entry point.
+    if module.header.entry_pc != -1
+        && (module.header.entry_pc < 0 || module.header.entry_pc >= code_len)
+    {
+        return Err(LoadError::ValidationError(format!(
+            "entry_pc {} is out of bounds (code size {})",
+            module.header.entry_pc, code_len
+        )));
+    }
+
+    // Entry type must reference a valid type descriptor (or -1 for none).
+    // When type_len is 0, entry_type 0 is allowed (uses default frame size).
+    if module.header.entry_type != -1
+        && type_len > 0
+        && (module.header.entry_type < 0 || module.header.entry_type >= type_len)
+    {
+        return Err(LoadError::ValidationError(format!(
+            "entry_type {} is out of bounds (type count {})",
+            module.header.entry_type, type_len
+        )));
+    }
+
+    // MUST_COMPILE and DONT_COMPILE must not both be set.
+    if module
+        .header
+        .runtime_flags
+        .contains(RuntimeFlags::MUST_COMPILE)
+        && module
+            .header
+            .runtime_flags
+            .contains(RuntimeFlags::DONT_COMPILE)
+    {
+        return Err(LoadError::ValidationError(
+            "MUST_COMPILE and DONT_COMPILE flags are both set".to_string(),
+        ));
+    }
+
+    // Validate exports: each PC must be within code bounds.
+    // Special exports like ".mp" (module data pointer) have pc == -1, which is valid.
+    for (i, exp) in module.exports.iter().enumerate() {
+        if exp.pc >= 0 && exp.pc >= code_len {
+            return Err(LoadError::ValidationError(format!(
+                "export[{i}] '{}' has pc {} out of bounds (code size {code_len})",
+                exp.name, exp.pc
+            )));
+        }
+        if exp.frame_type >= 0 && type_len > 0 && exp.frame_type >= type_len {
+            return Err(LoadError::ValidationError(format!(
+                "export[{i}] '{}' has frame_type {} out of bounds (type count {type_len})",
+                exp.name, exp.frame_type
+            )));
+        }
+    }
+
+    // Validate handler ranges.
+    for (i, h) in module.handlers.iter().enumerate() {
+        if h.begin_pc < 0 || h.begin_pc >= code_len {
+            return Err(LoadError::ValidationError(format!(
+                "handler[{i}] begin_pc {} out of bounds",
+                h.begin_pc
+            )));
+        }
+        if h.end_pc < 0 || h.end_pc > code_len {
+            return Err(LoadError::ValidationError(format!(
+                "handler[{i}] end_pc {} out of bounds",
+                h.end_pc
+            )));
+        }
+        if h.begin_pc >= h.end_pc {
+            return Err(LoadError::ValidationError(format!(
+                "handler[{i}] begin_pc {} >= end_pc {}",
+                h.begin_pc, h.end_pc
+            )));
+        }
+    }
+
+    // Note: HAS_IMPORT flag may be set even when module_count is 0 in the import
+    // section (the section still exists with a zero count followed by a null byte).
+    // This is valid and not an error.
+
+    // Log signature info for signed modules (verification not implemented).
+    if module.header.magic == SMAGIC && !module.header.signature.is_empty() {
+        tracing::debug!(
+            sig_len = module.header.signature.len(),
+            "signed module loaded (signature verification not implemented)"
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

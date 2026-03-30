@@ -44,7 +44,7 @@
         in
         {
           default = pkgs.rustPlatform.buildRustPackage {
-            pname = "rice-vm";
+            pname = "ricevm";
             version = "0.1.0-alpha.1";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;

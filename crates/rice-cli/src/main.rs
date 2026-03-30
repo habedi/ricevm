@@ -26,11 +26,22 @@ enum Command {
         /// Disable mark-and-sweep garbage collection
         #[arg(long = "no-gc")]
         no_gc: bool,
+        /// Thread pool size for the scheduler
+        #[arg(long, default_value = "1")]
+        threads: usize,
     },
     /// Disassemble a .dis module file
     Dis {
         /// Path to the .dis module file
         path: PathBuf,
+    },
+    /// Debug a .dis module file interactively
+    Debug {
+        /// Path to the .dis module file
+        path: PathBuf,
+        /// Module search paths (repeatable)
+        #[arg(long = "probe", short = 'p')]
+        probe_paths: Vec<PathBuf>,
     },
 }
 
@@ -45,6 +56,7 @@ fn main() -> anyhow::Result<()> {
             probe_paths,
             trace,
             no_gc,
+            threads,
         } => {
             // SAFETY: set_var is unsafe in edition 2024 due to potential data races,
             // but we're single-threaded at this point before spawning any threads.
@@ -54,6 +66,9 @@ fn main() -> anyhow::Result<()> {
                 }
                 if no_gc {
                     std::env::set_var("RICEVM_NO_GC", "1");
+                }
+                if threads > 1 {
+                    std::env::set_var("RICEVM_THREADS", threads.to_string());
                 }
                 if !probe_paths.is_empty() {
                     let paths: Vec<String> = probe_paths
@@ -67,6 +82,21 @@ fn main() -> anyhow::Result<()> {
             let module = ricevm_loader::load(&bytes)?;
             tracing::info!(name = %module.name, "Module loaded");
             ricevm_execute::execute(&module)?;
+        }
+        Command::Debug { path, probe_paths } => {
+            unsafe {
+                if !probe_paths.is_empty() {
+                    let paths: Vec<String> = probe_paths
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    std::env::set_var("RICEVM_PROBE", paths.join(":"));
+                }
+            }
+            let bytes = fs::read(&path)?;
+            let module = ricevm_loader::load(&bytes)?;
+            tracing::info!(name = %module.name, "Module loaded for debugging");
+            ricevm_execute::debug(&module)?;
         }
         Command::Dis { path } => {
             let bytes = fs::read(&path)?;

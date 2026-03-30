@@ -31,6 +31,8 @@ pub(crate) struct VmState<'m> {
     pub trace: bool,
     pub gc_enabled: bool,
     pub(crate) gc_counter: usize,
+    /// Index of the currently executing loaded module (None = main module).
+    pub(crate) current_loaded_module: Option<usize>,
 
     // Resolved operand targets for the current instruction.
     pub src: AddrTarget,
@@ -63,9 +65,32 @@ impl<'m> VmState<'m> {
         frames.push_entry(frame_size, -1); // -1 sentinel for "no caller"
 
         // Set up entry frame args for the Limbo init() convention:
-        // fp[32] = ref Draw->Context (nil)
+        // fp[32] = ref Draw->Context
         // fp[36] = list of string (program name)
         if frame_size >= 40 {
+            // Create Draw->Context record:
+            //   offset 0: ref Display (pointer)
+            //   offset 4: ref Screen (pointer)
+            //   offset 8: wm channel (pointer)
+            let mut ctx_data = vec![0u8; 16];
+            // Create a Display record (simplified)
+            let display_id = heap.alloc(0, heap::HeapData::Record(vec![0u8; 32]));
+            memory::write_word(&mut ctx_data, 0, display_id as i32);
+            // Create a Screen record
+            let screen_id = heap.alloc(0, heap::HeapData::Record(vec![0u8; 16]));
+            memory::write_word(&mut ctx_data, 4, screen_id as i32);
+            // Create a wm channel
+            let wm_chan = heap.alloc(
+                0,
+                heap::HeapData::Channel {
+                    elem_size: 4,
+                    pending: None,
+                },
+            );
+            memory::write_word(&mut ctx_data, 8, wm_chan as i32);
+            let ctx_id = heap.alloc(0, heap::HeapData::Record(ctx_data));
+
+            // Create args list with program name
             let prog_name = heap.alloc(0, heap::HeapData::Str(module.name.clone()));
             let mut head = vec![0u8; 4];
             memory::write_word(&mut head, 0, prog_name as i32);
@@ -76,8 +101,12 @@ impl<'m> VmState<'m> {
                     tail: heap::NIL,
                 },
             );
+
             let fp_base = frames.current_data_offset();
-            // fp[32] = nil (already 0)
+            // fp[32] = Draw->Context
+            if fp_base + 36 <= frames.data.len() {
+                memory::write_word(&mut frames.data, fp_base + 32, ctx_id as i32);
+            }
             // fp[36] = args list
             if fp_base + 40 <= frames.data.len() {
                 memory::write_word(&mut frames.data, fp_base + 36, args_list as i32);
@@ -88,6 +117,7 @@ impl<'m> VmState<'m> {
         modules.register(sys::create_sys_module());
         modules.register(crate::math::create_math_module());
         modules.register(crate::draw::create_draw_module());
+        modules.register(crate::tk::create_tk_module());
 
         let trace = std::env::var("RICEVM_TRACE").is_ok();
         let gc_enabled = std::env::var("RICEVM_NO_GC").is_err();
@@ -106,6 +136,7 @@ impl<'m> VmState<'m> {
             trace,
             gc_enabled,
             gc_counter: 0,
+            current_loaded_module: None,
             src: AddrTarget::None,
             mid: AddrTarget::None,
             dst: AddrTarget::None,
@@ -114,6 +145,18 @@ impl<'m> VmState<'m> {
             imm_dst: 0,
             heap_refs: Vec::new(),
         })
+    }
+
+    /// Get the type descriptor size for the currently executing module.
+    pub(crate) fn current_type_size(&self, type_idx: usize) -> Option<usize> {
+        if let Some(lm_idx) = self.current_loaded_module {
+            self.loaded_modules
+                .get(lm_idx)
+                .and_then(|lm| lm.module.types.get(type_idx))
+                .map(|td| td.size as usize)
+        } else {
+            self.module.types.get(type_idx).map(|td| td.size as usize)
+        }
     }
 
     pub fn run(&mut self) -> Result<(), ExecError> {
@@ -137,7 +180,12 @@ impl<'m> VmState<'m> {
                 self.gc_counter += 1;
                 if self.gc_counter >= GC_INTERVAL {
                     self.gc_counter = 0;
-                    crate::gc::collect(&mut self.heap, &self.frames, &self.mp);
+                    crate::gc::collect(
+                        &mut self.heap,
+                        &self.frames,
+                        &self.mp,
+                        &self.loaded_modules,
+                    );
                 }
             }
         }
@@ -199,7 +247,9 @@ impl<'m> VmState<'m> {
     ) -> Option<Vec<u8>> {
         let obj = self.heap.get(id)?;
         match &obj.data {
-            heap::HeapData::Array { data, .. } | heap::HeapData::Record(data) => {
+            heap::HeapData::Array { data, .. }
+            | heap::HeapData::Record(data)
+            | heap::HeapData::Adt { data, .. } => {
                 if offset + len <= data.len() {
                     Some(data[offset..offset + len].to_vec())
                 } else {
@@ -214,7 +264,9 @@ impl<'m> VmState<'m> {
     fn heap_write(&mut self, id: heap::HeapId, offset: usize, bytes: &[u8]) {
         if let Some(obj) = self.heap.get_mut(id) {
             match &mut obj.data {
-                heap::HeapData::Array { data, .. } | heap::HeapData::Record(data) => {
+                heap::HeapData::Array { data, .. }
+                | heap::HeapData::Record(data)
+                | heap::HeapData::Adt { data, .. } => {
                     if offset + bytes.len() <= data.len() {
                         data[offset..offset + bytes.len()].copy_from_slice(bytes);
                     }

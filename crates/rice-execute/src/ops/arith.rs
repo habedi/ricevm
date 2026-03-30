@@ -26,7 +26,7 @@ pub(crate) fn op_divw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_word()?;
     let m = vm.mid_word()?;
     if m == 0 {
-        return Err(ExecError::ThreadFault("division by zero".to_string()));
+        return vm.set_dst_word(0);
     }
     vm.set_dst_word(s.wrapping_div(m))
 }
@@ -35,7 +35,7 @@ pub(crate) fn op_modw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_word()?;
     let m = vm.mid_word()?;
     if m == 0 {
-        return Err(ExecError::ThreadFault("modulo by zero".to_string()));
+        return vm.set_dst_word(0);
     }
     vm.set_dst_word(s.wrapping_rem(m))
 }
@@ -64,7 +64,7 @@ pub(crate) fn op_divb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_byte()?;
     let m = vm.mid_byte()?;
     if m == 0 {
-        return Err(ExecError::ThreadFault("division by zero".to_string()));
+        return vm.set_dst_byte(0);
     }
     vm.set_dst_byte(s / m)
 }
@@ -73,7 +73,7 @@ pub(crate) fn op_modb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_byte()?;
     let m = vm.mid_byte()?;
     if m == 0 {
-        return Err(ExecError::ThreadFault("modulo by zero".to_string()));
+        return vm.set_dst_byte(0);
     }
     vm.set_dst_byte(s % m)
 }

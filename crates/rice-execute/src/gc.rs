@@ -17,7 +17,12 @@ use crate::memory;
 /// 2. The module data (MP)
 ///
 /// Then sweeps all unmarked objects from the heap.
-pub(crate) fn collect(heap: &mut Heap, frames: &FrameStack, mp: &[u8]) {
+pub(crate) fn collect(
+    heap: &mut Heap,
+    frames: &FrameStack,
+    mp: &[u8],
+    loaded_modules: &[crate::vm::LoadedModule],
+) {
     if heap.len() == 0 {
         return;
     }
@@ -29,6 +34,11 @@ pub(crate) fn collect(heap: &mut Heap, frames: &FrameStack, mp: &[u8]) {
 
     // Mark phase: scan module data
     scan_buffer(mp, heap, &mut marked);
+
+    // Mark phase: scan all loaded modules' MPs
+    for lm in loaded_modules {
+        scan_buffer(&lm.mp, heap, &mut marked);
+    }
 
     // Sweep phase: remove all unmarked objects
     heap.sweep(&marked);
@@ -57,7 +67,7 @@ fn mark_object(id: HeapId, heap: &Heap, marked: &mut HashSet<HeapId>) {
     // Scan the object's data for more heap references
     if let Some(obj) = heap.get(id) {
         match &obj.data {
-            HeapData::Record(data) | HeapData::Array { data, .. } => {
+            HeapData::Record(data) | HeapData::Array { data, .. } | HeapData::Adt { data, .. } => {
                 // Scan the data buffer for potential HeapIds
                 let mut offset = 0;
                 while offset + 4 <= data.len() {
@@ -81,8 +91,10 @@ fn mark_object(id: HeapId, heap: &Heap, marked: &mut HashSet<HeapId>) {
                 // Follow tail
                 mark_object(*tail, heap, marked);
             }
-            HeapData::Str(_) | HeapData::Channel => {}
-            HeapData::ModuleRef { .. } | HeapData::LoadedModule { .. } => {}
+            HeapData::Str(_) | HeapData::Channel { .. } => {}
+            HeapData::ModuleRef { .. }
+            | HeapData::MainModule { .. }
+            | HeapData::LoadedModule { .. } => {}
         }
     }
 }
@@ -108,7 +120,7 @@ mod tests {
         assert!(heap.get(id2).is_some());
 
         // Run GC
-        collect(&mut heap, &frames, &[]);
+        collect(&mut heap, &frames, &[], &[]);
 
         // After GC: id2 should be collected (not referenced by any root)
         assert!(heap.get(id2).is_none());
@@ -124,7 +136,7 @@ mod tests {
         let off = frames.current_data_offset();
         memory::write_word(&mut frames.data, off, id1 as i32);
 
-        collect(&mut heap, &frames, &[]);
+        collect(&mut heap, &frames, &[], &[]);
 
         assert!(heap.get(id1).is_some());
         assert_eq!(heap.get_string(id1), Some("hello"));
@@ -143,7 +155,7 @@ mod tests {
         let off = frames.current_data_offset();
         memory::write_word(&mut frames.data, off, list_id as i32);
 
-        collect(&mut heap, &frames, &[]);
+        collect(&mut heap, &frames, &[], &[]);
 
         // Both the list node and the string it references should survive
         assert!(heap.get(list_id).is_some());

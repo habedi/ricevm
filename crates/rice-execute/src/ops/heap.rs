@@ -6,11 +6,9 @@ use crate::vm::VmState;
 /// new src, dst — allocate a record of the type given by src (type index)
 pub(crate) fn op_new(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let type_idx = vm.src_word()? as usize;
-    let size = if type_idx < vm.module.types.len() {
-        vm.module.types[type_idx].size as usize
-    } else {
-        return Err(ExecError::Other(format!("invalid type index: {type_idx}")));
-    };
+    let size = vm
+        .current_type_size(type_idx)
+        .ok_or_else(|| ExecError::Other(format!("invalid type index: {type_idx}")))?;
     let id = vm
         .heap
         .alloc(type_idx as u32, HeapData::Record(vec![0; size]));
@@ -26,13 +24,9 @@ pub(crate) fn op_newz(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 pub(crate) fn op_newa(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let length = vm.src_word()? as usize;
     let elem_type_idx = vm.mid_word()? as usize;
-    let elem_size = if elem_type_idx < vm.module.types.len() {
-        vm.module.types[elem_type_idx].size as usize
-    } else {
-        return Err(ExecError::Other(format!(
-            "invalid element type index: {elem_type_idx}"
-        )));
-    };
+    let elem_size = vm
+        .current_type_size(elem_type_idx)
+        .ok_or_else(|| ExecError::Other(format!("invalid element type index: {elem_type_idx}")))?;
     let data = vec![0u8; length * elem_size];
     let id = vm.heap.alloc(
         elem_type_idx as u32,
@@ -56,32 +50,37 @@ pub(crate) fn op_mnewz(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     op_new(vm)
 }
 
-// Channel allocation stubs — allocate a Channel sentinel on the heap.
-// Actual channel operations (send/recv) are not yet implemented.
-
-fn alloc_channel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let id = vm.heap.alloc(0, HeapData::Channel);
+fn alloc_channel(vm: &mut VmState<'_>, elem_size: usize) -> Result<(), ExecError> {
+    let id = vm.heap.alloc(
+        0,
+        HeapData::Channel {
+            elem_size,
+            pending: None,
+        },
+    );
     vm.move_ptr_to_dst(id)
 }
 
 pub(crate) fn op_newcb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    alloc_channel(vm)
+    alloc_channel(vm, 1)
 }
 pub(crate) fn op_newcw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    alloc_channel(vm)
+    alloc_channel(vm, 4)
 }
 pub(crate) fn op_newcf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    alloc_channel(vm)
+    alloc_channel(vm, 8)
 }
 pub(crate) fn op_newcp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    alloc_channel(vm)
+    alloc_channel(vm, 4)
 }
 pub(crate) fn op_newcm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    alloc_channel(vm)
+    let elem_size = vm.current_type_size(vm.src_word()? as usize).unwrap_or(4);
+    alloc_channel(vm, elem_size)
 }
 pub(crate) fn op_newcmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    alloc_channel(vm)
+    let elem_size = vm.current_type_size(vm.src_word()? as usize).unwrap_or(4);
+    alloc_channel(vm, elem_size)
 }
 pub(crate) fn op_newcl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    alloc_channel(vm)
+    alloc_channel(vm, 8)
 }

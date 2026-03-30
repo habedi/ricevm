@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Binary format parser for Rice"
+description = "Binary format parser for RiceVM bytecode"
 
 [dependencies]
 ricevm_core.workspace = true

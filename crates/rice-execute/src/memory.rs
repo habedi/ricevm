@@ -6,7 +6,7 @@
 use ricevm_core::{Big, Byte, Real, Word};
 
 pub(crate) fn read_word(buf: &[u8], offset: usize) -> Word {
-    if offset + 4 > buf.len() {
+    if offset.checked_add(4).is_none_or(|end| end > buf.len()) {
         return 0;
     }
     let bytes: [u8; 4] = buf[offset..offset + 4].try_into().unwrap_or([0; 4]);
@@ -14,14 +14,14 @@ pub(crate) fn read_word(buf: &[u8], offset: usize) -> Word {
 }
 
 pub(crate) fn write_word(buf: &mut [u8], offset: usize, val: Word) {
-    if offset + 4 > buf.len() {
+    if offset.checked_add(4).is_none_or(|end| end > buf.len()) {
         return;
     }
     buf[offset..offset + 4].copy_from_slice(&val.to_ne_bytes());
 }
 
 pub(crate) fn read_big(buf: &[u8], offset: usize) -> Big {
-    if offset + 8 > buf.len() {
+    if offset.checked_add(8).is_none_or(|end| end > buf.len()) {
         return 0;
     }
     let bytes: [u8; 8] = buf[offset..offset + 8].try_into().unwrap_or([0; 8]);
@@ -29,14 +29,14 @@ pub(crate) fn read_big(buf: &[u8], offset: usize) -> Big {
 }
 
 pub(crate) fn write_big(buf: &mut [u8], offset: usize, val: Big) {
-    if offset + 8 > buf.len() {
+    if offset.checked_add(8).is_none_or(|end| end > buf.len()) {
         return;
     }
     buf[offset..offset + 8].copy_from_slice(&val.to_ne_bytes());
 }
 
 pub(crate) fn read_real(buf: &[u8], offset: usize) -> Real {
-    if offset + 8 > buf.len() {
+    if offset.checked_add(8).is_none_or(|end| end > buf.len()) {
         return 0.0;
     }
     let bytes: [u8; 8] = buf[offset..offset + 8].try_into().unwrap_or([0; 8]);
@@ -44,7 +44,7 @@ pub(crate) fn read_real(buf: &[u8], offset: usize) -> Real {
 }
 
 pub(crate) fn write_real(buf: &mut [u8], offset: usize, val: Real) {
-    if offset + 8 > buf.len() {
+    if offset.checked_add(8).is_none_or(|end| end > buf.len()) {
         return;
     }
     buf[offset..offset + 8].copy_from_slice(&val.to_ne_bytes());

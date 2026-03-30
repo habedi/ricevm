@@ -32,14 +32,13 @@ Priorities, in order:
 
 ## Repository Layout
 
-- `crates/rice-core/src/lib.rs`: Core library with shared types, error definitions, and initialization logic.
-- `crates/rice-loader/src/lib.rs`: Binary format parser for `.dis` module files (header, code, type descriptors, data, and imports).
-- `crates/rice-execute/src/lib.rs`: Execution engine for Dis bytecode (instruction dispatch, stack frames, and thread management).
-- `crates/rice-cli/src/main.rs`: CLI entry point using `clap`. Orchestrates the loader and executor.
-- `tests/integration_tests.rs`: Integration tests (currently empty).
-- `tests/property_tests.rs`: Property-based tests (currently empty).
+- `crates/rice-core/`: Shared types (Module, Opcode, Instruction, TypeDescriptor, errors). No runtime logic.
+- `crates/rice-loader/`: Binary format parser for `.dis` module files. One public function: `load(&[u8]) -> Result<Module, LoadError>`.
+- `crates/rice-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk), and file-based module
+  loading.
+- `crates/rice-cli/`: CLI with `run` and `dis` subcommands.
+- `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files for testing).
 - `Makefile`: GNU Make wrapper around `cargo` commands (`make test`, `make build`, `make lint`, etc.).
-- `Cargo.toml`: Workspace root defining all four crate members and shared dependencies.
 - `rust-toolchain.toml`: Pinned Rust toolchain (1.92.0) with `rustfmt`, `clippy`, and `rust-analyzer`.
 
 ## Architecture
@@ -47,27 +46,45 @@ Priorities, in order:
 ### Crate Dependency Graph
 
 ```
-rice-cli
-├── rice-core
-├── rice-loader → rice-core
-└── rice-execute → rice-core
+ricevm-cli
+├── ricevm-core
+├── ricevm-loader → ricevm-core
+└── ricevm-execute → ricevm-core, ricevm-loader
 ```
 
-`rice-cli` depends on all three library crates. `rice-loader` and `rice-execute` each depend on `rice-core` but not on each other.
+`ricevm-execute` depends on `ricevm-loader` for runtime module loading (the `load` opcode reads `.dis` files from disk).
 
-### Crate Responsibilities
+### Key Internal Modules in `ricevm-execute`
 
-- **rice-core**: Types and definitions shared across crates (opcodes, type descriptors, module structures, error types). No VM runtime logic.
-- **rice-loader**: Reads `.dis` binary files and produces in-memory module representations defined in `rice-core`. No execution logic.
-- **rice-execute**: Takes loaded modules and runs them (instruction dispatch, memory management, scheduling). Depends on types from `rice-core`.
-- **rice-cli**: Argument parsing, tracing setup, and orchestration. Thin glue between the loader and executor.
+| Module         | Purpose                                                                          |
+|----------------|----------------------------------------------------------------------------------|
+| `vm.rs`        | `VmState` struct, execution loop, operand read/write helpers                     |
+| `frame.rs`     | `FrameStack` with two-phase push (`alloc_pending` and `activate_pending`)        |
+| `heap.rs`      | `Heap` with reference counting, copy-on-write strings                            |
+| `gc.rs`        | Mark-and-sweep garbage collector (scans frames, MP, and loaded module MPs)       |
+| `address.rs`   | Operand resolution: `Operand` to `AddrTarget` (frame, MP, immediate, heap array) |
+| `memory.rs`    | Typed read/write on byte buffers with bounds checking                            |
+| `data.rs`      | Module data (MP) initialization from `DataItem` entries                          |
+| `filetab.rs`   | Portable file descriptor table (replaces raw Unix fd operations)                 |
+| `ops/`         | 176 instruction handlers organized by category                                   |
+| `sys.rs`       | Built-in `$Sys` module (43 functions with signature hashes)                      |
+| `math.rs`      | Built-in `$Math` module (66 functions)                                           |
+| `draw.rs`      | Built-in `$Draw` module (SDL2 backend, optional `gui` feature)                   |
+| `tk.rs`        | Built-in `$Tk` module (widget toolkit stubs)                                     |
+| `builtin.rs`   | `ModuleRegistry` for built-in module registration with signature-based lookup    |
+| `scheduler.rs` | Cooperative thread scheduler (infrastructure)                                    |
+| `channel.rs`   | Channel data structure for inter-thread communication                            |
 
-### Workspace Dependencies
+### Key Design Decisions
 
-- `anyhow` for application-level error handling (CLI and top-level operations).
-- `thiserror` for typed library errors in core, loader, and execute crates.
-- `tracing` and `tracing-subscriber` for structured logging.
-- `clap` for CLI argument parsing.
+- Package names use hyphens (`ricevm-core`); Rust identifiers use underscores (`ricevm_core`).
+- The heap uses `HashMap<u32, HeapObject>` with monotonic IDs; pointers stored as `Word` (i32) in frames.
+- Array element references use a `heap_refs` table with `HEAP_REF_FLAG` sentinel, resolved during double-indirect addressing.
+- Branch instructions: `if src OP mid, goto dst` (not `if src OP dst, goto mid`).
+- Multi-module execution: loaded modules' MPs are swapped (not cloned) to persist state across calls.
+- Built-in function dispatch uses signature hash matching from the caller's import table.
+- Portable I/O via `FileTable` (no `libc` dependency).
+- SDL2 for GUI is behind an optional `gui` feature flag.
 
 ## Required Validation
 
@@ -82,21 +99,12 @@ Run `make test` for any change. Key targets:
 | Coverage | `make coverage` | `cargo tarpaulin` with XML and HTML output        |
 | Audit    | `make audit`    | `cargo audit` on dependencies                     |
 
-Clippy is configured to deny `warnings`, `clippy::unwrap_used`, and `clippy::expect_used`. Use `anyhow` or `thiserror` for error handling instead of
-`unwrap()`/`expect()`.
-
-## First Contribution Flow
-
-1. Read the relevant crate's `src/lib.rs` (or `src/main.rs` for `rice-cli`).
-2. Implement the smallest possible change.
-3. Add unit tests in the same file, or integration tests in `tests/integration_tests.rs` if behavior crosses crate boundaries.
-4. Run `make lint && make test`.
-
 ## Testing Expectations
 
 - Unit tests live in each crate's source files using `#[cfg(test)]` modules.
-- Integration tests live in `tests/integration_tests.rs` for end-to-end validation with `.dis` module files.
-- Property-based tests live in `tests/property_tests.rs` for fuzzing parsers and verifying invariants.
+- Integration tests for the loader live in `crates/rice-loader/tests/`.
+- Pipeline tests (loader to executor) live in `crates/rice-cli/tests/`, including tests with real Inferno `.dis` files.
+- Fuzz testing for the loader is set up in `crates/rice-loader/fuzz/`.
 - No public API change is complete without a corresponding test.
 
 ## Commit and PR Hygiene

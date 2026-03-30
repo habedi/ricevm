@@ -3,12 +3,15 @@
 //! Maps integer fd numbers to Rust I/O objects, replacing raw Unix fd operations.
 //! Pre-populated with stdin(0), stdout(1), stderr(2).
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::net::{TcpListener, TcpStream};
 
 /// A file table entry that supports read, write, and seek.
 pub(crate) struct FileEntry {
     inner: Box<dyn FileOps>,
+    pub path: Option<String>,
 }
 
 /// Trait combining Read + Write + Seek, with optional support for each.
@@ -18,6 +21,7 @@ pub(crate) trait FileOps: Send {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize>;
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64>;
     fn flush(&mut self) -> io::Result<()>;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Wrapper for std::fs::File (supports all operations).
@@ -35,6 +39,9 @@ impl FileOps for RegularFile {
     }
     fn flush(&mut self) -> io::Result<()> {
         Write::flush(&mut self.0)
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -60,6 +67,9 @@ impl FileOps for StdoutFile {
     fn flush(&mut self) -> io::Result<()> {
         io::stdout().flush()
     }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 /// Wrapper for stderr.
@@ -83,6 +93,9 @@ impl FileOps for StderrFile {
     }
     fn flush(&mut self) -> io::Result<()> {
         io::stderr().flush()
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
@@ -108,6 +121,63 @@ impl FileOps for StdinFile {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Wrapper for a connected TCP stream.
+pub(crate) struct TcpStreamFile(pub TcpStream);
+
+impl FileOps for TcpStreamFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        Read::read(&mut self.0, buf)
+    }
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        Write::write(&mut self.0, buf)
+    }
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot seek TCP stream",
+        ))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Write::flush(&mut self.0)
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Wrapper for a TCP listener (used for announce/listen).
+pub(crate) struct TcpListenerFile(pub TcpListener);
+
+impl FileOps for TcpListenerFile {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot read listener",
+        ))
+    }
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot write listener",
+        ))
+    }
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot seek listener",
+        ))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 /// Portable file descriptor table.
@@ -126,18 +196,21 @@ impl FileTable {
             0,
             FileEntry {
                 inner: Box::new(StdinFile),
+                path: Some("/dev/stdin".to_string()),
             },
         );
         ft.files.insert(
             1,
             FileEntry {
                 inner: Box::new(StdoutFile),
+                path: Some("/dev/stdout".to_string()),
             },
         );
         ft.files.insert(
             2,
             FileEntry {
                 inner: Box::new(StderrFile),
+                path: Some("/dev/stderr".to_string()),
             },
         );
         ft
@@ -159,6 +232,7 @@ impl FileTable {
             fd,
             FileEntry {
                 inner: Box::new(RegularFile(file)),
+                path: Some(path.to_string()),
             },
         );
         Ok(fd)
@@ -173,6 +247,7 @@ impl FileTable {
             fd,
             FileEntry {
                 inner: Box::new(RegularFile(file)),
+                path: Some(path.to_string()),
             },
         );
         Ok(fd)
@@ -229,5 +304,63 @@ impl FileTable {
         if fd > 2 {
             self.files.remove(&fd);
         }
+    }
+
+    /// Get the path associated with an fd.
+    pub fn get_path(&self, fd: i32) -> Option<&str> {
+        self.files.get(&fd)?.path.as_deref()
+    }
+
+    /// Insert a TCP stream and return its fd.
+    pub fn insert_tcp_stream(&mut self, stream: TcpStream, addr: Option<String>) -> i32 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.files.insert(
+            fd,
+            FileEntry {
+                inner: Box::new(TcpStreamFile(stream)),
+                path: addr,
+            },
+        );
+        fd
+    }
+
+    /// Insert a TCP listener and return its fd.
+    pub fn insert_tcp_listener(&mut self, listener: TcpListener, addr: Option<String>) -> i32 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.files.insert(
+            fd,
+            FileEntry {
+                inner: Box::new(TcpListenerFile(listener)),
+                path: addr,
+            },
+        );
+        fd
+    }
+
+    /// Accept a connection on a listener fd. Returns (new stream fd, peer address).
+    pub fn accept_on(&mut self, listener_fd: i32) -> io::Result<(i32, String)> {
+        // We need to take the entry out temporarily to call accept, then put it back.
+        let mut entry = self
+            .files
+            .remove(&listener_fd)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
+
+        let result = match entry.inner.as_any_mut().downcast_mut::<TcpListenerFile>() {
+            Some(listener_file) => {
+                let (stream, addr) = listener_file.0.accept()?;
+                let addr_str = addr.to_string();
+                let stream_fd = self.insert_tcp_stream(stream, Some(addr_str.clone()));
+                Ok((stream_fd, addr_str))
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fd is not a listener",
+            )),
+        };
+
+        self.files.insert(listener_fd, entry);
+        result
     }
 }

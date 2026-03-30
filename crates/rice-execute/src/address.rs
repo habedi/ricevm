@@ -46,6 +46,10 @@ pub(crate) fn resolve_operand(
         AddressMode::OffsetDoubleIndirectFp => {
             let base_addr = fp_base + op.register1 as usize;
             let base_val = memory::read_word(stack_data, base_addr);
+            // Nil pointer dereference: treat as no-op target.
+            if base_val == 0 {
+                return Ok(AddrTarget::None);
+            }
             // Check if the base value is a heap array reference
             if base_val & HEAP_REF_FLAG != 0 {
                 let ref_idx = (base_val & !HEAP_REF_FLAG) as usize;
@@ -60,6 +64,10 @@ pub(crate) fn resolve_operand(
         }
         AddressMode::OffsetDoubleIndirectMp => {
             let base_val = memory::read_word(mp_data, op.register1 as usize);
+            // Nil pointer dereference: treat as no-op target.
+            if base_val == 0 {
+                return Ok(AddrTarget::None);
+            }
             if base_val & HEAP_REF_FLAG != 0 {
                 let ref_idx = (base_val & !HEAP_REF_FLAG) as usize;
                 if let Some(&(id, byte_offset)) = heap_refs.get(ref_idx) {

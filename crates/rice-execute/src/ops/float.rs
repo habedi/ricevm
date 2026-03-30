@@ -24,7 +24,7 @@ pub(crate) fn op_divf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_real()?;
     let m = vm.mid_real()?;
     if m == 0.0 {
-        return Err(ExecError::ThreadFault("float division by zero".to_string()));
+        return vm.set_dst_real(f64::INFINITY.copysign(s));
     }
     vm.set_dst_real(s / m)
 }

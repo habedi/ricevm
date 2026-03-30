@@ -23,6 +23,13 @@ pub struct PointerMap {
     pub bytes: Vec<u8>,
 }
 
+impl PointerMap {
+    /// Count the number of set bits (pointer slots) in the map.
+    pub fn count_pointers(&self) -> u32 {
+        self.bytes.iter().map(|b| b.count_ones()).sum()
+    }
+}
+
 /// Type descriptor: defines the size and pointer layout of a
 /// heap-allocated value. Used by the GC to trace live pointers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +40,8 @@ pub struct TypeDescriptor {
     pub size: Word,
     /// Pointer map for GC traversal.
     pub pointer_map: PointerMap,
+    /// Number of pointer slots in this type (derived from pointer_map).
+    pub pointer_count: u32,
 }
 
 #[cfg(test)]
@@ -51,6 +60,7 @@ mod tests {
             id: 0,
             size: 16,
             pointer_map: PointerMap { bytes: vec![0x03] },
+            pointer_count: 2,
         };
         assert_eq!(td.size, 16);
         assert_eq!(td.pointer_map.bytes[0] & 0x01, 1); // slot 0 is a pointer

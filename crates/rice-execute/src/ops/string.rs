@@ -159,8 +159,111 @@ pub(crate) fn op_cvtac(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.move_ptr_to_dst(new_id)
 }
 
-/// lenl src, dst — list length (stub: lists not yet implemented)
+/// lenl src, dst — list length
 pub(crate) fn op_lenl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let _src = vm.src_ptr()?;
-    vm.set_dst_word(0) // nil list has length 0
+    let mut list_id = vm.src_ptr()?;
+    let mut len = 0;
+
+    while list_id != heap::NIL {
+        let obj = vm
+            .heap
+            .get(list_id)
+            .ok_or_else(|| ExecError::ThreadFault("nil list dereference (lenl)".to_string()))?;
+        list_id = match &obj.data {
+            HeapData::List { tail, .. } => *tail,
+            _ => return Err(ExecError::ThreadFault("lenl on non-list".to_string())),
+        };
+        len += 1;
+    }
+
+    vm.set_dst_word(len)
+}
+
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap, RuntimeFlags,
+        TypeDescriptor, XMAGIC,
+    };
+
+    use super::*;
+    use crate::address::AddrTarget;
+    use crate::memory;
+
+    fn test_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 32,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "lenl_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    #[test]
+    fn lenl_counts_list_nodes() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+
+        let tail = vm.heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![20, 0, 0, 0],
+                tail: heap::NIL,
+            },
+        );
+        let head = vm.heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![10, 0, 0, 0],
+                tail,
+            },
+        );
+
+        let fp_base = vm.frames.current_data_offset();
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = head as i32;
+        vm.dst = AddrTarget::Frame(fp_base);
+
+        op_lenl(&mut vm).expect("lenl should succeed");
+
+        assert_eq!(memory::read_word(&vm.frames.data, fp_base), 2);
+    }
+
+    #[test]
+    fn lenl_rejects_non_list_values() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let string_id = vm.heap.alloc(0, HeapData::Str("not a list".to_string()));
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = string_id as i32;
+
+        let err = op_lenl(&mut vm).expect_err("lenl should reject non-list values");
+        assert!(err.to_string().contains("lenl on non-list"));
+    }
 }

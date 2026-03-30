@@ -46,7 +46,7 @@ pub(crate) fn dispatch(vm: &mut VmState<'_>, inst: &Instruction) -> Result<(), E
         Opcode::Newaz => heap::op_newaz(vm),
         Opcode::Mnewz => heap::op_mnewz(vm),
 
-        // Channel allocation stubs
+        // Channel allocation
         Opcode::Newcb => heap::op_newcb(vm),
         Opcode::Newcw => heap::op_newcw(vm),
         Opcode::Newcf => heap::op_newcf(vm),
@@ -236,7 +236,7 @@ pub(crate) fn dispatch(vm: &mut VmState<'_>, inst: &Instruction) -> Result<(), E
         Opcode::Cvtfx => fixedpoint::op_cvtfx(vm),
         Opcode::Cvtxf => fixedpoint::op_cvtxf(vm),
 
-        // Concurrency (stubs)
+        // Concurrency
         Opcode::Spawn => concurrency::op_spawn(vm),
         Opcode::Mspawn => concurrency::op_mspawn(vm),
         Opcode::Send => concurrency::op_send(vm),

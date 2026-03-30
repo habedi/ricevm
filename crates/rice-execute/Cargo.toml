@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Execution engine for Rice bytecode"
+description = "Execution engine for RiceVM bytecode"
 
 [features]
 default = []

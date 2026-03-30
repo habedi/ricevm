@@ -1,4 +1,4 @@
-[submodule "external/purgatorio"]
-	path = external/purgatorio
-	url = https://github.com/habedi/purgatorio-fork
-	branch = front
+[submodule "external/inferno-os"]
+	path = external/inferno-os
+	url = https://github.com/inferno-os/inferno-os.git
+	branch = master

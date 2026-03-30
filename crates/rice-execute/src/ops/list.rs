@@ -117,6 +117,10 @@ pub(crate) fn op_consmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 // headX src, dst: dst = hd(src)
 
 fn head_read<'a>(vm: &'a VmState<'_>, list_id: HeapId) -> Result<&'a [u8], ExecError> {
+    if list_id == heap::NIL {
+        // Head of nil: return empty slice (graceful)
+        return Ok(&[]);
+    }
     let obj = vm
         .heap
         .get(list_id)
@@ -209,6 +213,10 @@ pub(crate) fn op_headmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// tail src, dst: dst = tl(src)
 pub(crate) fn op_tail(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let list_id = vm.src_ptr()?;
+    if list_id == heap::NIL {
+        // Tail of nil is nil (graceful handling)
+        return vm.move_ptr_to_dst(heap::NIL);
+    }
     let obj = vm
         .heap
         .get(list_id)

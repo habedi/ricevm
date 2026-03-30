@@ -11,6 +11,7 @@ use crate::vm::VmState;
 pub(crate) type BuiltinFn = fn(&mut VmState<'_>) -> Result<(), ExecError>;
 
 /// A single function in a built-in module.
+#[allow(dead_code)]
 pub(crate) struct BuiltinFunc {
     pub name: &'static str,
     pub sig: u32,
@@ -63,6 +64,7 @@ impl ModuleRegistry {
     }
 
     /// Get a function from a built-in module by matching a signature hash.
+    #[allow(dead_code)]
     pub fn get_func_by_sig(&self, module_id: u32, sig: u32) -> Option<&BuiltinFunc> {
         self.builtins
             .get(module_id as usize)?

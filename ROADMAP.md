@@ -57,16 +57,17 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Stack frame allocation and deallocation
 - [x] Heap allocation for dynamic types (arrays, strings)
 - [x] Reference counting for deterministic destruction
-- [ ] Mark-and-sweep garbage collector for cyclic reference detection
-- [ ] Optional toggle to disable mark-and-sweep collection
+- [x] Mark-and-sweep garbage collector for cyclic reference detection
+- [x] Optional toggle to disable mark-and-sweep collection (`--no-gc` flag)
 
 ### Scheduler
 
-- [ ] Cooperative thread scheduling with configurable quanta
-- [ ] Thread spawn and exit
-- [ ] Channel-based inter-thread communication and synchronization
-- [ ] `alt` statement support for multiplexed channel operations
-- [ ] Configurable system thread pool (1 to N OS threads)
+- [x] Cooperative thread scheduler infrastructure (round-robin with quanta)
+- [x] Thread spawn and exit (simplified: inline execution)
+- [x] Channel data structure with send/receive queues
+- [x] `alt`/`nbalt` stubs (simplified: return first alternative)
+- [ ] Full preemptive thread scheduling with OS thread pool
+- [ ] Blocking channel synchronization
 
 ### Built-in Modules
 
@@ -74,7 +75,8 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] `Sys` module: `open`, `create`, `read`, `write`, `fildes`, `fd2path`, `dup` (file I/O)
 - [x] `Sys` module: `millisec`, `sleep`, `pctl`, `tokenize`, `byte2char`, `char2byte`, `utfbytes`
 - [x] Exception handler table lookup for `raise` opcode
-- [ ] `Sys` module: `seek`, `fstat`, `stat`, `bind`, `mount`, `pipe`, `dial`, etc.
+- [x] `Sys` module: `seek`, `chdir`, `remove`, `pipe`, `iounit`, `werrstr`
+- [ ] `Sys` module: `fstat`, `stat`, `bind`, `mount`, `dial`, etc.
 - [x] `Math` module: trig, log, exp, pow, sqrt, floor, ceil, hypot, bit conversions (66 functions)
 - [x] `$Sys` and `$Math` module type descriptors and entry points
 - [x] Extension mechanism for registering custom built-in modules
@@ -86,7 +88,9 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] `run` subcommand to execute a `.dis` module file
 - [ ] `--dis-gc` flag to enable or disable mark-and-sweep garbage collection
 - [ ] `--threads` flag to configure scheduler thread pool size
-- [ ] `--probe` flag to add module probing paths
+- [x] `--probe` flag to add module probing paths
+- [x] `--trace` flag for instruction-level debugging
+- [x] `dis` subcommand for disassembly
 - [ ] Debugger integration (breakpoints, single-stepping, and stack inspection)
 
 ### Development and Testing
@@ -98,12 +102,12 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] End-to-end pipeline tests (loader → executor) with hand-crafted `.dis` binaries
 - [ ] Integration tests with Limbo-compiled `.dis` modules
 - [x] Property-based tests for binary format parsing
-- [ ] Fuzz testing for the module loader
+- [x] Fuzz testing setup for the module loader (`cargo-fuzz` with `libfuzzer`)
 
 ### Documentation
 
-- [ ] Quickstart guide
-- [ ] Architecture overview (crate responsibilities and data flow)
-- [ ] Supported Dis opcodes and built-in module coverage matrix
+- [x] Quickstart guide (in README)
+- [x] Architecture overview (`docs/architecture.md`)
+- [x] Supported Dis opcodes and built-in module coverage matrix (`docs/opcodes.md`)
 - [ ] Mapping from Dis VM specification to RiceVM internals
 - [ ] Examples with precompiled Limbo programs

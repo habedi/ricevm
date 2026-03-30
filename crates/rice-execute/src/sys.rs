@@ -109,7 +109,7 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
             bf("bind", 48, sys_stub),           // 2
             bf("byte2char", 40, sys_byte2char), // 3
             bf("char2byte", 48, sys_char2byte), // 4
-            bf("chdir", 40, sys_stub),          // 5
+            bf("chdir", 40, sys_chdir),          // 5
             bf("create", 48, sys_create),       // 6
             bf("dial", 40, sys_stub),           // 7
             bf("dirread", 40, sys_stub),        // 8
@@ -123,20 +123,20 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
             bf("fstat", 40, sys_stub),          // 16
             bf("fversion", 48, sys_stub),       // 17
             bf("fwstat", 104, sys_stub),        // 18
-            bf("iounit", 40, sys_stub),         // 19
+            bf("iounit", 40, sys_iounit),        // 19
             bf("listen", 48, sys_stub),         // 20
             bf("millisec", 32, sys_millisec),   // 21
             bf("mount", 56, sys_stub),          // 22
             bf("open", 40, sys_open),           // 23
             bf("pctl", 40, sys_pctl),           // 24
-            bf("pipe", 40, sys_stub),           // 25
+            bf("pipe", 40, sys_pipe),            // 25
             bf("pread", 56, sys_stub),          // 26
             bf("print", 64, sys_print),         // 27
             bf("pwrite", 56, sys_stub),         // 28
             bf("read", 48, sys_read),           // 29
             bf("readn", 48, sys_read),          // 30
-            bf("remove", 40, sys_stub),         // 31
-            bf("seek", 56, sys_stub),           // 32
+            bf("remove", 40, sys_remove),        // 31
+            bf("seek", 56, sys_seek),           // 32
             bf("sleep", 40, sys_sleep),         // 33
             bf("sprint", 64, sys_sprint),       // 34
             bf("stat", 40, sys_stub),           // 35
@@ -144,7 +144,7 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
             bf("tokenize", 40, sys_tokenize),   // 37
             bf("unmount", 40, sys_stub),        // 38
             bf("utfbytes", 40, sys_utfbytes),   // 39
-            bf("werrstr", 40, sys_stub),        // 40
+            bf("werrstr", 40, sys_werrstr),      // 40
             bf("write", 48, sys_write),         // 41
             bf("wstat", 104, sys_stub),         // 42
         ],
@@ -553,6 +553,84 @@ fn sys_utfbytes(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 // --- Helper ---
+
+fn sys_chdir(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    let path_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    let result = if std::env::set_current_dir(&path).is_ok() {
+        0
+    } else {
+        -1
+    };
+    memory::write_word(&mut vm.frames.data, frame_base, result);
+    Ok(())
+}
+
+fn sys_remove(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    let path_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    let result = if std::fs::remove_file(&path).is_ok() {
+        0
+    } else {
+        -1
+    };
+    memory::write_word(&mut vm.frames.data, frame_base, result);
+    Ok(())
+}
+
+fn sys_seek(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let offset = memory::read_big(&vm.frames.data, frame_base + 20);
+    let whence = memory::read_word(&vm.frames.data, frame_base + 28);
+    let fd_num = get_fd_num(vm, fd_id);
+
+    let seek_whence = match whence {
+        0 => libc::SEEK_SET,
+        1 => libc::SEEK_CUR,
+        2 => libc::SEEK_END,
+        _ => libc::SEEK_SET,
+    };
+    let result = unsafe { libc::lseek(fd_num, offset, seek_whence) };
+    memory::write_big(&mut vm.frames.data, frame_base, result);
+    Ok(())
+}
+
+fn sys_pipe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    let mut fds = [0i32; 2];
+    let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
+
+    if result == 0 {
+        let arr_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+        // Write FD objects into the array
+        if let Some(obj) = vm.heap.get_mut(arr_id)
+            && let HeapData::Array { data, .. } = &mut obj.data
+            && data.len() >= 8
+        {
+            memory::write_word(data, 0, fds[0]);
+            memory::write_word(data, 4, fds[1]);
+        }
+    }
+    memory::write_word(&mut vm.frames.data, frame_base, result);
+    Ok(())
+}
+
+fn sys_iounit(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    // Return a reasonable default IO unit size
+    memory::write_word(&mut vm.frames.data, frame_base, 8192);
+    Ok(())
+}
+
+fn sys_werrstr(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    // Stub: always returns 0 (no error string to set)
+    memory::write_word(&mut vm.frames.data, frame_base, 0);
+    Ok(())
+}
 
 fn get_fd_num(vm: &VmState<'_>, fd_id: HeapId) -> i32 {
     if fd_id == heap::NIL as HeapId {

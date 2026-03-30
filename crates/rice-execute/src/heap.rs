@@ -119,6 +119,24 @@ impl Heap {
         }
     }
 
+    /// Number of live objects on the heap.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Check if a HeapId refers to a live object.
+    #[allow(dead_code)]
+    pub fn contains(&self, id: HeapId) -> bool {
+        id != NIL && self.objects.contains_key(&id)
+    }
+
+    /// Remove all objects not in the marked set (sweep phase of GC).
+    #[allow(dead_code)]
+    pub fn sweep(&mut self, marked: &std::collections::HashSet<HeapId>) {
+        self.objects.retain(|id, _| marked.contains(id));
+    }
+
     /// Get the string data from a heap object, or None if not a string.
     pub fn get_string(&self, id: HeapId) -> Option<&str> {
         match self.get(id)? {

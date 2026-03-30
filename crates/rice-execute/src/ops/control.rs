@@ -59,13 +59,20 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 
     // 2. Try loading from filesystem
-    // Search paths: exact path, path + ".dis", "/dis/" + path + ".dis"
-    let candidates = vec![
+    let mut candidates = vec![
         path.clone(),
         format!("{path}.dis"),
-        format!("/dis/{path}.dis"),
-        format!("./{path}.dis"),
     ];
+    // Add probe paths from RICEVM_PROBE env var
+    if let Ok(probe) = std::env::var("RICEVM_PROBE") {
+        for dir in probe.split(':') {
+            if !dir.is_empty() {
+                candidates.push(format!("{dir}/{path}"));
+                candidates.push(format!("{dir}/{path}.dis"));
+            }
+        }
+    }
+    candidates.push(format!("./{path}.dis"));
 
     for candidate in &candidates {
         if let Ok(bytes) = std::fs::read(candidate)
@@ -234,11 +241,20 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// goto src, dst — computed goto: dst holds a pc table pointer, src is the index.
 /// In Dis, `goto` jumps to the PC stored in a case table.
 /// src = pointer to word array of PCs, dst = index.
+/// goto src, dst — computed goto: read index from src, jump to table[index].
+/// dst points to a flat array of word-sized PCs in frame or MP memory.
 pub(crate) fn op_goto(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    // The goto instruction uses src as a pointer to an array of PCs
-    // and dst as an index. We read the target PC from src[dst].
-    let _src = vm.src_word()?;
-    let target = vm.dst_word()?;
+    let index = vm.src_word()? as usize;
+    // Read the target PC from the table at dst + index * 4
+    let target = match vm.dst {
+        crate::address::AddrTarget::Frame(off) => {
+            crate::memory::read_word(&vm.frames.data, off + index * 4)
+        }
+        crate::address::AddrTarget::Mp(off) => {
+            crate::memory::read_word(&vm.mp, off + index * 4)
+        }
+        _ => vm.dst_word()?,
+    };
     vm.next_pc = target as usize;
     Ok(())
 }

@@ -1,0 +1,17 @@
+[package]
+name = "ricevm-loader-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ricevm-loader = { path = ".." }
+
+[[bin]]
+name = "fuzz_load"
+path = "fuzz_targets/fuzz_load.rs"
+doc = false

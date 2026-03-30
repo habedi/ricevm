@@ -43,12 +43,12 @@ pub(crate) fn create_math_module() -> BuiltinModule {
             mf("erf", 40, math_stub),
             mf("erfc", 40, math_stub),
             mf("exp", 40, math_exp),
-            mf("expm1", 40, math_stub),
+            mf("expm1", 40, math_expm1),
             mf("export_int", 40, math_stub),
             mf("export_real", 40, math_stub),
             mf("export_real32", 40, math_stub),
             mf("fabs", 40, math_fabs),
-            mf("fdim", 48, math_stub),
+            mf("fdim", 48, math_fdim),
             mf("finite", 40, math_finite),
             mf("floor", 40, math_floor),
             mf("fmax", 48, math_fmax),
@@ -283,5 +283,17 @@ fn math_realbits64(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let bits = x.to_bits() as i64;
     memory::write_big(&mut vm.frames.data, base, bits);
+    Ok(())
+}
+
+fn math_expm1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    unary_real(vm, f64::exp_m1)
+}
+
+fn math_fdim(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let base = vm.frames.current_data_offset();
+    let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
+    let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
+    memory::write_real(&mut vm.frames.data, base + RET_OFF, if x > y { x - y } else { 0.0 });
     Ok(())
 }

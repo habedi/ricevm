@@ -28,6 +28,8 @@ pub(crate) struct VmState<'m> {
     pub next_pc: usize,
     pub halted: bool,
     pub trace: bool,
+    pub gc_enabled: bool,
+    pub(crate) gc_counter: usize,
 
     // Resolved operand targets for the current instruction.
     pub src: AddrTarget,
@@ -64,6 +66,7 @@ impl<'m> VmState<'m> {
         modules.register(crate::math::create_math_module());
 
         let trace = std::env::var("RICEVM_TRACE").is_ok();
+        let gc_enabled = std::env::var("RICEVM_NO_GC").is_err();
 
         Ok(Self {
             module,
@@ -76,6 +79,8 @@ impl<'m> VmState<'m> {
             next_pc: 0,
             halted: false,
             trace,
+            gc_enabled,
+            gc_counter: 0,
             src: AddrTarget::None,
             mid: AddrTarget::None,
             dst: AddrTarget::None,
@@ -87,6 +92,8 @@ impl<'m> VmState<'m> {
     }
 
     pub fn run(&mut self) -> Result<(), ExecError> {
+        const GC_INTERVAL: usize = 10_000;
+
         while !self.halted {
             if self.pc >= self.module.code.len() {
                 return Err(ExecError::InvalidPc(self.pc as Pc));
@@ -99,6 +106,15 @@ impl<'m> VmState<'m> {
             self.next_pc = self.pc + 1;
             ops::dispatch(self, &inst)?;
             self.pc = self.next_pc;
+
+            // Periodic GC
+            if self.gc_enabled {
+                self.gc_counter += 1;
+                if self.gc_counter >= GC_INTERVAL {
+                    self.gc_counter = 0;
+                    crate::gc::collect(&mut self.heap, &self.frames, &self.mp);
+                }
+            }
         }
         Ok(())
     }

@@ -17,6 +17,15 @@ enum Command {
     Run {
         /// Path to the .dis module file
         path: PathBuf,
+        /// Module search paths (repeatable)
+        #[arg(long = "probe", short = 'p')]
+        probe_paths: Vec<PathBuf>,
+        /// Enable instruction tracing
+        #[arg(long)]
+        trace: bool,
+        /// Disable mark-and-sweep garbage collection
+        #[arg(long = "no-gc")]
+        no_gc: bool,
     },
     /// Disassemble a .dis module file
     Dis {
@@ -31,7 +40,29 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Run { path } => {
+        Command::Run {
+            path,
+            probe_paths,
+            trace,
+            no_gc,
+        } => {
+            // SAFETY: set_var is unsafe in edition 2024 due to potential data races,
+            // but we're single-threaded at this point before spawning any threads.
+            unsafe {
+                if trace {
+                    std::env::set_var("RICEVM_TRACE", "1");
+                }
+                if no_gc {
+                    std::env::set_var("RICEVM_NO_GC", "1");
+                }
+                if !probe_paths.is_empty() {
+                    let paths: Vec<String> = probe_paths
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect();
+                    std::env::set_var("RICEVM_PROBE", paths.join(":"));
+                }
+            }
             let bytes = fs::read(&path)?;
             let module = ricevm_loader::load(&bytes)?;
             tracing::info!(name = %module.name, "Module loaded");

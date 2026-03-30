@@ -31,7 +31,11 @@ pub(crate) enum HeapData {
     /// `tail` is the HeapId of the next list node (NIL = end of list).
     List { head: Vec<u8>, tail: HeapId },
     /// A loaded module handle (for built-in modules).
-    ModuleRef { module_id: u32 },
+    /// `func_map` maps import function indices to builtin function indices.
+    ModuleRef {
+        module_id: u32,
+        func_map: Vec<Option<usize>>,
+    },
     /// A loaded Dis module from a .dis file.
     LoadedModule { module_idx: usize },
     /// A Dis channel (stub for milestone 3).

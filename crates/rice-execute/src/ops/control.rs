@@ -52,9 +52,28 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let path_id = vm.src_ptr()?;
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
 
+    // Get the import table index to build function mapping
+    let import_idx = vm.mid_word()? as usize;
+
     // 1. Try built-in module first
     if let Some(module_id) = vm.modules.find_builtin(&path) {
-        let ref_id = vm.heap.alloc(0, HeapData::ModuleRef { module_id });
+        // Build function mapping from caller's import table signatures
+        // to builtin function indices
+        let func_map = if import_idx < vm.module.imports.len() {
+            vm.module.imports[import_idx]
+                .functions
+                .iter()
+                .map(|imp| {
+                    let sig = imp.signature as u32;
+                    vm.modules
+                        .get_module(module_id)
+                        .and_then(|m| m.funcs.iter().position(|f| f.sig == sig))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let ref_id = vm.heap.alloc(0, HeapData::ModuleRef { module_id, func_map });
         return vm.move_ptr_to_dst(ref_id);
     }
 
@@ -95,15 +114,24 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 /// Resolved module reference: either a built-in or a loaded .dis module.
 enum ModuleKind {
-    Builtin { module_id: u32 },
-    Loaded { module_idx: usize },
+    Builtin {
+        module_id: u32,
+        func_map: Vec<Option<usize>>,
+    },
+    Loaded {
+        module_idx: usize,
+    },
 }
 
 fn resolve_module_ref(vm: &VmState<'_>, heap_id: heap::HeapId) -> Result<ModuleKind, ExecError> {
     match vm.heap.get(heap_id) {
         Some(obj) => match &obj.data {
-            HeapData::ModuleRef { module_id } => Ok(ModuleKind::Builtin {
+            HeapData::ModuleRef {
+                module_id,
+                func_map,
+            } => Ok(ModuleKind::Builtin {
                 module_id: *module_id,
+                func_map: func_map.clone(),
             }),
             HeapData::LoadedModule { module_idx } => Ok(ModuleKind::Loaded {
                 module_idx: *module_idx,
@@ -121,15 +149,25 @@ pub(crate) fn op_mframe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let func_idx = vm.mid_word()? as u32;
 
     let frame_size = match resolve_module_ref(vm, mod_ref_id)? {
-        ModuleKind::Builtin { module_id } => vm
-            .modules
-            .get_func(module_id, func_idx)
-            .map(|f| f.frame_size)
-            .ok_or_else(|| {
-                ExecError::Other(format!(
-                    "builtin function not found: module={module_id}, func={func_idx}"
-                ))
-            })?,
+        ModuleKind::Builtin {
+            module_id,
+            func_map,
+        } => {
+            // Map import index to builtin index via func_map
+            let builtin_idx = func_map
+                .get(func_idx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(func_idx as usize);
+            vm.modules
+                .get_func(module_id, builtin_idx as u32)
+                .map(|f| f.frame_size)
+                .ok_or_else(|| {
+                    ExecError::Other(format!(
+                        "builtin function not found: module={module_id}, func={func_idx} (mapped to {builtin_idx})"
+                    ))
+                })?
+        }
         ModuleKind::Loaded { module_idx } => {
             // For loaded modules, get frame size from the module's export + type section
             let loaded = &vm.loaded_modules[module_idx];
@@ -164,15 +202,23 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         .activate_pending(frame_data_offset, vm.next_pc as i32)?;
 
     match kind {
-        ModuleKind::Builtin { module_id } => {
-            // Call built-in handler directly
+        ModuleKind::Builtin {
+            module_id,
+            func_map,
+        } => {
+            // Map import index to builtin index via func_map
+            let builtin_idx = func_map
+                .get(func_idx as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(func_idx as usize);
             let handler = vm
                 .modules
-                .get_func(module_id, func_idx)
+                .get_func(module_id, builtin_idx as u32)
                 .map(|f| f.handler)
                 .ok_or_else(|| {
                     ExecError::Other(format!(
-                        "builtin function not found: module={module_id}, func={func_idx}"
+                        "builtin function not found: module={module_id}, func={func_idx} (mapped to {builtin_idx})"
                     ))
                 })?;
             handler(vm)?;

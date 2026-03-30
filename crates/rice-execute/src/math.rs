@@ -102,6 +102,7 @@ fn mf(
 ) -> BuiltinFunc {
     BuiltinFunc {
         name,
+        sig: 0, // Math functions use a simpler matching; sigs can be added later
         frame_size,
         handler,
     }

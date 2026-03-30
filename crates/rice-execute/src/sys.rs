@@ -104,60 +104,62 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
     BuiltinModule {
         name: "$Sys",
         funcs: vec![
-            bf("announce", 40, sys_stub),       // 0
-            bf("aprint", 64, sys_aprint),       // 1
-            bf("bind", 48, sys_stub),           // 2
-            bf("byte2char", 40, sys_byte2char), // 3
-            bf("char2byte", 48, sys_char2byte), // 4
-            bf("chdir", 40, sys_chdir),          // 5
-            bf("create", 48, sys_create),       // 6
-            bf("dial", 40, sys_stub),           // 7
-            bf("dirread", 40, sys_stub),        // 8
-            bf("dup", 40, sys_dup),             // 9
-            bf("export", 48, sys_stub),         // 10
-            bf("fauth", 40, sys_stub),          // 11
-            bf("fd2path", 40, sys_fd2path),     // 12
-            bf("fildes", 40, sys_fildes),       // 13
-            bf("file2chan", 40, sys_stub),      // 14
-            bf("fprint", 64, sys_fprint),       // 15
-            bf("fstat", 40, sys_stub),          // 16
-            bf("fversion", 48, sys_stub),       // 17
-            bf("fwstat", 104, sys_stub),        // 18
-            bf("iounit", 40, sys_iounit),        // 19
-            bf("listen", 48, sys_stub),         // 20
-            bf("millisec", 32, sys_millisec),   // 21
-            bf("mount", 56, sys_stub),          // 22
-            bf("open", 40, sys_open),           // 23
-            bf("pctl", 40, sys_pctl),           // 24
-            bf("pipe", 40, sys_pipe),            // 25
-            bf("pread", 56, sys_stub),          // 26
-            bf("print", 64, sys_print),         // 27
-            bf("pwrite", 56, sys_stub),         // 28
-            bf("read", 48, sys_read),           // 29
-            bf("readn", 48, sys_read),          // 30
-            bf("remove", 40, sys_remove),        // 31
-            bf("seek", 56, sys_seek),           // 32
-            bf("sleep", 40, sys_sleep),         // 33
-            bf("sprint", 64, sys_sprint),       // 34
-            bf("stat", 40, sys_stub),           // 35
-            bf("stream", 48, sys_stub),         // 36
-            bf("tokenize", 40, sys_tokenize),   // 37
-            bf("unmount", 40, sys_stub),        // 38
-            bf("utfbytes", 40, sys_utfbytes),   // 39
-            bf("werrstr", 40, sys_werrstr),      // 40
-            bf("write", 48, sys_write),         // 41
-            bf("wstat", 104, sys_stub),         // 42
+            bf("announce", 0x0b7c4ac0, 40, sys_stub),
+            bf("aprint",   0x77442d46, 64, sys_aprint),
+            bf("bind",     0x66326d91, 48, sys_stub),
+            bf("byte2char",0x3d6094f9, 40, sys_byte2char),
+            bf("char2byte",0x2ba5ab41, 48, sys_char2byte),
+            bf("chdir",    0xc6935858, 40, sys_chdir),
+            bf("create",   0x54db77d9, 48, sys_create),
+            bf("dial",     0x29e90174, 40, sys_stub),
+            bf("dirread",  0x72210d71, 40, sys_stub),
+            bf("dup",      0x6584767b, 40, sys_dup),
+            bf("export",   0x6fc6dc03, 48, sys_stub),
+            bf("fauth",    0x20ccc34b, 40, sys_stub),
+            bf("fd2path",  0x749c6042, 40, sys_fd2path),
+            bf("fildes",   0x1478f993, 40, sys_fildes),
+            bf("file2chan", 0x9f34d686, 40, sys_stub),
+            bf("fprint",   0xf46486c8, 64, sys_fprint),
+            bf("fstat",    0xda4499c2, 40, sys_stub),
+            bf("fversion", 0xfe9c0a06, 48, sys_stub),
+            bf("fwstat",   0x50a6c7e0, 104, sys_stub),
+            bf("iounit",   0x5583b730, 40, sys_iounit),
+            bf("listen",   0xb97416e0, 48, sys_stub),
+            bf("millisec", 0x616977e8, 32, sys_millisec),
+            bf("mount",    0x74c17b3a, 56, sys_stub),
+            bf("open",     0x8f477f99, 40, sys_open),
+            bf("pctl",     0x05df27fb, 40, sys_pctl),
+            bf("pipe",     0x1f2c52ea, 40, sys_pipe),
+            bf("pread",    0x09d8aac6, 56, sys_stub),
+            bf("print",    0xac849033, 64, sys_print),
+            bf("pwrite",   0x09d8aac6, 56, sys_stub),
+            bf("read",     0x7cfef557, 48, sys_read),
+            bf("readn",    0x7cfef557, 48, sys_read),
+            bf("remove",   0xc6935858, 40, sys_remove),
+            bf("seek",     0xaeccaddb, 56, sys_seek),
+            bf("sleep",    0xe67bf126, 40, sys_sleep),
+            bf("sprint",   0x4c0624b6, 64, sys_sprint),
+            bf("stat",     0x319328dd, 40, sys_stub),
+            bf("stream",   0xb9e8f9ea, 48, sys_stub),
+            bf("tokenize", 0x57338f20, 40, sys_tokenize),
+            bf("unmount",  0x21e337e3, 40, sys_stub),
+            bf("utfbytes", 0x01d4a1f4, 40, sys_utfbytes),
+            bf("werrstr",  0xc6935858, 40, sys_werrstr),
+            bf("write",    0x7cfef557, 48, sys_write),
+            bf("wstat",    0x56b02096, 104, sys_stub),
         ],
     }
 }
 
 fn bf(
     name: &'static str,
+    sig: u32,
     frame_size: usize,
     handler: fn(&mut VmState<'_>) -> Result<(), ExecError>,
 ) -> BuiltinFunc {
     BuiltinFunc {
         name,
+        sig,
         frame_size,
         handler,
     }

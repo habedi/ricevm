@@ -184,13 +184,22 @@ impl FileOps for TcpListenerFile {
 pub(crate) struct FileTable {
     files: HashMap<i32, FileEntry>,
     next_fd: i32,
+    /// Inferno root directory for resolving absolute guest paths.
+    /// When non-empty, guest paths starting with `/` are resolved as
+    /// `{root}/{guest_path}`. Relative paths are used as-is.
+    root: String,
 }
 
 impl FileTable {
     pub fn new() -> Self {
+        Self::with_root(String::new())
+    }
+
+    pub fn with_root(root: String) -> Self {
         let mut ft = Self {
             files: HashMap::new(),
             next_fd: 3,
+            root,
         };
         ft.files.insert(
             0,
@@ -216,15 +225,27 @@ impl FileTable {
         ft
     }
 
+    /// Resolve a guest path to a host path.
+    /// If a root is set and the path starts with `/`, prepend the root.
+    /// Otherwise, use the path as-is.
+    pub fn resolve_path(&self, path: &str) -> String {
+        if !self.root.is_empty() && path.starts_with('/') {
+            format!("{}{path}", self.root)
+        } else {
+            path.to_string()
+        }
+    }
+
     /// Open a file and return its fd number.
     pub fn open(&mut self, path: &str, mode: i32) -> io::Result<i32> {
+        let resolved = self.resolve_path(path);
         let file = match mode & 0x3 {
-            0 => std::fs::File::open(path)?,                          // OREAD
-            1 => std::fs::OpenOptions::new().write(true).open(path)?, // OWRITE
+            0 => std::fs::File::open(&resolved)?,                          // OREAD
+            1 => std::fs::OpenOptions::new().write(true).open(&resolved)?, // OWRITE
             _ => std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(path)?, // ORDWR
+                .open(&resolved)?, // ORDWR
         };
         let fd = self.next_fd;
         self.next_fd += 1;
@@ -232,7 +253,7 @@ impl FileTable {
             fd,
             FileEntry {
                 inner: Box::new(RegularFile(file)),
-                path: Some(path.to_string()),
+                path: Some(resolved),
             },
         );
         Ok(fd)
@@ -240,14 +261,15 @@ impl FileTable {
 
     /// Create a file and return its fd number.
     pub fn create(&mut self, path: &str) -> io::Result<i32> {
-        let file = std::fs::File::create(path)?;
+        let resolved = self.resolve_path(path);
+        let file = std::fs::File::create(&resolved)?;
         let fd = self.next_fd;
         self.next_fd += 1;
         self.files.insert(
             fd,
             FileEntry {
                 inner: Box::new(RegularFile(file)),
-                path: Some(path.to_string()),
+                path: Some(resolved),
             },
         );
         Ok(fd)

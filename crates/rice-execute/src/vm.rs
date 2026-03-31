@@ -33,6 +33,8 @@ pub(crate) struct VmState<'m> {
     pub(crate) gc_counter: usize,
     /// Index of the currently executing loaded module (None = main module).
     pub(crate) current_loaded_module: Option<usize>,
+    /// Inferno root directory for path resolution (empty = use host paths directly).
+    pub(crate) root_path: String,
 
     // Resolved operand targets for the current instruction.
     pub src: AddrTarget,
@@ -50,6 +52,10 @@ pub(crate) struct VmState<'m> {
 
 impl<'m> VmState<'m> {
     pub fn new(module: &'m Module) -> Result<Self, ExecError> {
+        Self::with_args(module, Vec::new())
+    }
+
+    pub fn with_args(module: &'m Module, args: Vec<String>) -> Result<Self, ExecError> {
         let mut heap = Heap::new();
         let mp = data::init_mp(module.header.data_size as usize, &module.data, &mut heap);
         let mut frames = FrameStack::new();
@@ -90,17 +96,27 @@ impl<'m> VmState<'m> {
             memory::write_word(&mut ctx_data, 8, wm_chan as i32);
             let ctx_id = heap.alloc(0, heap::HeapData::Record(ctx_data));
 
-            // Create args list with program name
-            let prog_name = heap.alloc(0, heap::HeapData::Str(module.name.clone()));
-            let mut head = vec![0u8; 4];
-            memory::write_word(&mut head, 0, prog_name as i32);
-            let args_list = heap.alloc(
-                0,
-                heap::HeapData::List {
-                    head,
-                    tail: heap::NIL,
-                },
-            );
+            // Build args list: [module_name, arg1, arg2, ...] as a linked list.
+            // Construct in reverse so the list is in forward order.
+            let mut all_args = vec![module.name.clone()];
+            all_args.extend(args.iter().cloned());
+
+            let mut args_list = heap::NIL;
+            for arg in all_args.iter().rev() {
+                let str_id = heap.alloc(0, heap::HeapData::Str(arg.clone()));
+                let mut head_buf = vec![0u8; 4];
+                memory::write_word(&mut head_buf, 0, str_id as i32);
+                if args_list != heap::NIL {
+                    heap.inc_ref(args_list);
+                }
+                args_list = heap.alloc(
+                    0,
+                    heap::HeapData::List {
+                        head: head_buf,
+                        tail: args_list,
+                    },
+                );
+            }
 
             let fp_base = frames.current_data_offset();
             // fp[32] = Draw->Context
@@ -121,6 +137,7 @@ impl<'m> VmState<'m> {
 
         let trace = std::env::var("RICEVM_TRACE").is_ok();
         let gc_enabled = std::env::var("RICEVM_NO_GC").is_err();
+        let root_path = std::env::var("RICEVM_ROOT").unwrap_or_default();
 
         Ok(Self {
             module,
@@ -129,7 +146,7 @@ impl<'m> VmState<'m> {
             heap,
             modules,
             loaded_modules: Vec::new(),
-            files: crate::filetab::FileTable::new(),
+            files: crate::filetab::FileTable::with_root(root_path.clone()),
             pc: module.header.entry_pc as usize,
             next_pc: 0,
             halted: false,
@@ -137,6 +154,7 @@ impl<'m> VmState<'m> {
             gc_enabled,
             gc_counter: 0,
             current_loaded_module: None,
+            root_path,
             src: AddrTarget::None,
             mid: AddrTarget::None,
             dst: AddrTarget::None,

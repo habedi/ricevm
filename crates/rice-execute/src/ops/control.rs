@@ -134,6 +134,13 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     // 3. Try loading from filesystem
     let mut candidates = vec![path.clone(), format!("{path}.dis")];
 
+    // If a root path is configured, resolve absolute Inferno paths through it.
+    let root = &vm.root_path;
+    if !root.is_empty() && path.starts_with('/') {
+        candidates.insert(0, format!("{root}{path}"));
+        candidates.insert(1, format!("{root}{path}.dis"));
+    }
+
     // Strip common Inferno prefixes for relative resolution
     let stripped_paths: Vec<String> = ["/dis/lib/", "/dis/", "/"]
         .iter()
@@ -152,6 +159,15 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     candidates.push(format!("{dir}/{sp}.dis"));
                 }
             }
+        }
+    }
+    // Also try root + stripped paths
+    if !root.is_empty() {
+        for sp in &stripped_paths {
+            candidates.push(format!("{root}/dis/{sp}"));
+            candidates.push(format!("{root}/dis/{sp}.dis"));
+            candidates.push(format!("{root}/dis/lib/{sp}"));
+            candidates.push(format!("{root}/dis/lib/{sp}.dis"));
         }
     }
     candidates.push(format!("./{path}.dis"));

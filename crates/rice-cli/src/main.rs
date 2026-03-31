@@ -20,6 +20,9 @@ enum Command {
         /// Module search paths (repeatable)
         #[arg(long = "probe", short = 'p')]
         probe_paths: Vec<PathBuf>,
+        /// Inferno root directory for path resolution
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Enable instruction tracing
         #[arg(long)]
         trace: bool,
@@ -29,6 +32,9 @@ enum Command {
         /// Thread pool size for the scheduler
         #[arg(long, default_value = "1")]
         threads: usize,
+        /// Arguments to pass to the guest program
+        #[arg(last = true)]
+        guest_args: Vec<String>,
     },
     /// Disassemble a .dis module file
     Dis {
@@ -54,9 +60,11 @@ fn main() -> anyhow::Result<()> {
         Command::Run {
             path,
             probe_paths,
+            root,
             trace,
             no_gc,
             threads,
+            guest_args,
         } => {
             // SAFETY: set_var is unsafe in edition 2024 due to potential data races,
             // but we're single-threaded at this point before spawning any threads.
@@ -70,6 +78,9 @@ fn main() -> anyhow::Result<()> {
                 if threads > 1 {
                     std::env::set_var("RICEVM_THREADS", threads.to_string());
                 }
+                if let Some(ref root_dir) = root {
+                    std::env::set_var("RICEVM_ROOT", root_dir.to_string_lossy().as_ref());
+                }
                 if !probe_paths.is_empty() {
                     let paths: Vec<String> = probe_paths
                         .iter()
@@ -81,7 +92,7 @@ fn main() -> anyhow::Result<()> {
             let bytes = fs::read(&path)?;
             let module = ricevm_loader::load(&bytes)?;
             tracing::info!(name = %module.name, "Module loaded");
-            ricevm_execute::execute(&module)?;
+            ricevm_execute::execute_with_args(&module, guest_args)?;
         }
         Command::Debug { path, probe_paths } => {
             unsafe {

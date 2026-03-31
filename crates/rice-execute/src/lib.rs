@@ -28,6 +28,14 @@ use ricevm_core::{ExecError, Module};
 ///
 /// Returns `Ok(())` on clean exit, or an [`ExecError`] describing the failure.
 pub fn execute(module: &Module) -> Result<(), ExecError> {
+    execute_with_args(module, Vec::new())
+}
+
+/// Execute a loaded Dis module with guest program arguments.
+///
+/// `args` are passed to the guest program's `init()` as the argv list.
+/// The module name is automatically prepended as argv[0].
+pub fn execute_with_args(module: &Module, args: Vec<String>) -> Result<(), ExecError> {
     let entry_pc = module.header.entry_pc;
     if entry_pc < 0 || entry_pc as usize >= module.code.len() {
         return Err(ExecError::InvalidPc(entry_pc));
@@ -36,9 +44,10 @@ pub fn execute(module: &Module) -> Result<(), ExecError> {
         name = %module.name,
         entry_pc = entry_pc,
         instructions = module.code.len(),
+        args = ?args,
         "Executing module"
     );
-    let mut state = vm::VmState::new(module)?;
+    let mut state = vm::VmState::with_args(module, args)?;
     state.run()
 }
 

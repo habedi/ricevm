@@ -4,9 +4,10 @@
 //! Pre-populated with stdin(0), stdout(1), stderr(2).
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 
 /// A file table entry that supports read, write, and seek.
 pub(crate) struct FileEntry {
@@ -180,6 +181,70 @@ impl FileOps for TcpListenerFile {
     }
 }
 
+/// Shared buffer for in-memory pipes.
+type PipeBuffer = Arc<Mutex<VecDeque<u8>>>;
+
+/// Read end of an in-memory pipe.
+struct PipeReader(PipeBuffer);
+
+impl FileOps for PipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut queue = self.0.lock().unwrap();
+        let n = buf.len().min(queue.len());
+        for b in buf.iter_mut().take(n) {
+            *b = queue.pop_front().unwrap();
+        }
+        Ok(n)
+    }
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot write to read end of pipe",
+        ))
+    }
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot seek pipe",
+        ))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Write end of an in-memory pipe.
+struct PipeWriter(PipeBuffer);
+
+impl FileOps for PipeWriter {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot read from write end of pipe",
+        ))
+    }
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut queue = self.0.lock().unwrap();
+        queue.extend(buf);
+        Ok(buf.len())
+    }
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot seek pipe",
+        ))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 /// Portable file descriptor table.
 pub(crate) struct FileTable {
     files: HashMap<i32, FileEntry>,
@@ -240,7 +305,7 @@ impl FileTable {
     pub fn open(&mut self, path: &str, mode: i32) -> io::Result<i32> {
         let resolved = self.resolve_path(path);
         let file = match mode & 0x3 {
-            0 => std::fs::File::open(&resolved)?,                          // OREAD
+            0 => std::fs::File::open(&resolved)?, // OREAD
             1 => std::fs::OpenOptions::new().write(true).open(&resolved)?, // OWRITE
             _ => std::fs::OpenOptions::new()
                 .read(true)
@@ -273,6 +338,30 @@ impl FileTable {
             },
         );
         Ok(fd)
+    }
+
+    /// Create an in-memory pipe. Returns (read_fd, write_fd).
+    pub fn pipe(&mut self) -> (i32, i32) {
+        let buf = Arc::new(Mutex::new(VecDeque::new()));
+        let read_fd = self.next_fd;
+        self.next_fd += 1;
+        let write_fd = self.next_fd;
+        self.next_fd += 1;
+        self.files.insert(
+            read_fd,
+            FileEntry {
+                inner: Box::new(PipeReader(buf.clone())),
+                path: None,
+            },
+        );
+        self.files.insert(
+            write_fd,
+            FileEntry {
+                inner: Box::new(PipeWriter(buf)),
+                path: None,
+            },
+        );
+        (read_fd, write_fd)
     }
 
     /// Get an fd entry for reading.
@@ -384,5 +473,25 @@ impl FileTable {
 
         self.files.insert(listener_fd, entry);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipe_read_write() {
+        let mut ft = FileTable::new();
+        let (read_fd, write_fd) = ft.pipe();
+
+        let data = b"hello pipe";
+        let written = ft.write(write_fd, data).expect("pipe write should succeed");
+        assert_eq!(written, data.len());
+
+        let mut buf = vec![0u8; 32];
+        let n = ft.read(read_fd, &mut buf).expect("pipe read should succeed");
+        assert_eq!(n, data.len());
+        assert_eq!(&buf[..n], data);
     }
 }

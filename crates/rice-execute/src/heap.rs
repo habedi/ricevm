@@ -11,6 +11,14 @@ pub(crate) type HeapId = u32;
 /// The nil heap pointer.
 pub(crate) const NIL: HeapId = 0;
 
+/// Base value for HeapId allocation.
+///
+/// HeapIds start at this value so they never overlap with frame byte offsets
+/// (typically < 1 MB) or MP offsets (typically < 100 KB). This allows
+/// double-indirect addressing to distinguish heap pointers from frame/MP
+/// offsets by checking `value >= HEAP_ID_BASE`.
+pub(crate) const HEAP_ID_BASE: HeapId = 0x0100_0000; // 16 MB
+
 /// The kind of data stored in a heap object.
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -54,6 +62,17 @@ pub(crate) enum HeapData {
     /// `tag` identifies which pick variant is active (0 = base fields only).
     /// `data` contains the fields as a flat byte buffer, same layout as Record.
     Adt { tag: u32, data: Vec<u8> },
+    /// A slice view into another array. Reads and writes go through to the
+    /// parent array at `byte_start`. This preserves shared-storage semantics
+    /// required by the Dis VM (e.g. Bufio fills a buffer slice, and getb
+    /// reads from the original buffer).
+    ArraySlice {
+        parent_id: HeapId,
+        byte_start: usize,
+        elem_type: u32,
+        elem_size: usize,
+        length: usize,
+    },
 }
 
 /// A heap-allocated object with reference count.
@@ -74,7 +93,7 @@ impl Heap {
     pub fn new() -> Self {
         Self {
             objects: HashMap::new(),
-            next_id: 1, // 0 is reserved for NIL
+            next_id: HEAP_ID_BASE,
         }
     }
 
@@ -128,12 +147,102 @@ impl Heap {
         }
         let should_free = if let Some(obj) = self.objects.get_mut(&id) {
             obj.ref_count = obj.ref_count.saturating_sub(1);
-            obj.ref_count == 0
+            if obj.ref_count == 0 {
+                // Don't free module references — they persist for the VM lifetime
+                // and movmp/movm don't do proper ref counting for embedded pointers.
+                !matches!(
+                    obj.data,
+                    HeapData::ModuleRef { .. }
+                        | HeapData::MainModule { .. }
+                        | HeapData::LoadedModule { .. }
+                )
+            } else {
+                false
+            }
         } else {
             false
         };
         if should_free {
             self.objects.remove(&id);
+        }
+    }
+
+    /// Read bytes from an array or array slice, resolving slices to their parent.
+    pub fn array_read(&self, id: HeapId, offset: usize, len: usize) -> Option<Vec<u8>> {
+        let obj = self.get(id)?;
+        match &obj.data {
+            HeapData::Array { data, .. } => {
+                if offset + len <= data.len() {
+                    Some(data[offset..offset + len].to_vec())
+                } else {
+                    Some(vec![0u8; len])
+                }
+            }
+            HeapData::ArraySlice {
+                parent_id,
+                byte_start,
+                ..
+            } => self.array_read(*parent_id, byte_start + offset, len),
+            _ => None,
+        }
+    }
+
+    /// Write bytes to an array or array slice, resolving slices to their parent.
+    pub fn array_write(&mut self, id: HeapId, offset: usize, data: &[u8]) {
+        if let Some(obj) = self.get(id) {
+            if let HeapData::ArraySlice {
+                parent_id,
+                byte_start,
+                ..
+            } = &obj.data
+            {
+                let pid = *parent_id;
+                let bs = *byte_start;
+                self.array_write(pid, bs + offset, data);
+                return;
+            }
+        }
+        if let Some(obj) = self.get_mut(id) {
+            match &mut obj.data {
+                HeapData::Array {
+                    data: arr_data, ..
+                } => {
+                    let end = (offset + data.len()).min(arr_data.len());
+                    let copy_len = end.saturating_sub(offset);
+                    if copy_len > 0 {
+                        arr_data[offset..offset + copy_len]
+                            .copy_from_slice(&data[..copy_len]);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Get the mutable data buffer of an array, resolving slices to their
+    /// parent. Returns (data, byte_offset) where byte_offset is the start
+    /// offset within the parent's data for slice types, or 0 for arrays.
+    pub fn array_data_mut(
+        &mut self,
+        id: HeapId,
+    ) -> Option<(&mut Vec<u8>, usize)> {
+        // First resolve ArraySlice to its parent.
+        let (root_id, byte_start) = {
+            let obj = self.get(id)?;
+            match &obj.data {
+                HeapData::ArraySlice {
+                    parent_id,
+                    byte_start,
+                    ..
+                } => (*parent_id, *byte_start),
+                HeapData::Array { .. } => (id, 0),
+                _ => return None,
+            }
+        };
+        let obj = self.get_mut(root_id)?;
+        match &mut obj.data {
+            HeapData::Array { data, .. } => Some((data, byte_start)),
+            _ => None,
         }
     }
 
@@ -280,5 +389,102 @@ mod tests {
             HeapData::Array { length, .. } => assert_eq!(*length, 10),
             _ => panic!("expected array"),
         }
+    }
+
+    #[test]
+    fn array_read_through_slice() {
+        let mut heap = Heap::new();
+        // Parent array with data [10, 20, 30, 40, 50] as i32
+        let mut data = vec![0u8; 20];
+        for i in 0..5i32 {
+            crate::memory::write_word(&mut data, i as usize * 4, (i + 1) * 10);
+        }
+        let parent_id = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data,
+                length: 5,
+            },
+        );
+
+        // Slice starting at byte 8 (element 2), length 2
+        let slice_id = heap.alloc(
+            0,
+            HeapData::ArraySlice {
+                parent_id,
+                byte_start: 8,
+                elem_type: 0,
+                elem_size: 4,
+                length: 2,
+            },
+        );
+
+        // Read first element of the slice (should be parent element 2 = 30)
+        let bytes = heap.array_read(slice_id, 0, 4).unwrap();
+        let val = crate::memory::read_word(&bytes, 0);
+        assert_eq!(val, 30);
+
+        // Read second element of slice (should be parent element 3 = 40)
+        let bytes = heap.array_read(slice_id, 4, 4).unwrap();
+        let val = crate::memory::read_word(&bytes, 0);
+        assert_eq!(val, 40);
+    }
+
+    #[test]
+    fn array_write_through_slice_updates_parent() {
+        let mut heap = Heap::new();
+        let data = vec![0u8; 20];
+        let parent_id = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data,
+                length: 5,
+            },
+        );
+
+        // Slice at byte_start=4 (element 1)
+        let slice_id = heap.alloc(
+            0,
+            HeapData::ArraySlice {
+                parent_id,
+                byte_start: 4,
+                elem_type: 0,
+                elem_size: 4,
+                length: 3,
+            },
+        );
+
+        // Write 99 at slice offset 0 (= parent offset 4)
+        heap.array_write(slice_id, 0, &99i32.to_le_bytes());
+
+        // Read from parent at offset 4 -- should see 99
+        let bytes = heap.array_read(parent_id, 4, 4).unwrap();
+        let val = i32::from_le_bytes(bytes.try_into().unwrap());
+        assert_eq!(val, 99);
+    }
+
+    #[test]
+    fn module_ref_not_freed_on_dec_ref() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(
+            0,
+            HeapData::ModuleRef {
+                module_id: 1,
+                func_map: Vec::new(),
+            },
+        );
+        assert!(heap.contains(id));
+
+        // Dec ref to 0 -- ModuleRef should NOT be freed
+        heap.dec_ref(id);
+        assert!(
+            heap.contains(id),
+            "ModuleRef should persist even at ref_count 0"
+        );
+        assert_eq!(heap.get(id).unwrap().ref_count, 0);
     }
 }

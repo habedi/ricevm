@@ -208,7 +208,10 @@ impl<'m> Debugger<'m> {
             "fp" => println!("  fp = {}", self.vm.frames.current_data_offset()),
             "stack" => {
                 println!("  frame stack: {} bytes", self.vm.frames.data.len());
-                println!("  current frame base: {}", self.vm.frames.current_data_offset());
+                println!(
+                    "  current frame base: {}",
+                    self.vm.frames.current_data_offset()
+                );
             }
             "heap" => {
                 println!("  heap objects: {}", self.vm.heap.len());

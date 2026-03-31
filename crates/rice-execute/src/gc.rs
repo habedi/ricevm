@@ -91,6 +91,9 @@ fn mark_object(id: HeapId, heap: &Heap, marked: &mut HashSet<HeapId>) {
                 // Follow tail
                 mark_object(*tail, heap, marked);
             }
+            HeapData::ArraySlice { parent_id, .. } => {
+                mark_object(*parent_id, heap, marked);
+            }
             HeapData::Str(_) | HeapData::Channel { .. } => {}
             HeapData::ModuleRef { .. }
             | HeapData::MainModule { .. }

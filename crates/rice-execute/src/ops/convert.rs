@@ -110,13 +110,13 @@ pub(crate) fn op_cvtsw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 pub(crate) fn op_cvtrf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    // fixed-point real to float (stub: treat as identity since we don't have fixed-point)
+    // real → fixed-point (16.16 format)
     let val = vm.src_real()?;
-    vm.set_dst_real(val)
+    vm.set_dst_word((val * 65536.0) as i32)
 }
 
 pub(crate) fn op_cvtfr(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    // float to fixed-point real (stub: treat as identity)
-    let val = vm.src_real()?;
-    vm.set_dst_real(val)
+    // fixed-point → real
+    let val = vm.src_word()?;
+    vm.set_dst_real(val as f64 / 65536.0)
 }

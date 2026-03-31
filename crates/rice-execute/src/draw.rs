@@ -295,7 +295,7 @@ fn draw_display_allocate(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// Display.getwindow: returns (ref Screen, ref Image)
 fn draw_display_getwindow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let display_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let display_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
 
     let screen_id = make_screen(&mut vm.heap, display_id);
     let window_img = make_image(&mut vm.heap, 0, 0, 800, 600, 32, display_id);
@@ -316,8 +316,8 @@ fn draw_display_getwindow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn draw_display_color(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let display_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let _color = memory::read_word(&vm.frames.data, frame_base + 20) as u32;
+    let display_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
+    let _color = memory::read_word(&vm.frames.data, frame_base + 36) as u32;
     let img = make_image(&mut vm.heap, 0, 0, 1, 1, 32, display_id);
     memory::write_word(&mut vm.frames.data, frame_base, img as i32);
     Ok(())
@@ -325,11 +325,11 @@ fn draw_display_color(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn draw_display_newimage(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let display_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let rx = memory::read_word(&vm.frames.data, frame_base + 20);
-    let ry = memory::read_word(&vm.frames.data, frame_base + 24);
-    let rw = memory::read_word(&vm.frames.data, frame_base + 28) - rx;
-    let rh = memory::read_word(&vm.frames.data, frame_base + 32) - ry;
+    let display_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
+    let rx = memory::read_word(&vm.frames.data, frame_base + 36);
+    let ry = memory::read_word(&vm.frames.data, frame_base + 40);
+    let rw = memory::read_word(&vm.frames.data, frame_base + 44) - rx;
+    let rh = memory::read_word(&vm.frames.data, frame_base + 48) - ry;
     let img = make_image(&mut vm.heap, rx, ry, rw, rh, 32, display_id);
     memory::write_word(&mut vm.frames.data, frame_base, img as i32);
     Ok(())
@@ -342,10 +342,10 @@ fn draw_image_draw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     {
         let frame_base = vm.frames.current_data_offset();
         // Read rectangle (min.x, min.y, max.x, max.y)
-        let rx = memory::read_word(&vm.frames.data, frame_base + 20);
-        let ry = memory::read_word(&vm.frames.data, frame_base + 24);
-        let rw = memory::read_word(&vm.frames.data, frame_base + 28) - rx;
-        let rh = memory::read_word(&vm.frames.data, frame_base + 32) - ry;
+        let rx = memory::read_word(&vm.frames.data, frame_base + 36);
+        let ry = memory::read_word(&vm.frames.data, frame_base + 40);
+        let rw = memory::read_word(&vm.frames.data, frame_base + 44) - rx;
+        let rh = memory::read_word(&vm.frames.data, frame_base + 48) - ry;
 
         // Get source color (simplified: use white)
         state::with(|opt_state| {
@@ -364,10 +364,10 @@ fn draw_image_line(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     #[cfg(feature = "gui")]
     {
         let frame_base = vm.frames.current_data_offset();
-        let x0 = memory::read_word(&vm.frames.data, frame_base + 20);
-        let y0 = memory::read_word(&vm.frames.data, frame_base + 24);
-        let x1 = memory::read_word(&vm.frames.data, frame_base + 28);
-        let y1 = memory::read_word(&vm.frames.data, frame_base + 32);
+        let x0 = memory::read_word(&vm.frames.data, frame_base + 36);
+        let y0 = memory::read_word(&vm.frames.data, frame_base + 40);
+        let x1 = memory::read_word(&vm.frames.data, frame_base + 44);
+        let y1 = memory::read_word(&vm.frames.data, frame_base + 48);
 
         state::with(|opt_state| {
             if let Some(state) = opt_state {
@@ -386,10 +386,10 @@ fn draw_image_ellipse(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     #[cfg(feature = "gui")]
     {
         let frame_base = vm.frames.current_data_offset();
-        let cx = memory::read_word(&vm.frames.data, frame_base + 20);
-        let cy = memory::read_word(&vm.frames.data, frame_base + 24);
-        let a = memory::read_word(&vm.frames.data, frame_base + 28);
-        let b = memory::read_word(&vm.frames.data, frame_base + 32);
+        let cx = memory::read_word(&vm.frames.data, frame_base + 36);
+        let cy = memory::read_word(&vm.frames.data, frame_base + 40);
+        let a = memory::read_word(&vm.frames.data, frame_base + 44);
+        let b = memory::read_word(&vm.frames.data, frame_base + 48);
 
         state::with(|opt_state| {
             if let Some(state) = opt_state {
@@ -411,10 +411,10 @@ fn draw_image_fillellipse(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     #[cfg(feature = "gui")]
     {
         let frame_base = vm.frames.current_data_offset();
-        let cx = memory::read_word(&vm.frames.data, frame_base + 20);
-        let cy = memory::read_word(&vm.frames.data, frame_base + 24);
-        let a = memory::read_word(&vm.frames.data, frame_base + 28);
-        let b = memory::read_word(&vm.frames.data, frame_base + 32);
+        let cx = memory::read_word(&vm.frames.data, frame_base + 36);
+        let cy = memory::read_word(&vm.frames.data, frame_base + 40);
+        let a = memory::read_word(&vm.frames.data, frame_base + 44);
+        let b = memory::read_word(&vm.frames.data, frame_base + 48);
 
         state::with(|opt_state| {
             if let Some(state) = opt_state {
@@ -435,8 +435,8 @@ fn draw_image_text(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     #[cfg(feature = "gui")]
     {
         let frame_base = vm.frames.current_data_offset();
-        let _px = memory::read_word(&vm.frames.data, frame_base + 20);
-        let _py = memory::read_word(&vm.frames.data, frame_base + 24);
+        let _px = memory::read_word(&vm.frames.data, frame_base + 36);
+        let _py = memory::read_word(&vm.frames.data, frame_base + 40);
         // Text rendering requires SDL2_ttf which adds complexity.
         // For now, this is a stub that returns the point unchanged.
         memory::write_word(&mut vm.frames.data, frame_base, _px);
@@ -449,10 +449,10 @@ fn draw_image_border(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     #[cfg(feature = "gui")]
     {
         let frame_base = vm.frames.current_data_offset();
-        let rx = memory::read_word(&vm.frames.data, frame_base + 20);
-        let ry = memory::read_word(&vm.frames.data, frame_base + 24);
-        let rw = memory::read_word(&vm.frames.data, frame_base + 28) - rx;
-        let rh = memory::read_word(&vm.frames.data, frame_base + 32) - ry;
+        let rx = memory::read_word(&vm.frames.data, frame_base + 36);
+        let ry = memory::read_word(&vm.frames.data, frame_base + 40);
+        let rw = memory::read_word(&vm.frames.data, frame_base + 44) - rx;
+        let rh = memory::read_word(&vm.frames.data, frame_base + 48) - ry;
 
         state::with(|opt_state| {
             if let Some(state) = opt_state {
@@ -523,7 +523,7 @@ fn draw_font_open(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn draw_font_width(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let str_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
+    let str_id = memory::read_word(&vm.frames.data, frame_base + 36) as HeapId;
     let len = vm.heap.get_string(str_id).map(|s| s.len()).unwrap_or(0);
     // Approximate: 8 pixels per character (monospace assumption)
     memory::write_word(&mut vm.frames.data, frame_base, (len * 8) as i32);
@@ -535,11 +535,11 @@ fn draw_font_width(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn draw_screen_newwindow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     // Read screen ref and rectangle from the frame
-    let screen_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let rx = memory::read_word(&vm.frames.data, frame_base + 20);
-    let ry = memory::read_word(&vm.frames.data, frame_base + 24);
-    let rw = memory::read_word(&vm.frames.data, frame_base + 28) - rx;
-    let rh = memory::read_word(&vm.frames.data, frame_base + 32) - ry;
+    let screen_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
+    let rx = memory::read_word(&vm.frames.data, frame_base + 36);
+    let ry = memory::read_word(&vm.frames.data, frame_base + 40);
+    let rw = memory::read_word(&vm.frames.data, frame_base + 44) - rx;
+    let rh = memory::read_word(&vm.frames.data, frame_base + 48) - ry;
 
     // Get the display from the screen
     let display_id = if let Some(obj) = vm.heap.get(screen_id) {
@@ -571,7 +571,7 @@ fn draw_screen_newwindow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn draw_screen_allocate(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let image_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let image_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
     // Get display from image
     let display_id = if let Some(obj) = vm.heap.get(image_id) {
         if let HeapData::Record(data) = &obj.data {

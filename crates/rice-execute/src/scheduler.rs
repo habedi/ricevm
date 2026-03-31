@@ -34,7 +34,9 @@ pub(crate) struct VmThread {
     pub imm_src: i32,
     pub imm_mid: i32,
     pub imm_dst: i32,
+
     pub heap_refs: Vec<(HeapId, usize)>,
+    pub last_error: String,
     pub id: u32,
     pub state: ThreadState,
 }
@@ -106,7 +108,9 @@ impl<'m> Scheduler<'m> {
             imm_src: 0,
             imm_mid: 0,
             imm_dst: 0,
+
             heap_refs: Vec::new(),
+            last_error: String::new(),
             id,
             state: ThreadState::Ready,
         });
@@ -249,7 +253,9 @@ impl<'m> PreemptiveScheduler<'m> {
             imm_src: 0,
             imm_mid: 0,
             imm_dst: 0,
+
             heap_refs: Vec::new(),
+            last_error: String::new(),
             id,
             state: ThreadState::Ready,
         });
@@ -273,9 +279,10 @@ impl<'m> PreemptiveScheduler<'m> {
             // Wait for all workers to finish
             let mut result = Ok(());
             for w in workers {
-                if let Err(e) = w.join().unwrap_or(Err(ExecError::Other(
-                    "worker thread panicked".to_string(),
-                ))) {
+                if let Err(e) = w
+                    .join()
+                    .unwrap_or(Err(ExecError::Other("worker thread panicked".to_string())))
+                {
                     result = Err(e);
                 }
             }
@@ -394,6 +401,8 @@ fn run_thread_quanta_shared(
             imm_src: thread.imm_src,
             imm_mid: thread.imm_mid,
             imm_dst: thread.imm_dst,
+            last_error: std::mem::take(&mut thread.last_error),
+            caller_mp_stack: Vec::new(),
             heap_refs: std::mem::take(&mut thread.heap_refs),
         };
 
@@ -412,6 +421,7 @@ fn run_thread_quanta_shared(
         thread.imm_mid = vm.imm_mid;
         thread.imm_dst = vm.imm_dst;
         thread.heap_refs = vm.heap_refs;
+        thread.last_error = vm.last_error;
         state.heap = vm.heap;
         state.modules = vm.modules;
         state.loaded_modules = vm.loaded_modules;
@@ -454,6 +464,8 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
         imm_src: thread.imm_src,
         imm_mid: thread.imm_mid,
         imm_dst: thread.imm_dst,
+        last_error: std::mem::take(&mut thread.last_error),
+        caller_mp_stack: Vec::new(),
         heap_refs: std::mem::take(&mut thread.heap_refs),
     };
 
@@ -477,6 +489,7 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
     thread.imm_mid = vm.imm_mid;
     thread.imm_dst = vm.imm_dst;
     thread.heap_refs = vm.heap_refs;
+    thread.last_error = vm.last_error;
     sched.heap = vm.heap;
     sched.modules = vm.modules;
     sched.loaded_modules = vm.loaded_modules;

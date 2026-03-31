@@ -174,8 +174,10 @@ pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             };
 
             let saved_loaded_module = vm.current_loaded_module;
+            let caller_virt_idx = vm.current_module_virt_idx();
             let loaded_mp = std::mem::take(&mut vm.loaded_modules[module_idx].mp);
             let parent_mp = std::mem::replace(&mut vm.mp, loaded_mp);
+            vm.caller_mp_stack.push((caller_virt_idx, parent_mp));
 
             let loaded_code_len = vm.loaded_modules[module_idx].module.code.len();
             vm.current_loaded_module = Some(module_idx);
@@ -197,6 +199,7 @@ pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 }
             }
 
+            let (_, parent_mp) = vm.caller_mp_stack.pop().unwrap_or_default();
             vm.loaded_modules[module_idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
             vm.current_loaded_module = saved_loaded_module;
             vm.halted = false;
@@ -266,6 +269,14 @@ fn read_addr_bytes(
                 buf[..copy_len].copy_from_slice(&vm.mp[off..off + copy_len]);
             }
         }
+        AddrTarget::ModuleMp { module_idx, offset } => {
+            if let Some(mp) = vm.module_mp(module_idx) {
+                if offset < mp.len() {
+                    let copy_len = size.min(mp.len() - offset);
+                    buf[..copy_len].copy_from_slice(&mp[offset..offset + copy_len]);
+                }
+            }
+        }
         AddrTarget::Immediate => match size {
             1 => buf[0] = imm as u8,
             8 => buf.copy_from_slice(&(imm as i64).to_ne_bytes()),
@@ -302,6 +313,15 @@ fn write_addr_bytes(
             if off < vm.mp.len() {
                 let copy_len = data.len().min(vm.mp.len() - off);
                 vm.mp[off..off + copy_len].copy_from_slice(&data[..copy_len]);
+            }
+            Ok(())
+        }
+        AddrTarget::ModuleMp { module_idx, offset } => {
+            if let Some(mp) = vm.module_mp_mut(module_idx) {
+                if offset < mp.len() {
+                    let copy_len = data.len().min(mp.len() - offset);
+                    mp[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
+                }
             }
             Ok(())
         }

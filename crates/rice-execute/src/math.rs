@@ -13,17 +13,19 @@ use crate::builtin::{BuiltinFunc, BuiltinModule};
 use crate::memory;
 use crate::vm::VmState;
 
-// Frame layout for most Math functions:
-//   Offset 0..8:  return value (real)
-//   Offset 8..16: temp registers
-//   Offset 16+:   arguments
+// Frame layout for Math built-in function calls:
+//   Offset 0..8:   return value (real)
+//   Offset 8..16:  additional return values or padding
+//   Offset 16..20: return address pointer (written by Lea)
+//   Offset 20..32: reserved/padding
+//   Offset 32+:    arguments
 //
-// Unary: arg at offset 16 (real, 8 bytes). Return at offset 0.
-// Binary: arg1 at offset 16, arg2 at offset 24. Return at offset 0.
+// Unary: arg at offset 32 (real, 8 bytes). Return at offset 0.
+// Binary: arg1 at offset 32, arg2 at offset 40. Return at offset 0.
 
 const RET_OFF: usize = 0;
-const ARG1_OFF: usize = 16;
-const ARG2_OFF: usize = 24;
+const ARG1_OFF: usize = 32;
+const ARG2_OFF: usize = 40;
 
 pub(crate) fn create_math_module() -> BuiltinModule {
     BuiltinModule {
@@ -387,9 +389,11 @@ fn bessel_j0(x: f64) -> f64 {
         let y = z * z;
         let xx = ax - 0.785398164;
         let p = 1.0
-            + y * (-0.1098628627e-2 + y * (0.2734510407e-4 + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
+            + y * (-0.1098628627e-2
+                + y * (0.2734510407e-4 + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
         let q = -0.1562499995e-1
-            + y * (0.1430488765e-3 + y * (-0.6911147651e-5 + y * (0.7621095161e-6 - y * 0.934935152e-7)));
+            + y * (0.1430488765e-3
+                + y * (-0.6911147651e-5 + y * (0.7621095161e-6 - y * 0.934935152e-7)));
         (0.636619772 / ax).sqrt() * (p * xx.cos() - z * q * xx.sin())
     }
 }
@@ -403,9 +407,11 @@ fn bessel_j1(x: f64) -> f64 {
     let ax = x.abs();
     if ax < 8.0 {
         let y = x * x;
-        let n = x * (72362614232.0
-            + y * (-7895059235.0
-                + y * (242396853.1 + y * (-2972611.439 + y * (15704.48260 + y * (-30.16036606))))));
+        let n = x
+            * (72362614232.0
+                + y * (-7895059235.0
+                    + y * (242396853.1
+                        + y * (-2972611.439 + y * (15704.48260 + y * (-30.16036606))))));
         let d = 144725228442.0
             + y * (2300535178.0
                 + y * (18583304.74 + y * (99447.43394 + y * (376.9991397 + y * 1.0))));
@@ -415,9 +421,11 @@ fn bessel_j1(x: f64) -> f64 {
         let y = z * z;
         let xx = ax - 2.356194491;
         let p = 1.0
-            + y * (0.183105e-2 + y * (-0.3516396496e-4 + y * (0.2457520174e-5 - y * 0.240337019e-6)));
+            + y * (0.183105e-2
+                + y * (-0.3516396496e-4 + y * (0.2457520174e-5 - y * 0.240337019e-6)));
         let q = 0.04687499995
-            + y * (-0.2002690873e-3 + y * (0.8449199096e-5 + y * (-0.88228987e-6 + y * 0.105787412e-6)));
+            + y * (-0.2002690873e-3
+                + y * (0.8449199096e-5 + y * (-0.88228987e-6 + y * 0.105787412e-6)));
         let ans = (0.636619772 / ax).sqrt() * (p * xx.cos() - z * q * xx.sin());
         if x < 0.0 { -ans } else { ans }
     }
@@ -466,9 +474,11 @@ fn bessel_y0(x: f64) -> f64 {
         let y = z * z;
         let xx = x - 0.785398164;
         let p = 1.0
-            + y * (-0.1098628627e-2 + y * (0.2734510407e-4 + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
+            + y * (-0.1098628627e-2
+                + y * (0.2734510407e-4 + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
         let q = -0.1562499995e-1
-            + y * (0.1430488765e-3 + y * (-0.6911147651e-5 + y * (0.7621095161e-6 - y * 0.934935152e-7)));
+            + y * (0.1430488765e-3
+                + y * (-0.6911147651e-5 + y * (0.7621095161e-6 - y * 0.934935152e-7)));
         (0.636619772 / x).sqrt() * (p * xx.sin() + z * q * xx.cos())
     }
 }
@@ -481,10 +491,11 @@ fn math_y0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn bessel_y1(x: f64) -> f64 {
     if x < 8.0 {
         let y = x * x;
-        let n = x * (-4900604943000.0
-            + y * (1275274390000.0
-                + y * (-51534866838.0
-                    + y * (622785432.7 + y * (-3130827.838 + y * (7.374510624e3))))));
+        let n = x
+            * (-4900604943000.0
+                + y * (1275274390000.0
+                    + y * (-51534866838.0
+                        + y * (622785432.7 + y * (-3130827.838 + y * (7.374510624e3))))));
         let d = 24995805700000.0
             + y * (424441966400.0
                 + y * (3733650367.0
@@ -495,9 +506,11 @@ fn bessel_y1(x: f64) -> f64 {
         let y = z * z;
         let xx = x - 2.356194491;
         let p = 1.0
-            + y * (0.183105e-2 + y * (-0.3516396496e-4 + y * (0.2457520174e-5 - y * 0.240337019e-6)));
+            + y * (0.183105e-2
+                + y * (-0.3516396496e-4 + y * (0.2457520174e-5 - y * 0.240337019e-6)));
         let q = 0.04687499995
-            + y * (-0.2002690873e-3 + y * (0.8449199096e-5 + y * (-0.88228987e-6 + y * 0.105787412e-6)));
+            + y * (-0.2002690873e-3
+                + y * (0.8449199096e-5 + y * (-0.88228987e-6 + y * 0.105787412e-6)));
         (0.636619772 / x).sqrt() * (p * xx.sin() + z * q * xx.cos())
     }
 }
@@ -532,14 +545,14 @@ fn math_yn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn lgamma_approx(x: f64) -> f64 {
     let g = 7.0;
     let c = [
-        0.99999999999980993,
+        0.999_999_999_999_809_9,
         676.5203681218851,
         -1259.1392167224028,
-        771.32342877765313,
-        -176.61502916214059,
+        771.323_428_777_653_1,
+        -176.615_029_162_140_6,
         12.507343278686905,
         -0.13857109526572012,
-        9.9843695780195716e-6,
+        9.984_369_578_019_572e-6,
         1.5056327351493116e-7,
     ];
     if x < 0.5 {
@@ -591,31 +604,49 @@ fn math_nextafter(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
+fn read_real_array(vm: &VmState<'_>, arr_id: u32, n: usize) -> Vec<f64> {
+    let data = vm.heap.array_read(arr_id, 0, n * 8).unwrap_or_default();
+    (0..n.min(data.len() / 8))
+        .map(|i| memory::read_real(&data, i * 8))
+        .collect()
+}
+
 fn math_dot(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
-    let _n = memory::read_word(&vm.frames.data, base + ARG1_OFF);
-    // Dot product would need array pointers; simplified stub returns 0.0
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, 0.0);
+    let n = memory::read_word(&vm.frames.data, base + ARG1_OFF) as usize;
+    let x_id = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as u32;
+    let y_id = memory::read_word(&vm.frames.data, base + ARG1_OFF + 8) as u32;
+    let x = read_real_array(vm, x_id, n);
+    let y = read_real_array(vm, y_id, n);
+    let result: f64 = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
+    memory::write_real(&mut vm.frames.data, base + RET_OFF, result);
     Ok(())
 }
 
 fn math_norm1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
-    // L1 norm needs array access; stub returns 0.0
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, 0.0);
+    let x_id = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u32;
+    let n = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as usize;
+    let x = read_real_array(vm, x_id, n);
+    let result: f64 = x.iter().map(|v| v.abs()).sum();
+    memory::write_real(&mut vm.frames.data, base + RET_OFF, result);
     Ok(())
 }
 
 fn math_norm2(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, 0.0);
+    let x_id = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u32;
+    let n = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as usize;
+    let x = read_real_array(vm, x_id, n);
+    let result: f64 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+    memory::write_real(&mut vm.frames.data, base + RET_OFF, result);
     Ok(())
 }
 
 fn math_sort(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let arr_id = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u32;
-    let count = memory::read_word(&vm.frames.data, base + 20) as usize;
+    let count = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as usize;
     if let Some(obj) = vm.heap.get_mut(arr_id)
         && let crate::heap::HeapData::Array {
             data, elem_size, ..
@@ -634,8 +665,16 @@ fn math_sort(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn math_iamax(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
-    // Returns index of max abs value; stub returns 0
-    memory::write_word(&mut vm.frames.data, base, 0);
+    let x_id = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u32;
+    let n = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as usize;
+    let x = read_real_array(vm, x_id, n);
+    let result = x
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i as i32)
+        .unwrap_or(0);
+    memory::write_word(&mut vm.frames.data, base, result);
     Ok(())
 }
 
@@ -651,7 +690,7 @@ fn math_gemm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn math_export_int(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let val = memory::read_word(&vm.frames.data, base + ARG1_OFF);
-    let buf_id = memory::read_word(&vm.frames.data, base + 20) as u32;
+    let buf_id = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as u32;
     if let Some(obj) = vm.heap.get_mut(buf_id)
         && let crate::heap::HeapData::Array { data, .. } = &mut obj.data
         && data.len() >= 4
@@ -679,7 +718,7 @@ fn math_export_real(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn math_export_real32(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let val = memory::read_real(&vm.frames.data, base + ARG1_OFF) as f32;
-    let buf_id = memory::read_word(&vm.frames.data, base + 20) as u32;
+    let buf_id = memory::read_word(&vm.frames.data, base + ARG2_OFF) as u32; // arg1 is real (8 bytes), so arg2 at ARG2_OFF
     if let Some(obj) = vm.heap.get_mut(buf_id)
         && let crate::heap::HeapData::Array { data, .. } = &mut obj.data
         && data.len() >= 4
@@ -707,7 +746,9 @@ fn math_import_int(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn math_import_real(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
+    // Frame layout: buf at offset 32, ret destination array at offset 36
     let buf_id = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u32;
+    let ret_ref = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as u32;
     let val = if let Some(obj) = vm.heap.get(buf_id)
         && let crate::heap::HeapData::Array { data, .. } = &obj.data
         && data.len() >= 8
@@ -718,6 +759,14 @@ fn math_import_real(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     } else {
         0.0
     };
+    // Write result to the caller's storage via ret pointer (heap array ref)
+    if let Some(obj) = vm.heap.get_mut(ret_ref)
+        && let crate::heap::HeapData::Array { data, .. } = &mut obj.data
+        && data.len() >= 8
+    {
+        memory::write_real(data, 0, val);
+    }
+    // Also write at frame offset 0 for the standard return mechanism
     memory::write_real(&mut vm.frames.data, base + RET_OFF, val);
     Ok(())
 }

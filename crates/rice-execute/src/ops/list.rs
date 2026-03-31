@@ -19,6 +19,13 @@ fn cons_bytes(vm: &mut VmState<'_>, size: usize) -> Result<(), ExecError> {
         crate::address::AddrTarget::Mp(off) => {
             head.copy_from_slice(&vm.mp[off..off + size]);
         }
+        crate::address::AddrTarget::ModuleMp { module_idx, offset } => {
+            if let Some(mp) = vm.module_mp(module_idx) {
+                if offset + size <= mp.len() {
+                    head.copy_from_slice(&mp[offset..offset + size]);
+                }
+            }
+        }
         crate::address::AddrTarget::Immediate => {
             // For immediate, store the word value
             let val = vm.imm_src;
@@ -198,6 +205,14 @@ pub(crate) fn op_headm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             let end = off + head.len();
             if end <= vm.mp.len() {
                 vm.mp[off..end].copy_from_slice(&head);
+            }
+        }
+        crate::address::AddrTarget::ModuleMp { module_idx, offset } => {
+            if let Some(mp) = vm.module_mp_mut(module_idx) {
+                let end = offset + head.len();
+                if end <= mp.len() {
+                    mp[offset..end].copy_from_slice(&head);
+                }
             }
         }
         _ => {}

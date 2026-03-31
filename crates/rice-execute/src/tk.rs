@@ -45,7 +45,7 @@ fn bf(
 
 fn tk_getimage(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let toplevel_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let toplevel_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
     // Return the toplevel's image (offset 8 in Toplevel record)
     let img = if let Some(obj) = vm.heap.get(toplevel_id) {
         if let HeapData::Record(data) = &obj.data {
@@ -85,8 +85,8 @@ fn tk_rect(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// Returns a ref Toplevel (heap record with display, image, etc.)
 fn tk_toplevel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let _display_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let arg_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
+    let _display_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
+    let arg_id = memory::read_word(&vm.frames.data, frame_base + 36) as HeapId;
     let _arg = vm.heap.get_string(arg_id).unwrap_or("").to_string();
 
     tracing::trace!(arg = _arg, "Tk.toplevel");
@@ -121,7 +121,7 @@ fn tk_toplevel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     // Write result at frame offset 0 (standard return location)
     memory::write_word(&mut vm.frames.data, frame_base, tl_id as i32);
     // Write at the return pointer location (offset 16 holds the caller's return address)
-    let ret_addr = memory::read_word(&vm.frames.data, frame_base + 16);
+    let ret_addr = memory::read_word(&vm.frames.data, frame_base + 32);
     tracing::trace!(
         tl_id = tl_id,
         frame_base = frame_base,
@@ -139,8 +139,8 @@ fn tk_toplevel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// Returns a result string (empty on success, error message on failure).
 fn tk_cmd(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let _toplevel_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let cmd_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
+    let _toplevel_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
+    let cmd_id = memory::read_word(&vm.frames.data, frame_base + 36) as HeapId;
     let cmd = vm.heap.get_string(cmd_id).unwrap_or("").to_string();
 
     tracing::debug!(cmd = cmd, "Tk.cmd");
@@ -160,9 +160,9 @@ fn tk_cmd(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// Tk->namechan: register a named channel for Tk events.
 fn tk_namechan(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let _toplevel_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let _chan_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
-    let name_id = memory::read_word(&vm.frames.data, frame_base + 24) as HeapId;
+    let _toplevel_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
+    let _chan_id = memory::read_word(&vm.frames.data, frame_base + 36) as HeapId;
+    let name_id = memory::read_word(&vm.frames.data, frame_base + 40) as HeapId;
     let _name = vm.heap.get_string(name_id).unwrap_or("").to_string();
 
     tracing::debug!(name = _name, "Tk.namechan");
@@ -194,7 +194,7 @@ fn tk_keyboard(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// Tk->quote: quote a string for Tk.
 fn tk_quote(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let str_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let str_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
     let s = vm.heap.get_string(str_id).unwrap_or("").to_string();
     let quoted = format!("{{{s}}}");
     let result_id = vm.heap.alloc(0, HeapData::Str(quoted));
@@ -205,7 +205,7 @@ fn tk_quote(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// Tk->color: convert a color name to an integer.
 fn tk_color(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let str_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let str_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
     let s = vm.heap.get_string(str_id).unwrap_or("").to_string();
 
     let color = match s.as_str() {
@@ -311,7 +311,14 @@ pub(crate) mod widgets {
         }
 
         pub fn layout(&mut self, width: i32, height: i32) {
-            layout_children(&self.root_children.clone(), &mut self.widgets, 0, 0, width, height);
+            layout_children(
+                &self.root_children.clone(),
+                &mut self.widgets,
+                0,
+                0,
+                width,
+                height,
+            );
             self.needs_layout = false;
         }
     }
@@ -416,12 +423,9 @@ fn process_tk_cmd(vm: &mut VmState<'_>, cmd: &str) {
                         for w in tree.widgets.values() {
                             let bg = inferno_to_sdl_color(w.bg_color);
                             state.canvas.set_draw_color(bg);
-                            let _ = state.canvas.fill_rect(SdlRect::new(
-                                w.x,
-                                w.y,
-                                w.w as u32,
-                                w.h as u32,
-                            ));
+                            let _ = state
+                                .canvas
+                                .fill_rect(SdlRect::new(w.x, w.y, w.w as u32, w.h as u32));
                             // Draw text for labels and buttons
                             match &w.kind {
                                 widgets::WidgetKind::Label { text }
@@ -432,19 +436,14 @@ fn process_tk_cmd(vm: &mut VmState<'_>, cmd: &str) {
                                     for (i, _ch) in text.chars().enumerate() {
                                         let cx = w.x + 4 + (i as i32) * 8;
                                         let cy = w.y + 4;
-                                        let _ = state
-                                            .canvas
-                                            .fill_rect(SdlRect::new(cx, cy, 6, 12));
+                                        let _ = state.canvas.fill_rect(SdlRect::new(cx, cy, 6, 12));
                                     }
                                 }
                                 widgets::WidgetKind::Button { .. } => {
                                     state.canvas.set_draw_color(Color::BLACK);
-                                    let _ = state.canvas.draw_rect(SdlRect::new(
-                                        w.x,
-                                        w.y,
-                                        w.w as u32,
-                                        w.h as u32,
-                                    ));
+                                    let _ = state
+                                        .canvas
+                                        .draw_rect(SdlRect::new(w.x, w.y, w.w as u32, w.h as u32));
                                 }
                                 _ => {}
                             }
@@ -484,10 +483,10 @@ fn process_tk_cmd(vm: &mut VmState<'_>, cmd: &str) {
                 WIDGET_TREE.with(|tree| {
                     let mut tree = tree.borrow_mut();
                     tree.add_widget(name.to_string(), kind);
-                    if let Some(color) = bg {
-                        if let Some(w) = tree.widgets.get_mut(*name) {
-                            w.bg_color = color;
-                        }
+                    if let Some(color) = bg
+                        && let Some(w) = tree.widgets.get_mut(*name)
+                    {
+                        w.bg_color = color;
                     }
                 });
             }
@@ -527,7 +526,13 @@ fn parse_pack_side(parts: &[&str]) -> widgets::PackSide {
 fn extract_option(parts: &[&str], opt: &str) -> Option<String> {
     for i in 0..parts.len().saturating_sub(1) {
         if parts[i] == opt {
-            return Some(parts[i + 1].trim_matches('"').trim_matches('{').trim_matches('}').to_string());
+            return Some(
+                parts[i + 1]
+                    .trim_matches('"')
+                    .trim_matches('{')
+                    .trim_matches('}')
+                    .to_string(),
+            );
         }
     }
     None

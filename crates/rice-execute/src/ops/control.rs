@@ -113,9 +113,15 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 .iter()
                 .map(|imp| {
                     let sig = imp.signature as u32;
-                    vm.modules
-                        .get_module(module_id)
-                        .and_then(|m| m.funcs.iter().position(|f| f.sig == sig))
+                    let name = &imp.name;
+                    vm.modules.get_module(module_id).and_then(|m| {
+                        // Prefer name match (avoids collisions like read/write
+                        // sharing the same signature hash).
+                        m.funcs
+                            .iter()
+                            .position(|f| f.name == name)
+                            .or_else(|| m.funcs.iter().position(|f| f.sig == sig))
+                    })
                 })
                 .collect()
         } else {
@@ -181,21 +187,30 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             && let Ok(module) = ricevm_loader::load(&bytes)
         {
             tracing::trace!(name = %module.name, path = %candidate, "Loaded module from file");
-            let mp =
-                crate::data::init_mp(module.header.data_size as usize, &module.data, &mut vm.heap);
+            let mp = crate::data::init_mp_with_types(
+                module.header.data_size as usize,
+                &module.data,
+                &mut vm.heap,
+                &module.types,
+            );
 
-            // Build func_map: match caller's import function signatures
-            // against the loaded module's export signatures.
+            // Build func_map: match caller's import functions against the
+            // loaded module's exports. Prefer name matching to avoid
+            // collisions (e.g. splitl/splitr sharing the same signature).
             let func_map = if let Some(imp_mod) = imports.as_ref() {
                 imp_mod
                     .functions
                     .iter()
                     .map(|imp| {
                         let sig = imp.signature as u32;
+                        let name = &imp.name;
                         module
                             .exports
                             .iter()
-                            .position(|e| e.signature as u32 == sig)
+                            .position(|e| e.name == *name)
+                            .or_else(|| {
+                                module.exports.iter().position(|e| e.signature as u32 == sig)
+                            })
                     })
                     .collect()
             } else {
@@ -369,6 +384,14 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     ))
                 })?;
             handler(vm)?;
+            // Copy return value from callee frame to caller via return pointer.
+            let data_off = vm.frames.current_data_offset();
+            let ret_ptr = crate::memory::read_word(&vm.frames.data, data_off + 16);
+            if ret_ptr != 0 {
+                let target = crate::address::decode_virtual_addr(ret_ptr, 0);
+                let ret_val = crate::memory::read_word(&vm.frames.data, data_off);
+                vm.write_word_at(target, ret_val)?;
+            }
             // Auto-return from built-in call
             let prev_pc = vm.frames.pop()?;
             if prev_pc >= 0 {
@@ -450,8 +473,12 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             // Swap MP with the loaded module's persistent MP.
             // This ensures module refs stored during execution persist
             // in the loaded module's MP for subsequent calls.
+            let caller_virt_idx = vm.current_module_virt_idx();
             let loaded_mp = std::mem::take(&mut vm.loaded_modules[module_idx].mp);
             let parent_mp = std::mem::replace(&mut vm.mp, loaded_mp);
+            // Push the caller's MP onto the stack so cross-module virtual
+            // addresses can resolve to it during execution.
+            vm.caller_mp_stack.push((caller_virt_idx, parent_mp));
 
             let loaded_code_len = vm.loaded_modules[module_idx].module.code.len();
             vm.current_loaded_module = Some(module_idx);
@@ -482,7 +509,8 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             }
 
             // Write back the loaded module's MP (preserving any changes),
-            // then restore the parent's MP.
+            // then restore the parent's MP from the stack.
+            let (_, parent_mp) = vm.caller_mp_stack.pop().unwrap_or_default();
             vm.loaded_modules[module_idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
             vm.pc = saved_pc;
             vm.next_pc = saved_next_pc;
@@ -540,18 +568,28 @@ pub(crate) fn op_casew(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         }
     };
 
-    // Default PC is after all entries
-    let default_pc = read_table(vm, 1 + count as usize * 3)?;
+    // Binary search matching the reference Dis VM implementation.
+    // Table layout: [count, (lo, hi, pc)..., default_pc]
+    // Match condition: lo <= value < hi
+    let n = count as usize;
+    let default_pc = read_table(vm, 1 + n * 3)?;
     let mut target_pc = default_pc;
 
-    // Search entries
-    for i in 0..count as usize {
-        let base = 1 + i * 3;
-        let lo = read_table(vm, base)?;
-        let hi = read_table(vm, base + 1)?;
-        let pc = read_table(vm, base + 2)?;
-        if lo <= value && value < hi {
-            target_pc = pc;
+    // t points to index 1 (first entry after count)
+    let mut t_off = 1usize;
+    let mut remaining = n;
+    while remaining > 0 {
+        let n2 = remaining >> 1;
+        let l_off = t_off + n2 * 3;
+        let lo = read_table(vm, l_off)?;
+        let hi = read_table(vm, l_off + 1)?;
+        if value < lo {
+            remaining = n2;
+        } else if value >= hi {
+            t_off = l_off + 3;
+            remaining -= n2 + 1;
+        } else {
+            target_pc = read_table(vm, l_off + 2)?;
             break;
         }
     }
@@ -563,7 +601,7 @@ pub(crate) fn op_casew(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// casec src, dst — string case dispatch.
 ///
 /// Same table format as casew, but lo/hi are string pointer HeapIds.
-/// Matches if value == lo, or (value > lo && value == hi).
+/// Binary search with string comparison matching the reference Dis VM.
 pub(crate) fn op_casec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let value_id = vm.src_ptr()?;
     let value_str = vm.heap.get_string(value_id).unwrap_or("").to_string();
@@ -583,29 +621,41 @@ pub(crate) fn op_casec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         }
     };
 
-    let default_pc = read_table(vm, 1 + count as usize * 3)?;
+    let n = count as usize;
+    let default_pc = read_table(vm, 1 + n * 3)?;
     let mut target_pc = default_pc;
 
-    for i in 0..count as usize {
-        let base = 1 + i * 3;
-        let lo_id = read_table(vm, base)? as heap::HeapId;
-        let hi_id = read_table(vm, base + 1)? as heap::HeapId;
-        let pc = read_table(vm, base + 2)?;
-
+    // Binary search matching reference Dis VM casec implementation.
+    let mut t_off = 1usize;
+    let mut remaining = n;
+    while remaining > 0 {
+        let n2 = remaining >> 1;
+        let l_off = t_off + n2 * 3;
+        let lo_id = read_table(vm, l_off)? as heap::HeapId;
         let lo_str = vm.heap.get_string(lo_id).unwrap_or("");
         let cmp = value_str.as_str().cmp(lo_str);
 
         if cmp == std::cmp::Ordering::Equal {
-            target_pc = pc;
+            target_pc = read_table(vm, l_off + 2)?;
             break;
         }
-        if cmp == std::cmp::Ordering::Greater {
-            let hi_str = vm.heap.get_string(hi_id).unwrap_or("");
-            if !hi_str.is_empty() && value_str.as_str() == hi_str {
-                target_pc = pc;
-                break;
-            }
+        if cmp == std::cmp::Ordering::Less {
+            remaining = n2;
+            continue;
         }
+        // value > lo: check hi
+        let hi_id = read_table(vm, l_off + 1)? as heap::HeapId;
+        if hi_id == heap::NIL
+            || value_str.as_str().cmp(vm.heap.get_string(hi_id).unwrap_or(""))
+                == std::cmp::Ordering::Greater
+        {
+            t_off = l_off + 3;
+            remaining -= n2 + 1;
+            continue;
+        }
+        // lo < value <= hi: match
+        target_pc = read_table(vm, l_off + 2)?;
+        break;
     }
 
     vm.next_pc = target_pc as usize;
@@ -645,19 +695,27 @@ pub(crate) fn op_casel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         }
     };
 
-    // Layout: count(4 bytes), then N * (lo_big(8) + hi_big(8) + pc(4)) = 20 bytes per entry, then default_pc(4)
-    let entry_size = 20; // 8 + 8 + 4
-    let default_off = 4 + count as usize * entry_size;
+    // Layout: count(4), then N * (lo_big(8) + hi_big(8) + pc(4)) = 20 per entry, then default_pc(4)
+    let entry_size = 20;
+    let n = count as usize;
+    let default_off = 4 + n * entry_size;
     let default_pc = read_word(vm, default_off)?;
     let mut target_pc = default_pc;
 
-    for i in 0..count as usize {
-        let base = 4 + i * entry_size;
-        let lo = read_big(vm, base)?;
-        let hi = read_big(vm, base + 8)?;
-        let pc = read_word(vm, base + 16)?;
-        if lo <= value && value < hi {
-            target_pc = pc;
+    let mut t_off = 4usize;
+    let mut remaining = n;
+    while remaining > 0 {
+        let n2 = remaining >> 1;
+        let l_off = t_off + n2 * entry_size;
+        let lo = read_big(vm, l_off)?;
+        let hi = read_big(vm, l_off + 8)?;
+        if value < lo {
+            remaining = n2;
+        } else if value >= hi {
+            t_off = l_off + entry_size;
+            remaining -= n2 + 1;
+        } else {
+            target_pc = read_word(vm, l_off + 16)?;
             break;
         }
     }

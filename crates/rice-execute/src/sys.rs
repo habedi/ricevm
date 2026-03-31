@@ -14,11 +14,21 @@ use crate::heap::{self, HeapData, HeapId};
 use crate::memory;
 use crate::vm::VmState;
 
-// Common frame layout offsets for Sys functions.
-// Most Sys functions have:
+// Frame layout for Sys built-in function calls:
 //   Offset 0..4:   return value (word or pointer)
-//   Offset 4..16:  temp registers (3 words)
-//   Offset 16+:    arguments
+//   Offset 4..16:  additional return values or padding
+//   Offset 16..20: return address pointer (written by Lea instruction)
+//   Offset 20..32: reserved/padding
+//   Offset 32+:    arguments
+const ARG_START: usize = 32;
+
+fn read_ptr(data: &[u8], offset: usize) -> HeapId {
+    memory::read_word(data, offset) as HeapId
+}
+
+fn write_ptr(data: &mut [u8], offset: usize, id: HeapId) {
+    memory::write_word(data, offset, id as i32);
+}
 
 /// Format a printf-style string with arguments from the frame.
 fn format_string(
@@ -27,7 +37,7 @@ fn format_string(
     fmt_offset: usize,
     args_offset: usize,
 ) -> String {
-    let fmt_id = memory::read_word(&vm.frames.data, frame_base + fmt_offset) as HeapId;
+    let fmt_id = read_ptr(&vm.frames.data, frame_base + fmt_offset);
     let fmt_str = match vm.heap.get_string(fmt_id) {
         Some(s) => s.to_string(),
         None => return String::new(),
@@ -42,51 +52,172 @@ fn format_string(
             output.push(ch);
             continue;
         }
+
+        // Parse optional flags: '-', '0', '+', ' '
+        let mut left_align = false;
+        let mut zero_pad = false;
+        let mut plus_sign = false;
+        let mut space_sign = false;
+        while let Some(&fc) = chars.peek() {
+            match fc {
+                '-' => { left_align = true; chars.next(); }
+                '0' => { zero_pad = true; chars.next(); }
+                '+' => { plus_sign = true; chars.next(); }
+                ' ' => { space_sign = true; chars.next(); }
+                _ => break,
+            }
+        }
+
+        // Parse optional width
+        let mut width: Option<usize> = None;
+        while let Some(&wc) = chars.peek() {
+            if wc.is_ascii_digit() {
+                chars.next();
+                let w = width.unwrap_or(0);
+                width = Some(w * 10 + (wc as usize - '0' as usize));
+            } else {
+                break;
+            }
+        }
+
+        // Parse optional precision: '.' followed by digits
+        let mut precision: Option<usize> = None;
+        if chars.peek() == Some(&'.') {
+            chars.next();
+            let mut p: usize = 0;
+            while let Some(&pc) = chars.peek() {
+                if pc.is_ascii_digit() {
+                    chars.next();
+                    p = p * 10 + (pc as usize - '0' as usize);
+                } else {
+                    break;
+                }
+            }
+            precision = Some(p);
+        }
+
+        // Helper: apply width/alignment to an already-formatted string
+        let apply_width = |s: String| -> String {
+            let w = width.unwrap_or(0);
+            if w == 0 || s.len() >= w {
+                return s;
+            }
+            if left_align {
+                format!("{:<width$}", s, width = w)
+            } else if zero_pad {
+                // For zero-padding, handle negative numbers specially
+                if s.starts_with('-') {
+                    let digits = &s[1..];
+                    format!("-{:0>width$}", digits, width = w - 1)
+                } else {
+                    format!("{:0>width$}", s, width = w)
+                }
+            } else {
+                format!("{:>width$}", s, width = w)
+            }
+        };
+
         match chars.next() {
             Some('%') => output.push('%'),
             Some('s') => {
-                let str_id = memory::read_word(&vm.frames.data, arg_offset) as HeapId;
-                if let Some(s) = vm.heap.get_string(str_id) {
-                    output.push_str(s);
+                let str_id = read_ptr(&vm.frames.data, arg_offset);
+                let s = if let Some(s) = vm.heap.get_string(str_id) {
+                    s.to_string()
                 } else {
-                    output.push_str("<nil>");
-                }
+                    "<nil>".to_string()
+                };
+                let s = if let Some(prec) = precision {
+                    if prec < s.len() { s[..prec].to_string() } else { s }
+                } else {
+                    s
+                };
+                output.push_str(&apply_width(s));
                 arg_offset += 4;
             }
             Some('d') => {
                 let val = memory::read_word(&vm.frames.data, arg_offset);
-                output.push_str(&val.to_string());
+                let s = if let Some(prec) = precision {
+                    // Precision for integers means minimum digits
+                    let abs_s = format!("{}", val.unsigned_abs());
+                    let padded = format!("{:0>width$}", abs_s, width = prec);
+                    if val < 0 { format!("-{padded}") } else { padded }
+                } else {
+                    val.to_string()
+                };
+                let s = if plus_sign && !s.starts_with('-') {
+                    format!("+{s}")
+                } else if space_sign && !s.starts_with('-') {
+                    format!(" {s}")
+                } else {
+                    s
+                };
+                output.push_str(&apply_width(s));
                 arg_offset += 4;
             }
-            Some('g' | 'f' | 'e') => {
+            Some(fc @ ('g' | 'f' | 'e')) => {
                 let val = memory::read_real(&vm.frames.data, arg_offset);
-                output.push_str(&val.to_string());
+                let s = match (fc, precision) {
+                    ('f', Some(p)) => format!("{val:.prec$}", prec = p),
+                    ('f', None) => format!("{val:.6}"),
+                    ('e', Some(p)) => format!("{val:.prec$e}", prec = p),
+                    ('e', None) => format!("{val:e}"),
+                    (_, Some(p)) => format!("{val:.prec$}", prec = p),
+                    _ => val.to_string(),
+                };
+                let s = if plus_sign && !s.starts_with('-') {
+                    format!("+{s}")
+                } else if space_sign && !s.starts_with('-') {
+                    format!(" {s}")
+                } else {
+                    s
+                };
+                output.push_str(&apply_width(s));
                 arg_offset += 8;
             }
             Some('c') => {
                 let val = memory::read_word(&vm.frames.data, arg_offset) as u32;
                 if let Some(c) = char::from_u32(val) {
-                    output.push(c);
+                    let s = c.to_string();
+                    output.push_str(&apply_width(s));
                 }
                 arg_offset += 4;
             }
             Some('x') => {
                 let val = memory::read_word(&vm.frames.data, arg_offset);
-                output.push_str(&format!("{val:x}"));
+                let s = if let Some(prec) = precision {
+                    format!("{:0>width$x}", val, width = prec)
+                } else {
+                    format!("{val:x}")
+                };
+                output.push_str(&apply_width(s));
                 arg_offset += 4;
             }
             Some('X') => {
                 let val = memory::read_word(&vm.frames.data, arg_offset);
-                output.push_str(&format!("{val:X}"));
+                let s = if let Some(prec) = precision {
+                    format!("{:0>width$X}", val, width = prec)
+                } else {
+                    format!("{val:X}")
+                };
+                output.push_str(&apply_width(s));
                 arg_offset += 4;
             }
             Some('o') => {
                 let val = memory::read_word(&vm.frames.data, arg_offset);
-                output.push_str(&format!("{val:o}"));
+                let s = if let Some(prec) = precision {
+                    format!("{:0>width$o}", val, width = prec)
+                } else {
+                    format!("{val:o}")
+                };
+                output.push_str(&apply_width(s));
                 arg_offset += 4;
             }
             Some('r') => {
-                output.push_str("(no error)");
+                if vm.last_error.is_empty() {
+                    output.push_str("(no error)");
+                } else {
+                    output.push_str(&vm.last_error);
+                }
             }
             Some(other) => {
                 output.push('%');
@@ -179,7 +310,7 @@ fn sys_stub(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_print(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let output = format_string(vm, frame_base, 16, 20);
+    let output = format_string(vm, frame_base, ARG_START, ARG_START + 4);
     let len = output.len() as i32;
     print!("{output}");
     memory::write_word(&mut vm.frames.data, frame_base, len);
@@ -188,10 +319,10 @@ fn sys_print(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_fprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let fd_num = get_fd_num(vm, fd_id);
     let fd_num = if fd_num < 0 { 1 } else { fd_num }; // default to stdout
-    let output = format_string(vm, frame_base, 20, 24);
+    let output = format_string(vm, frame_base, ARG_START + 4, ARG_START + 8);
     let len = output.len() as i32;
     let _ = vm.files.write(fd_num, output.as_bytes());
     memory::write_word(&mut vm.frames.data, frame_base, len);
@@ -200,16 +331,16 @@ fn sys_fprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_sprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let output = format_string(vm, frame_base, 16, 20);
+    let output = format_string(vm, frame_base, ARG_START, ARG_START + 4);
     let str_id = vm.heap.alloc(0, HeapData::Str(output));
     // Return string pointer at frame offset 0
-    memory::write_word(&mut vm.frames.data, frame_base, str_id as i32);
+    write_ptr(&mut vm.frames.data, frame_base, str_id);
     Ok(())
 }
 
 fn sys_aprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let output = format_string(vm, frame_base, 16, 20);
+    let output = format_string(vm, frame_base, ARG_START, ARG_START + 4);
     let bytes = output.into_bytes();
     let length = bytes.len();
     let arr_id = vm.heap.alloc(
@@ -221,7 +352,7 @@ fn sys_aprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             length,
         },
     );
-    memory::write_word(&mut vm.frames.data, frame_base, arr_id as i32);
+    write_ptr(&mut vm.frames.data, frame_base, arr_id);
     Ok(())
 }
 
@@ -229,19 +360,19 @@ fn sys_aprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_open(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let path_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let mode = memory::read_word(&vm.frames.data, frame_base + 20);
+    let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let mode = memory::read_word(&vm.frames.data, frame_base + ARG_START + 4);
 
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
-
     match vm.files.open(&path, mode) {
         Ok(fd) => {
             let mut fd_data = vec![0u8; 4];
             memory::write_word(&mut fd_data, 0, fd);
             let fd_id = vm.heap.alloc(0, HeapData::Record(fd_data));
-            memory::write_word(&mut vm.frames.data, frame_base, fd_id as i32);
+            write_ptr(&mut vm.frames.data, frame_base, fd_id);
         }
-        Err(_) => {
+        Err(e) => {
+            vm.last_error = format!("{e}");
             memory::write_word(&mut vm.frames.data, frame_base, 0);
         }
     }
@@ -250,18 +381,18 @@ fn sys_open(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_create(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let path_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
 
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
-
     match vm.files.create(&path) {
         Ok(fd) => {
             let mut fd_data = vec![0u8; 4];
             memory::write_word(&mut fd_data, 0, fd);
             let fd_id = vm.heap.alloc(0, HeapData::Record(fd_data));
-            memory::write_word(&mut vm.frames.data, frame_base, fd_id as i32);
+            write_ptr(&mut vm.frames.data, frame_base, fd_id);
         }
-        Err(_) => {
+        Err(e) => {
+            vm.last_error = format!("{e}");
             memory::write_word(&mut vm.frames.data, frame_base, 0);
         }
     }
@@ -270,20 +401,22 @@ fn sys_create(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_read(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let buf_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
-    let count = memory::read_word(&vm.frames.data, frame_base + 24) as usize;
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
+    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
 
     let fd_num = get_fd_num(vm, fd_id);
     let mut tmp = vec![0u8; count];
-    let n = vm.files.read(fd_num, &mut tmp).unwrap_or(-1_i32 as usize) as i32;
+    let n = match vm.files.read(fd_num, &mut tmp) {
+        Ok(n) => n as i32,
+        Err(e) => {
+            vm.last_error = format!("{e}");
+            -1
+        }
+    };
 
-    if n > 0
-        && let Some(obj) = vm.heap.get_mut(buf_id)
-        && let HeapData::Array { data, .. } = &mut obj.data
-    {
-        let copy_len = (n as usize).min(data.len());
-        data[..copy_len].copy_from_slice(&tmp[..copy_len]);
+    if n > 0 {
+        vm.heap.array_write(buf_id, 0, &tmp[..(n as usize)]);
     }
 
     memory::write_word(&mut vm.frames.data, frame_base, n);
@@ -292,30 +425,33 @@ fn sys_read(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_write(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let buf_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
-    let count = memory::read_word(&vm.frames.data, frame_base + 24) as usize;
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
+    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
 
     let fd_num = get_fd_num(vm, fd_id);
-    let bytes: Vec<u8> = match vm.heap.get(buf_id) {
-        Some(obj) => match &obj.data {
-            HeapData::Array { data, .. } => data[..count.min(data.len())].to_vec(),
-            _ => Vec::new(),
-        },
-        None => Vec::new(),
-    };
+    let bytes: Vec<u8> = vm
+        .heap
+        .array_read(buf_id, 0, count)
+        .unwrap_or_default();
 
-    let n = vm.files.write(fd_num, &bytes).unwrap_or(0) as i32;
+    let n = match vm.files.write(fd_num, &bytes) {
+        Ok(n) => n as i32,
+        Err(e) => {
+            vm.last_error = format!("{e}");
+            0
+        }
+    };
     memory::write_word(&mut vm.frames.data, frame_base, n);
     Ok(())
 }
 
 fn sys_pread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let buf_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
-    let count = memory::read_word(&vm.frames.data, frame_base + 24) as usize;
-    let offset = memory::read_big(&vm.frames.data, frame_base + 28);
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
+    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
+    let offset = memory::read_big(&vm.frames.data, frame_base + ARG_START + 12);
     let fd_num = get_fd_num(vm, fd_id);
 
     let original_pos = match vm.files.seek(fd_num, 0, 1) {
@@ -349,10 +485,10 @@ fn sys_pread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_pwrite(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let buf_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
-    let count = memory::read_word(&vm.frames.data, frame_base + 24) as usize;
-    let offset = memory::read_big(&vm.frames.data, frame_base + 28);
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
+    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
+    let offset = memory::read_big(&vm.frames.data, frame_base + ARG_START + 12);
     let fd_num = get_fd_num(vm, fd_id);
 
     let original_pos = match vm.files.seek(fd_num, 0, 1) {
@@ -384,12 +520,12 @@ fn sys_pwrite(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_fildes(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_num = memory::read_word(&vm.frames.data, frame_base + 16);
+    let fd_num = memory::read_word(&vm.frames.data, frame_base + ARG_START);
     if vm.files.fildes(fd_num) {
         let mut fd_data = vec![0u8; 4];
         memory::write_word(&mut fd_data, 0, fd_num);
         let fd_id = vm.heap.alloc(0, HeapData::Record(fd_data));
-        memory::write_word(&mut vm.frames.data, frame_base, fd_id as i32);
+        write_ptr(&mut vm.frames.data, frame_base, fd_id);
     } else {
         memory::write_word(&mut vm.frames.data, frame_base, 0);
     }
@@ -398,19 +534,19 @@ fn sys_fildes(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_fd2path(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let fd_num = get_fd_num(vm, fd_id);
     // Portable: return a placeholder since we can't resolve fd→path without OS-specific APIs
     let result = format!("/fd/{fd_num}");
     let str_id = vm.heap.alloc(0, HeapData::Str(result));
-    memory::write_word(&mut vm.frames.data, frame_base, str_id as i32);
+    write_ptr(&mut vm.frames.data, frame_base, str_id);
     Ok(())
 }
 
 fn sys_dup(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let old_fd = memory::read_word(&vm.frames.data, frame_base + 16);
-    let new_fd = memory::read_word(&vm.frames.data, frame_base + 20);
+    let old_fd = memory::read_word(&vm.frames.data, frame_base + ARG_START);
+    let new_fd = memory::read_word(&vm.frames.data, frame_base + ARG_START + 4);
     let result = vm.files.dup(old_fd, new_fd);
     memory::write_word(&mut vm.frames.data, frame_base, result);
     Ok(())
@@ -430,7 +566,7 @@ fn sys_millisec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_sleep(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let period_ms = memory::read_word(&vm.frames.data, frame_base + 16);
+    let period_ms = memory::read_word(&vm.frames.data, frame_base + ARG_START);
     if period_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(period_ms as u64));
     }
@@ -447,8 +583,8 @@ fn sys_pctl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_tokenize(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let str_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let delim_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
+    let str_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let delim_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
 
     let s = vm.heap.get_string(str_id).unwrap_or("").to_string();
     let delim = vm.heap.get_string(delim_id).unwrap_or(" \t\n").to_string();
@@ -481,47 +617,42 @@ fn sys_tokenize(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
     // Return (count, list) — count at offset 0, list at offset 4
     memory::write_word(&mut vm.frames.data, frame_base, count);
-    memory::write_word(&mut vm.frames.data, frame_base + 4, list_id as i32);
+    write_ptr(&mut vm.frames.data, frame_base + 4, list_id);
     Ok(())
 }
 
 fn sys_byte2char(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let buf_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let n = memory::read_word(&vm.frames.data, frame_base + 20) as usize;
+    let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let n = memory::read_word(&vm.frames.data, frame_base + ARG_START + 4) as usize;
 
-    let (char_val, bytes_consumed, status) = if let Some(obj) = vm.heap.get(buf_id) {
-        match &obj.data {
-            HeapData::Array { data, .. } => {
-                let slice = &data[..n.min(data.len())];
-                match std::str::from_utf8(slice) {
-                    Ok(s) => {
+    let (char_val, bytes_consumed, status) =
+        if let Some(data) = vm.heap.array_read(buf_id, 0, n) {
+            match std::str::from_utf8(&data) {
+                Ok(s) => {
+                    if let Some(ch) = s.chars().next() {
+                        (ch as i32, ch.len_utf8() as i32, 0)
+                    } else {
+                        (0, 0, -1)
+                    }
+                }
+                Err(e) => {
+                    let valid = e.valid_up_to();
+                    if valid > 0 {
+                        let s = std::str::from_utf8(&data[..valid]).unwrap_or("");
                         if let Some(ch) = s.chars().next() {
                             (ch as i32, ch.len_utf8() as i32, 0)
                         } else {
-                            (0, 0, -1)
+                            (0xFFFD, 1, 0)
                         }
-                    }
-                    Err(e) => {
-                        let valid = e.valid_up_to();
-                        if valid > 0 {
-                            let s = std::str::from_utf8(&slice[..valid]).unwrap_or("");
-                            if let Some(ch) = s.chars().next() {
-                                (ch as i32, ch.len_utf8() as i32, 0)
-                            } else {
-                                (0xFFFD, 1, 0)
-                            }
-                        } else {
-                            (0xFFFD, 1, 0) // replacement character
-                        }
+                    } else {
+                        (0xFFFD, 1, 0) // replacement character
                     }
                 }
             }
-            _ => (0, 0, -1),
-        }
-    } else {
-        (0, 0, -1)
-    };
+        } else {
+            (0, 0, -1)
+        };
 
     // Return (char, bytes_consumed, status)
     memory::write_word(&mut vm.frames.data, frame_base, char_val);
@@ -532,21 +663,17 @@ fn sys_byte2char(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_char2byte(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let ch_val = memory::read_word(&vm.frames.data, frame_base + 16) as u32;
-    let buf_id = memory::read_word(&vm.frames.data, frame_base + 20) as HeapId;
-    let n = memory::read_word(&vm.frames.data, frame_base + 24) as usize;
+    let ch_val = memory::read_word(&vm.frames.data, frame_base + ARG_START) as u32;
+    let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
+    let n = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
 
     let ch = char::from_u32(ch_val).unwrap_or('\u{FFFD}');
     let mut utf8_buf = [0u8; 4];
     let encoded = ch.encode_utf8(&mut utf8_buf);
     let bytes_written = encoded.len();
 
-    if let Some(obj) = vm.heap.get_mut(buf_id)
-        && let HeapData::Array { data, .. } = &mut obj.data
-    {
-        let copy_len = bytes_written.min(data.len() - n);
-        data[n..n + copy_len].copy_from_slice(&utf8_buf[..copy_len]);
-    }
+    vm.heap
+        .array_write(buf_id, n, &utf8_buf[..bytes_written]);
 
     memory::write_word(&mut vm.frames.data, frame_base, bytes_written as i32);
     Ok(())
@@ -554,20 +681,14 @@ fn sys_char2byte(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_utfbytes(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let buf_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let n = memory::read_word(&vm.frames.data, frame_base + 20) as usize;
+    let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let n = memory::read_word(&vm.frames.data, frame_base + ARG_START + 4) as usize;
 
-    let result = if let Some(obj) = vm.heap.get(buf_id) {
-        match &obj.data {
-            HeapData::Array { data, .. } => {
-                let slice = &data[..n.min(data.len())];
-                // Find the last valid UTF-8 boundary
-                match std::str::from_utf8(slice) {
-                    Ok(s) => s.len() as i32,
-                    Err(e) => e.valid_up_to() as i32,
-                }
-            }
-            _ => 0,
+    let result = if let Some(data) = vm.heap.array_read(buf_id, 0, n) {
+        // Find the last valid UTF-8 boundary
+        match std::str::from_utf8(&data) {
+            Ok(s) => s.len() as i32,
+            Err(e) => e.valid_up_to() as i32,
         }
     } else {
         0
@@ -581,12 +702,14 @@ fn sys_utfbytes(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_chdir(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let path_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
-    let result = if std::env::set_current_dir(&path).is_ok() {
-        0
-    } else {
-        -1
+    let result = match std::env::set_current_dir(&path) {
+        Ok(()) => 0,
+        Err(e) => {
+            vm.last_error = format!("{e}");
+            -1
+        }
     };
     memory::write_word(&mut vm.frames.data, frame_base, result);
     Ok(())
@@ -594,12 +717,14 @@ fn sys_chdir(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_remove(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let path_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
-    let result = if std::fs::remove_file(&path).is_ok() {
-        0
-    } else {
-        -1
+    let result = match std::fs::remove_file(&path) {
+        Ok(()) => 0,
+        Err(e) => {
+            vm.last_error = format!("{e}");
+            -1
+        }
     };
     memory::write_word(&mut vm.frames.data, frame_base, result);
     Ok(())
@@ -607,25 +732,70 @@ fn sys_remove(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_seek(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
-    let offset = memory::read_big(&vm.frames.data, frame_base + 20);
-    let whence = memory::read_word(&vm.frames.data, frame_base + 28);
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    // Big values are aligned to 8 bytes: fd at +32 (4 bytes), padding +36,
+    // offset at +40 (8 bytes), whence at +48 (4 bytes)
+    let offset = memory::read_big(&vm.frames.data, frame_base + ARG_START + 8);
+    let whence = memory::read_word(&vm.frames.data, frame_base + ARG_START + 16);
     let fd_num = get_fd_num(vm, fd_id);
 
-    let result = vm
-        .files
-        .seek(fd_num, offset, whence)
-        .map(|p| p as i64)
-        .unwrap_or(-1);
+    // Non-seekable standard streams: return 0 position without actually seeking.
+    // Bufio calls seek on stdin to get the current position, and an error would
+    // make it think the file is invalid.
+    if fd_num >= 0 && fd_num <= 2 {
+        memory::write_big(&mut vm.frames.data, frame_base, 0i64);
+        let ret_ptr = memory::read_word(&vm.frames.data, frame_base + 16);
+        if ret_ptr > 0 && (ret_ptr as usize) + 8 <= vm.frames.data.len() {
+            memory::write_big(&mut vm.frames.data, ret_ptr as usize, 0i64);
+        }
+        return Ok(());
+    }
+
+    let result = match vm.files.seek(fd_num, offset, whence) {
+        Ok(p) => p as i64,
+        Err(e) => {
+            vm.last_error = format!("{e}");
+            -1
+        }
+    };
+    // Write result at frame offset 0 (standard) AND through the return
+    // pointer at offset 16. seek returns a big (8 bytes), and the 4-byte
+    // mcall return copy can't handle that, so write directly.
     memory::write_big(&mut vm.frames.data, frame_base, result);
+    let ret_ptr = memory::read_word(&vm.frames.data, frame_base + 16);
+    if ret_ptr > 0 && (ret_ptr as usize) + 8 <= vm.frames.data.len() {
+        memory::write_big(&mut vm.frames.data, ret_ptr as usize, result);
+    }
     Ok(())
 }
 
 fn sys_pipe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    // Portable pipe is not available in std without platform-specific code.
-    // Return -1 (error) as a stub.
-    memory::write_word(&mut vm.frames.data, frame_base, -1);
+    let fds_arr_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+
+    // Create an in-memory pipe (read_fd, write_fd).
+    let (read_fd, write_fd) = vm.files.pipe();
+
+    // Allocate FD records on the heap (4-byte Record containing fd number).
+    let mut fd0_data = vec![0u8; 4];
+    memory::write_word(&mut fd0_data, 0, read_fd);
+    let fd0_id = vm.heap.alloc(0, HeapData::Record(fd0_data));
+
+    let mut fd1_data = vec![0u8; 4];
+    memory::write_word(&mut fd1_data, 0, write_fd);
+    let fd1_id = vm.heap.alloc(0, HeapData::Record(fd1_data));
+
+    // Write the FD record pointers into the array at indices 0 and 1.
+    // Each element is a 4-byte pointer (HeapId).
+    let mut ptr_bytes = [0u8; 4];
+    memory::write_word(&mut ptr_bytes, 0, fd0_id as i32);
+    vm.heap.array_write(fds_arr_id, 0, &ptr_bytes);
+
+    memory::write_word(&mut ptr_bytes, 0, fd1_id as i32);
+    vm.heap.array_write(fds_arr_id, 4, &ptr_bytes);
+
+    // Return 0 (success).
+    memory::write_word(&mut vm.frames.data, frame_base, 0);
     Ok(())
 }
 
@@ -638,7 +808,9 @@ fn sys_iounit(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_werrstr(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    // Stub: always returns 0 (no error string to set)
+    let str_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let msg = vm.heap.get_string(str_id).unwrap_or("").to_string();
+    vm.last_error = msg;
     memory::write_word(&mut vm.frames.data, frame_base, 0);
     Ok(())
 }
@@ -698,7 +870,7 @@ fn build_dir_record(vm: &mut VmState<'_>, meta: &std::fs::Metadata, name: &str) 
 
 fn sys_fstat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let fd_num = get_fd_num(vm, fd_id);
     let path = vm.files.get_path(fd_num).unwrap_or("").to_string();
 
@@ -711,9 +883,10 @@ fn sys_fstat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             let dir_id = build_dir_record(vm, &meta, name);
             // Return (0, Dir) at frame+0 and frame+4
             memory::write_word(&mut vm.frames.data, frame_base, 0);
-            memory::write_word(&mut vm.frames.data, frame_base + 4, dir_id as i32);
+            write_ptr(&mut vm.frames.data, frame_base + 4, dir_id);
         }
-        Err(_) => {
+        Err(e) => {
+            vm.last_error = format!("{e}");
             memory::write_word(&mut vm.frames.data, frame_base, -1);
         }
     }
@@ -722,7 +895,7 @@ fn sys_fstat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_stat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let path_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
 
     match std::fs::metadata(&path) {
@@ -733,9 +906,10 @@ fn sys_stat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 .unwrap_or("");
             let dir_id = build_dir_record(vm, &meta, name);
             memory::write_word(&mut vm.frames.data, frame_base, 0);
-            memory::write_word(&mut vm.frames.data, frame_base + 4, dir_id as i32);
+            write_ptr(&mut vm.frames.data, frame_base + 4, dir_id);
         }
-        Err(_) => {
+        Err(e) => {
+            vm.last_error = format!("{e}");
             memory::write_word(&mut vm.frames.data, frame_base, -1);
         }
     }
@@ -744,7 +918,7 @@ fn sys_stat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_dirread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let fd_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let fd_num = get_fd_num(vm, fd_id);
     let path = vm.files.get_path(fd_num).unwrap_or("").to_string();
 
@@ -774,9 +948,10 @@ fn sys_dirread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 },
             );
             memory::write_word(&mut vm.frames.data, frame_base, count as i32);
-            memory::write_word(&mut vm.frames.data, frame_base + 4, arr_id as i32);
+            write_ptr(&mut vm.frames.data, frame_base + 4, arr_id);
         }
-        Err(_) => {
+        Err(e) => {
+            vm.last_error = format!("{e}");
             memory::write_word(&mut vm.frames.data, frame_base, -1);
         }
     }
@@ -853,24 +1028,29 @@ fn build_connection(vm: &mut VmState<'_>, dfd: i32, cfd: i32, dir: &str) -> Heap
 
 fn sys_dial(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let addr_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let addr_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let addr = vm.heap.get_string(addr_id).unwrap_or("").to_string();
 
     match parse_dial_addr(&addr) {
         Some((host, port)) => match TcpStream::connect(format!("{host}:{port}")) {
             Ok(stream) => {
-                let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
                 let fd = vm.files.insert_tcp_stream(stream, Some(peer.clone()));
                 let conn = build_connection(vm, fd, fd, &peer);
                 memory::write_word(&mut vm.frames.data, frame_base, 0);
-                memory::write_word(&mut vm.frames.data, frame_base + 4, conn as i32);
+                write_ptr(&mut vm.frames.data, frame_base + 4, conn);
             }
-            Err(_) => {
+            Err(e) => {
+                vm.last_error = format!("{e}");
                 memory::write_word(&mut vm.frames.data, frame_base, -1);
                 memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
             }
         },
         None => {
+            vm.last_error = "invalid dial address".to_string();
             memory::write_word(&mut vm.frames.data, frame_base, -1);
             memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
         }
@@ -880,7 +1060,7 @@ fn sys_dial(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_announce(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let addr_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let addr_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let addr = vm.heap.get_string(addr_id).unwrap_or("").to_string();
 
     match parse_dial_addr(&addr) {
@@ -893,14 +1073,16 @@ fn sys_announce(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 let lfd = vm.files.insert_tcp_listener(listener, Some(local.clone()));
                 let conn = build_connection(vm, -1, lfd, &local);
                 memory::write_word(&mut vm.frames.data, frame_base, 0);
-                memory::write_word(&mut vm.frames.data, frame_base + 4, conn as i32);
+                write_ptr(&mut vm.frames.data, frame_base + 4, conn);
             }
-            Err(_) => {
+            Err(e) => {
+                vm.last_error = format!("{e}");
                 memory::write_word(&mut vm.frames.data, frame_base, -1);
                 memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
             }
         },
         None => {
+            vm.last_error = "invalid announce address".to_string();
             memory::write_word(&mut vm.frames.data, frame_base, -1);
             memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
         }
@@ -910,7 +1092,7 @@ fn sys_announce(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_listen(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let conn_id = memory::read_word(&vm.frames.data, frame_base + 16) as HeapId;
+    let conn_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     // Read cfd from Connection record (offset 4)
     let cfd_num = if let Some(obj) = vm.heap.get(conn_id) {
         if let HeapData::Record(data) = &obj.data {
@@ -933,9 +1115,10 @@ fn sys_listen(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         Ok((stream_fd, addr)) => {
             let conn = build_connection(vm, stream_fd, cfd_num, &addr);
             memory::write_word(&mut vm.frames.data, frame_base, 0);
-            memory::write_word(&mut vm.frames.data, frame_base + 4, conn as i32);
+            write_ptr(&mut vm.frames.data, frame_base + 4, conn);
         }
-        Err(_) => {
+        Err(e) => {
+            vm.last_error = format!("{e}");
             memory::write_word(&mut vm.frames.data, frame_base, -1);
             memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
         }
@@ -1043,10 +1226,10 @@ mod tests {
             },
         );
         let frame_base = vm.frames.current_data_offset();
-        memory::write_word(&mut vm.frames.data, frame_base + 16, fd_id as i32);
-        memory::write_word(&mut vm.frames.data, frame_base + 20, buf_id as i32);
-        memory::write_word(&mut vm.frames.data, frame_base + 24, 3);
-        memory::write_big(&mut vm.frames.data, frame_base + 28, 2);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, buf_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 3);
+        memory::write_big(&mut vm.frames.data, frame_base + ARG_START + 12, 2);
         vm.files.seek(fd, 5, 0).expect("seek should succeed");
 
         sys_pread(&mut vm).expect("pread should succeed");
@@ -1084,10 +1267,10 @@ mod tests {
             },
         );
         let frame_base = vm.frames.current_data_offset();
-        memory::write_word(&mut vm.frames.data, frame_base + 16, fd_id as i32);
-        memory::write_word(&mut vm.frames.data, frame_base + 20, buf_id as i32);
-        memory::write_word(&mut vm.frames.data, frame_base + 24, 3);
-        memory::write_big(&mut vm.frames.data, frame_base + 28, 1);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, buf_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 3);
+        memory::write_big(&mut vm.frames.data, frame_base + ARG_START + 12, 1);
         vm.files.seek(fd, 4, 0).expect("seek should succeed");
 
         sys_pwrite(&mut vm).expect("pwrite should succeed");
@@ -1101,5 +1284,54 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Helper: set up a VmState with a format string and arguments, then call format_string.
+    fn run_format(fmt: &str, setup_args: impl FnOnce(&mut VmState<'_>, usize)) -> String {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let frame_base = vm.frames.current_data_offset();
+
+        // Write format string to heap and store pointer at ARG_START
+        let fmt_id = vm.heap.alloc(0, HeapData::Str(fmt.to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fmt_id);
+
+        // Let the caller set up arguments starting at ARG_START + 4
+        setup_args(&mut vm, frame_base + ARG_START + 4);
+
+        format_string(&vm, frame_base, ARG_START, ARG_START + 4)
+    }
+
+    #[test]
+    fn format_string_width_d() {
+        let result = run_format("%7d", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 42);
+        });
+        assert_eq!(result, "     42");
+    }
+
+    #[test]
+    fn format_string_precision_f() {
+        let result = run_format("%.2f", |vm, off| {
+            memory::write_real(&mut vm.frames.data, off, 3.14159);
+        });
+        assert_eq!(result, "3.14");
+    }
+
+    #[test]
+    fn format_string_left_align_s() {
+        let result = run_format("%-10s", |vm, off| {
+            let s_id = vm.heap.alloc(0, HeapData::Str("hi".to_string()));
+            write_ptr(&mut vm.frames.data, off, s_id);
+        });
+        assert_eq!(result, "hi        ");
+    }
+
+    #[test]
+    fn format_string_zero_pad_x() {
+        let result = run_format("%07x", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 0x1a2b);
+        });
+        assert_eq!(result, "0001a2b");
     }
 }

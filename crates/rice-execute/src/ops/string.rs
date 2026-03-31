@@ -78,9 +78,15 @@ pub(crate) fn op_insc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 /// addc src, mid, dst — string concatenation: dst = mid + src
+/// Two-operand form: addc src, dst — dst = dst + src
 pub(crate) fn op_addc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s2_id = vm.src_ptr()?;
-    let s1_id = vm.mid_ptr()?;
+    // Two-operand: mid is None, so use dst as s1.
+    let s1_id = if vm.mid == crate::address::AddrTarget::None {
+        vm.dst_ptr()?
+    } else {
+        vm.mid_ptr()?
+    };
 
     let s1 = vm.heap.get_string(s1_id).unwrap_or("").to_string();
     let s2 = vm.heap.get_string(s2_id).unwrap_or("").to_string();

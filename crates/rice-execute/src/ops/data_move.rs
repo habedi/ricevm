@@ -5,8 +5,7 @@ use crate::heap::{self, HeapData};
 use crate::vm::VmState;
 
 pub(crate) fn op_movw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let val = vm.src_word()?;
-    vm.set_dst_word(val)
+    vm.set_dst_word(vm.src_word()?)
 }
 
 pub(crate) fn op_movb(vm: &mut VmState<'_>) -> Result<(), ExecError> {
@@ -36,9 +35,21 @@ pub(crate) fn op_movm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// movmp src, mid, dst — copy a block with pointer tracking (same as movm for now)
+/// movmp src, mid, dst — copy a typed record block.
+/// Unlike movm where mid is a byte count, mid is a type descriptor index.
+/// The actual size to copy comes from types[mid].size.
 pub(crate) fn op_movmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    op_movm(vm)
+    let type_idx = vm.mid_word()? as usize;
+    let size = vm
+        .current_type_size(type_idx)
+        .unwrap_or(type_idx); // fallback to raw value if type not found
+    if size == 0 {
+        return Ok(());
+    }
+
+    let src_bytes = read_block(vm, vm.src, size);
+    write_block(vm, vm.dst, &src_bytes);
+    Ok(())
 }
 
 /// movpc src, dst — move program counter (word) to dst
@@ -108,9 +119,17 @@ fn read_block(vm: &VmState<'_>, target: AddrTarget, size: usize) -> Vec<u8> {
             }
         }
         AddrTarget::Mp(off) => {
-            if off < vm.mp.len() {
-                let copy_len = size.min(vm.mp.len() - off);
-                buf[..copy_len].copy_from_slice(&vm.mp[off..off + copy_len]);
+            if off + size <= vm.mp.len() {
+                buf.copy_from_slice(&vm.mp[off..off + size]);
+            }
+        }
+        AddrTarget::ModuleMp { module_idx, offset } => {
+            let mp = match vm.module_mp(module_idx) {
+                Some(mp) => mp,
+                None => return buf,
+            };
+            if offset + size <= mp.len() {
+                buf.copy_from_slice(&mp[offset..offset + size]);
             }
         }
         AddrTarget::HeapArray { id, offset } => {
@@ -132,23 +151,19 @@ fn write_block(vm: &mut VmState<'_>, target: AddrTarget, data: &[u8]) {
             }
         }
         AddrTarget::Mp(off) => {
-            if off < vm.mp.len() {
-                let copy_len = data.len().min(vm.mp.len() - off);
-                vm.mp[off..off + copy_len].copy_from_slice(&data[..copy_len]);
+            if off + data.len() <= vm.mp.len() {
+                vm.mp[off..off + data.len()].copy_from_slice(data);
+            }
+        }
+        AddrTarget::ModuleMp { module_idx, offset } => {
+            if let Some(mp) = vm.module_mp_mut(module_idx) {
+                if offset + data.len() <= mp.len() {
+                    mp[offset..offset + data.len()].copy_from_slice(data);
+                }
             }
         }
         AddrTarget::HeapArray { id, offset } => {
-            if let Some(obj) = vm.heap.get_mut(id) {
-                match &mut obj.data {
-                    HeapData::Array { data: buf, .. } | HeapData::Record(buf) => {
-                        if offset < buf.len() {
-                            let copy_len = data.len().min(buf.len() - offset);
-                            buf[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            vm.heap_write(id, offset, data);
         }
         AddrTarget::Immediate | AddrTarget::None => {}
     }
@@ -283,5 +298,43 @@ mod tests {
         op_movm(&mut vm).expect("movm should succeed");
 
         assert_eq!(&vm.frames.data[fp_base + 62..fp_base + 64], &[9, 8]);
+    }
+
+    #[test]
+    fn movmp_uses_type_descriptor_size() {
+        // Create a module with type index 1 having size=8
+        let mut module = test_module();
+        module.types.push(TypeDescriptor {
+            id: 1,
+            size: 8,
+            pointer_map: PointerMap { bytes: vec![] },
+            pointer_count: 0,
+        });
+
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fp_base = vm.frames.current_data_offset();
+
+        // Write 16 bytes of recognizable data at source
+        vm.frames.data[fp_base..fp_base + 16]
+            .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+
+        vm.src = AddrTarget::Frame(fp_base);
+        // mid = type index 1, which has size=8
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 1;
+        vm.dst = AddrTarget::Frame(fp_base + 32);
+
+        op_movmp(&mut vm).expect("movmp should succeed");
+
+        // Only 8 bytes should be copied (types[1].size=8), not 1 byte (raw index)
+        assert_eq!(
+            &vm.frames.data[fp_base + 32..fp_base + 40],
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+        // Bytes beyond the 8 copied should remain zero
+        assert_eq!(
+            &vm.frames.data[fp_base + 40..fp_base + 48],
+            &[0, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 }

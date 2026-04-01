@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 
+use colored::Colorize;
 use ricevm_core::{ExecError, Module, Pc};
 
 use crate::memory;
@@ -30,14 +31,14 @@ impl<'m> Debugger<'m> {
 
     /// Run the interactive debugger loop.
     pub fn run_interactive(&mut self) -> Result<(), ExecError> {
-        println!("RiceVM debugger. Type 'help' for commands.");
+        println!("{}", "RiceVM debugger. Type 'help' for commands.".bold());
         self.print_current_instruction();
 
         let stdin = io::stdin();
         let mut last_cmd = String::new();
 
         loop {
-            print!("(ricevm) ");
+            print!("{} ", "(ricevm)".bold());
             io::stdout().flush().unwrap_or(());
 
             let mut line = String::new();
@@ -58,7 +59,7 @@ impl<'m> Debugger<'m> {
             }
 
             match parts[0] {
-                "step" | "s" => {
+                "step" | "s" | "n" => {
                     if self.vm.halted {
                         println!("Program has exited.");
                         continue;
@@ -66,7 +67,7 @@ impl<'m> Debugger<'m> {
                     self.step()?;
                     self.print_current_instruction();
                 }
-                "continue" | "c" => {
+                "continue" | "c" | "r" => {
                     self.run_to_breakpoint()?;
                     if self.vm.halted {
                         println!("Program exited.");
@@ -78,7 +79,11 @@ impl<'m> Debugger<'m> {
                     if let Some(pc_str) = parts.get(1) {
                         if let Ok(pc) = pc_str.parse::<usize>() {
                             self.breakpoints.insert(pc);
-                            println!("Breakpoint set at pc={pc}");
+                            println!(
+                                "{} set at pc={}",
+                                "Breakpoint".red().bold(),
+                                format!("{pc}").yellow()
+                            );
                         } else {
                             println!("Invalid PC: {pc_str}");
                         }
@@ -90,7 +95,11 @@ impl<'m> Debugger<'m> {
                     if let Some(pc_str) = parts.get(1) {
                         if let Ok(pc) = pc_str.parse::<usize>() {
                             if self.breakpoints.remove(&pc) {
-                                println!("Breakpoint at pc={pc} removed.");
+                                println!(
+                                    "{} at pc={} removed.",
+                                    "Breakpoint".red().bold(),
+                                    format!("{pc}").yellow()
+                                );
                             } else {
                                 println!("No breakpoint at pc={pc}.");
                             }
@@ -106,7 +115,7 @@ impl<'m> Debugger<'m> {
                         let mut bps: Vec<_> = self.breakpoints.iter().copied().collect();
                         bps.sort();
                         for bp in bps {
-                            println!("  pc={bp}");
+                            println!("  {} pc={}", "*".red(), format!("{bp}").yellow());
                         }
                     }
                 }
@@ -114,24 +123,66 @@ impl<'m> Debugger<'m> {
                     if let Some(what) = parts.get(1) {
                         self.print_info(what, parts.get(2).copied());
                     } else {
-                        println!("Usage: print pc|fp|stack|heap|inst|word <offset>");
+                        // Default: show current instruction with full detail
+                        self.print_current_instruction();
+                    }
+                }
+                "info" | "i" => {
+                    // GDB-style info command
+                    if let Some(what) = parts.get(1) {
+                        match *what {
+                            "regs" | "registers" => {
+                                self.print_info("pc", None);
+                                self.print_info("fp", None);
+                                self.print_info("stack", None);
+                            }
+                            "break" | "breakpoints" => {
+                                if self.breakpoints.is_empty() {
+                                    println!("No breakpoints set.");
+                                } else {
+                                    let mut bps: Vec<_> =
+                                        self.breakpoints.iter().copied().collect();
+                                    bps.sort();
+                                    for bp in bps {
+                                        println!("  {} pc={}", "*".red(), format!("{bp}").yellow());
+                                    }
+                                }
+                            }
+                            "frame" => self.print_info("stack", None),
+                            "heap" => self.print_info("heap", None),
+                            "mp" => {
+                                println!(
+                                    "  mp: {} bytes",
+                                    format!("{}", self.vm.mp.len()).yellow()
+                                );
+                            }
+                            _ => println!(
+                                "Unknown info target: {what}. Try: regs, break, frame, heap, mp"
+                            ),
+                        }
+                    } else {
+                        println!("Usage: info regs|break|frame|heap|mp");
                     }
                 }
                 "list" | "l" => {
                     self.list_instructions();
                 }
-                "backtrace" | "bt" => {
+                "backtrace" | "bt" | "where" => {
                     self.print_backtrace();
                 }
-                "quit" | "q" => {
+                "quit" | "q" | "exit" => {
                     println!("Exiting debugger.");
                     return Ok(());
                 }
-                "help" | "h" => {
+                "help" | "h" | "?" => {
                     Self::print_help();
                 }
                 _ => {
-                    println!("Unknown command: '{}'. Type 'help' for commands.", parts[0]);
+                    println!(
+                        "Unknown command: '{}'. Type {} for commands.",
+                        parts[0],
+                        "help".bold()
+                    );
                 }
             }
         }
@@ -171,7 +222,11 @@ impl<'m> Debugger<'m> {
             }
             self.step()?;
             if self.breakpoints.contains(&self.vm.pc) {
-                println!("Hit breakpoint at pc={}", self.vm.pc);
+                println!(
+                    "Hit {} at pc={}",
+                    "breakpoint".red().bold(),
+                    format!("{}", self.vm.pc).yellow()
+                );
                 return Ok(());
             }
         }
@@ -179,12 +234,26 @@ impl<'m> Debugger<'m> {
 
     fn print_current_instruction(&self) {
         if self.vm.halted {
-            println!("  (halted)");
+            println!("  {}", "(halted)".dimmed());
             return;
         }
         if self.vm.pc < self.module.code.len() {
             let inst = &self.module.code[self.vm.pc];
-            println!("  {:4}: {:?}", self.vm.pc, inst.opcode);
+            let operands = self.format_instruction_operands(inst);
+            if operands.is_empty() {
+                println!(
+                    "  {}: {}",
+                    format!("{:4}", self.vm.pc).yellow(),
+                    format!("{:?}", inst.opcode).cyan().bold()
+                );
+            } else {
+                println!(
+                    "  {}: {} {}",
+                    format!("{:4}", self.vm.pc).yellow(),
+                    format!("{:?}", inst.opcode).cyan().bold(),
+                    operands
+                );
+            }
         }
     }
 
@@ -192,29 +261,44 @@ impl<'m> Debugger<'m> {
         let start = self.vm.pc.saturating_sub(5);
         let end = (self.vm.pc + 10).min(self.module.code.len());
         for i in start..end {
-            let marker = if i == self.vm.pc { ">" } else { " " };
             let bp = if self.breakpoints.contains(&i) {
-                "*"
+                format!("{}", "*".red())
             } else {
-                " "
+                " ".to_string()
             };
-            println!("{bp}{marker} {:4}: {:?}", i, self.module.code[i].opcode);
+            let marker = if i == self.vm.pc { ">" } else { " " };
+            let addr = format!("{:4}", i).yellow();
+            let opcode = format!("{:?}", self.module.code[i].opcode);
+            if i == self.vm.pc {
+                println!("{bp}{marker} {addr}: {}", opcode.cyan().bold());
+            } else {
+                println!("{bp}{marker} {addr}: {opcode}");
+            }
         }
     }
 
     fn print_info(&self, what: &str, arg: Option<&str>) {
         match what {
-            "pc" => println!("  pc = {}", self.vm.pc),
-            "fp" => println!("  fp = {}", self.vm.frames.current_data_offset()),
+            "pc" => println!("  pc = {}", format!("{}", self.vm.pc).yellow()),
+            "fp" => println!(
+                "  fp = {}",
+                format!("{}", self.vm.frames.current_data_offset()).yellow()
+            ),
             "stack" => {
-                println!("  frame stack: {} bytes", self.vm.frames.data.len());
+                println!(
+                    "  frame stack: {} bytes",
+                    format!("{}", self.vm.frames.data.len()).yellow()
+                );
                 println!(
                     "  current frame base: {}",
-                    self.vm.frames.current_data_offset()
+                    format!("{}", self.vm.frames.current_data_offset()).yellow()
                 );
             }
             "heap" => {
-                println!("  heap objects: {}", self.vm.heap.len());
+                println!(
+                    "  heap objects: {}",
+                    format!("{}", self.vm.heap.len()).yellow()
+                );
             }
             "inst" => {
                 if self.vm.pc < self.module.code.len() {
@@ -228,7 +312,11 @@ impl<'m> Debugger<'m> {
                         let abs = fp + off;
                         if abs + 4 <= self.vm.frames.data.len() {
                             let val = memory::read_word(&self.vm.frames.data, abs);
-                            println!("  fp+{off} = {val} (0x{val:08x})");
+                            println!(
+                                "  fp+{off} = {} ({})",
+                                format!("{val}").yellow(),
+                                format!("0x{val:08x}").yellow()
+                            );
                         } else {
                             println!("  offset out of bounds");
                         }
@@ -242,7 +330,7 @@ impl<'m> Debugger<'m> {
     }
 
     fn print_backtrace(&self) {
-        println!("  #0 pc={} (current)", self.vm.pc);
+        println!("  #0 pc={} (current)", format!("{}", self.vm.pc).yellow());
         // Walk frame chain by reading prev_base and prev_pc from frame headers.
         let mut base = self.vm.frames.current_data_offset();
         let mut depth = 1;
@@ -260,7 +348,7 @@ impl<'m> Debugger<'m> {
                 println!("  #{depth} pc=<entry> (bottom of stack)");
                 break;
             }
-            println!("  #{depth} pc={prev_pc}");
+            println!("  #{depth} pc={}", format!("{prev_pc}").yellow());
             if prev_base == 0 || prev_base >= base {
                 break;
             }
@@ -273,17 +361,69 @@ impl<'m> Debugger<'m> {
         }
     }
 
+    fn format_instruction_operands(&self, inst: &ricevm_core::Instruction) -> String {
+        use ricevm_core::{AddressMode, MiddleMode};
+        let mut parts = Vec::new();
+        if inst.source.mode != AddressMode::None {
+            parts.push(format!("src={}", Self::format_operand(&inst.source)));
+        }
+        if inst.middle.mode != MiddleMode::None {
+            parts.push(format!("mid={}", Self::format_mid(&inst.middle)));
+        }
+        if inst.destination.mode != AddressMode::None {
+            parts.push(format!("dst={}", Self::format_operand(&inst.destination)));
+        }
+        parts.join(" ")
+    }
+
+    fn format_operand(op: &ricevm_core::Operand) -> String {
+        use ricevm_core::AddressMode;
+        match op.mode {
+            AddressMode::OffsetIndirectFp => format!("{}(fp)", op.register1),
+            AddressMode::OffsetIndirectMp => format!("{}(mp)", op.register1),
+            AddressMode::OffsetDoubleIndirectFp => {
+                format!("{}({}(fp))", op.register2, op.register1)
+            }
+            AddressMode::OffsetDoubleIndirectMp => {
+                format!("{}({}(mp))", op.register2, op.register1)
+            }
+            AddressMode::Immediate => format!("${}", op.register1 as i16),
+            _ => String::new(),
+        }
+    }
+
+    fn format_mid(op: &ricevm_core::MiddleOperand) -> String {
+        use ricevm_core::MiddleMode;
+        match op.mode {
+            MiddleMode::None => String::new(),
+            MiddleMode::SmallImmediate => format!("${}", op.register1 as i16),
+            MiddleMode::SmallOffsetFp => format!("{}(fp)", op.register1),
+            MiddleMode::SmallOffsetMp => format!("{}(mp)", op.register1),
+        }
+    }
+
     fn print_help() {
-        println!("Commands:");
-        println!("  step (s)         - Execute one instruction");
-        println!("  continue (c)     - Run until breakpoint or exit");
-        println!("  break (b) <pc>   - Set breakpoint at PC");
-        println!("  delete (d) <pc>  - Remove breakpoint");
-        println!("  breakpoints (bl) - List breakpoints");
-        println!("  print (p) <what> - Print state: pc, fp, stack, heap, inst, word <offset>");
-        println!("  list (l)         - Show instructions around current PC");
-        println!("  backtrace (bt)   - Show call stack");
-        println!("  quit (q)         - Exit debugger");
-        println!("  help (h)         - Show this help");
+        println!("{}", "Commands:".bold());
+        let cmds = [
+            ("step (s, n)", "Execute one instruction"),
+            ("continue (c, r)", "Run until breakpoint or exit"),
+            ("break (b) <pc>", "Set breakpoint at PC"),
+            ("delete (d) <pc>", "Remove breakpoint"),
+            ("breakpoints (bl)", "List breakpoints"),
+            (
+                "print (p) [what]",
+                "Print state: pc, fp, stack, heap, inst, word <offset>",
+            ),
+            ("info (i) <what>", "Show info: regs, break, frame, heap, mp"),
+            ("list (l)", "Show instructions around current PC"),
+            ("backtrace (bt)", "Show call stack"),
+            ("quit (q)", "Exit debugger"),
+            ("help (h, ?)", "Show this help"),
+        ];
+        for (cmd, desc) in cmds {
+            println!("  {:<22} {}", cmd.bold(), desc.dimmed());
+        }
+        println!();
+        println!("  {}", "Press Enter to repeat the last command.".dimmed());
     }
 }

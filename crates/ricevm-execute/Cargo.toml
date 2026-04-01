@@ -17,4 +17,5 @@ ricevm_loader.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+colored.workspace = true
 sdl2 = { version = "0.38.0", optional = true }

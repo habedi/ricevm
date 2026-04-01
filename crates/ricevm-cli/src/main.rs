@@ -1,11 +1,17 @@
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use ricevm_core::{AddressMode, MiddleMode, Module};
 
 #[derive(Parser)]
-#[command(name = "ricevm", version, about = "Dis virtual machine")]
+#[command(
+    name = "ricevm",
+    version,
+    about = "RiceVM: A Dis virtual machine implementation in Rust"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -13,30 +19,30 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Execute a .dis module file
+    /// Execute a compiled .dis module file
     Run {
         /// Path to the .dis module file
         path: PathBuf,
-        /// Module search paths (repeatable)
+        /// Add a directory to the module search path (can be repeated)
         #[arg(long = "probe", short = 'p')]
         probe_paths: Vec<PathBuf>,
-        /// Inferno root directory for path resolution
+        /// Map Inferno root paths to a host directory
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Enable instruction tracing
+        /// Print each instruction as it executes
         #[arg(long)]
         trace: bool,
-        /// Disable mark-and-sweep garbage collection
+        /// Disable the mark-and-sweep garbage collector
         #[arg(long = "no-gc")]
         no_gc: bool,
         /// Thread pool size for the scheduler
         #[arg(long, default_value = "1")]
         threads: usize,
-        /// Arguments to pass to the guest program
+        /// Arguments passed to the guest program
         #[arg(last = true)]
         guest_args: Vec<String>,
     },
-    /// Disassemble a .dis module file
+    /// Disassemble a .dis module into human-readable output
     Dis {
         /// Path to the .dis module file
         path: PathBuf,
@@ -45,17 +51,22 @@ enum Command {
     Debug {
         /// Path to the .dis module file
         path: PathBuf,
-        /// Module search paths (repeatable)
+        /// Add a directory to the module search path (can be repeated)
         #[arg(long = "probe", short = 'p')]
         probe_paths: Vec<PathBuf>,
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
 
+    let code = run(cli);
+    std::process::exit(code);
+}
+
+fn run(cli: Cli) -> i32 {
     match cli.command {
         Command::Run {
             path,
@@ -89,10 +100,32 @@ fn main() -> anyhow::Result<()> {
                     std::env::set_var("RICEVM_PROBE", paths.join(":"));
                 }
             }
-            let bytes = fs::read(&path)?;
-            let module = ricevm_loader::load(&bytes)?;
-            tracing::info!(name = %module.name, "Module loaded");
-            ricevm_execute::execute_with_args(&module, guest_args)?;
+            let bytes = match read_file(&path) {
+                Ok(b) => b,
+                Err(code) => return code,
+            };
+            let module = match load_module(&bytes) {
+                Ok(m) => m,
+                Err(code) => return code,
+            };
+            eprintln!("{} Module loaded: {}", "✓".green(), module.name);
+            let start = Instant::now();
+            match ricevm_execute::execute_with_args(&module, guest_args) {
+                Ok(()) => {
+                    let elapsed = start.elapsed();
+                    eprintln!(
+                        "{} {} in {:.2}s",
+                        "✓".green(),
+                        module.name,
+                        elapsed.as_secs_f64()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("{}: {}", "error".red().bold(), e);
+                    1
+                }
+            }
         }
         Command::Debug { path, probe_paths } => {
             unsafe {
@@ -104,30 +137,85 @@ fn main() -> anyhow::Result<()> {
                     std::env::set_var("RICEVM_PROBE", paths.join(":"));
                 }
             }
-            let bytes = fs::read(&path)?;
-            let module = ricevm_loader::load(&bytes)?;
-            tracing::info!(name = %module.name, "Module loaded for debugging");
-            ricevm_execute::debug(&module)?;
+            let bytes = match read_file(&path) {
+                Ok(b) => b,
+                Err(code) => return code,
+            };
+            let module = match load_module(&bytes) {
+                Ok(m) => m,
+                Err(code) => return code,
+            };
+            eprintln!(
+                "{} Module loaded for debugging: {}",
+                "✓".green(),
+                module.name
+            );
+            match ricevm_execute::debug(&module) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("{}: {}", "error".red().bold(), e);
+                    1
+                }
+            }
         }
         Command::Dis { path } => {
-            let bytes = fs::read(&path)?;
-            let module = ricevm_loader::load(&bytes)?;
+            let bytes = match read_file(&path) {
+                Ok(b) => b,
+                Err(code) => return code,
+            };
+            let module = match load_module(&bytes) {
+                Ok(m) => m,
+                Err(code) => return code,
+            };
             disassemble(&module);
+            0
         }
     }
+}
 
-    Ok(())
+fn read_file(path: &PathBuf) -> Result<Vec<u8>, i32> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(bytes),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "{}: file not found: {}",
+                    "error".red().bold(),
+                    path.display()
+                );
+                Err(3)
+            } else {
+                eprintln!(
+                    "{}: cannot read {}: {}",
+                    "error".red().bold(),
+                    path.display(),
+                    e
+                );
+                Err(1)
+            }
+        }
+    }
+}
+
+fn load_module(bytes: &[u8]) -> Result<Module, i32> {
+    match ricevm_loader::load(bytes) {
+        Ok(m) => Ok(m),
+        Err(e) => {
+            eprintln!("{}: failed to load module: {}", "error".red().bold(), e);
+            Err(2)
+        }
+    }
 }
 
 fn disassemble(module: &Module) {
-    println!("Module: {}", module.name);
+    println!("{} {}", "Module:".bold(), module.name);
     println!(
-        "  magic={:#x} flags={:#x} stack_extent={} entry_pc={} entry_type={}",
-        module.header.magic,
-        module.header.runtime_flags.0,
-        module.header.stack_extent,
-        module.header.entry_pc,
-        module.header.entry_type
+        "  magic={} flags={} stack_extent={} entry_pc={} entry_type={}",
+        format!("{:#x}", module.header.magic).yellow(),
+        format!("{:#x}", module.header.runtime_flags.0).yellow(),
+        format!("{}", module.header.stack_extent).yellow(),
+        format!("{}", module.header.entry_pc).yellow(),
+        format!("{}", module.header.entry_type).yellow()
     );
     println!(
         "  code={} types={} data={} exports={} imports={} handlers={}",
@@ -142,11 +230,11 @@ fn disassemble(module: &Module) {
 
     // Type descriptors
     if !module.types.is_empty() {
-        println!("Types:");
+        println!("{}", "Types:".bold());
         for td in &module.types {
             println!(
                 "  [{}] size={} ptrmap={} bytes",
-                td.id,
+                format!("{}", td.id).yellow(),
                 td.size,
                 td.pointer_map.bytes.len()
             );
@@ -155,9 +243,11 @@ fn disassemble(module: &Module) {
     }
 
     // Code
-    println!("Code:");
+    println!("{}", "Code:".bold());
     for (i, inst) in module.code.iter().enumerate() {
-        let mut line = format!("  {:4}: {:?}", i, inst.opcode);
+        let addr = format!("  {:4}:", i).yellow();
+        let opcode = format!("{:?}", inst.opcode).cyan().bold();
+        let mut line = format!("{addr} {opcode}");
         if inst.source.mode != AddressMode::None {
             line.push_str(&format!(" {}", fmt_op(&inst.source)));
         }
@@ -173,11 +263,14 @@ fn disassemble(module: &Module) {
 
     // Exports
     if !module.exports.is_empty() {
-        println!("Exports:");
+        println!("{}", "Exports:".bold());
         for e in &module.exports {
             println!(
-                "  {} pc={} frame_type={} sig={:#x}",
-                e.name, e.pc, e.frame_type, e.signature
+                "  {} pc={} frame_type={} sig={}",
+                e.name,
+                format!("{}", e.pc).yellow(),
+                e.frame_type,
+                format!("{:#x}", e.signature).yellow()
             );
         }
         println!();
@@ -185,25 +278,36 @@ fn disassemble(module: &Module) {
 
     // Imports
     for (i, imp) in module.imports.iter().enumerate() {
-        println!("Import module [{}]:", i);
+        println!("{}", format!("Import module [{i}]:").bold());
         for f in &imp.functions {
-            println!("  {} sig={:#x}", f.name, f.signature);
+            println!(
+                "  {} sig={}",
+                f.name,
+                format!("{:#x}", f.signature).yellow()
+            );
         }
         println!();
     }
 
     // Handlers
     if !module.handlers.is_empty() {
-        println!("Handlers:");
+        println!("{}", "Handlers:".bold());
         for h in &module.handlers {
             println!(
                 "  pc=[{}..{}) exc_offset={} type={:?}",
-                h.begin_pc, h.end_pc, h.exception_offset, h.type_descriptor
+                format!("{}", h.begin_pc).yellow(),
+                format!("{}", h.end_pc).yellow(),
+                h.exception_offset,
+                h.type_descriptor
             );
             for c in &h.cases {
                 match &c.name {
-                    Some(name) => println!("    \"{}\" -> pc={}", name, c.pc),
-                    None => println!("    * -> pc={}", c.pc),
+                    Some(name) => println!(
+                        "    {} -> pc={}",
+                        format!("\"{name}\"").green(),
+                        format!("{}", c.pc).yellow()
+                    ),
+                    None => println!("    * -> pc={}", format!("{}", c.pc).yellow()),
                 }
             }
         }
@@ -212,33 +316,44 @@ fn disassemble(module: &Module) {
 
     // Data
     if !module.data.is_empty() {
-        println!("Data:");
+        println!("{}", "Data:".bold());
         for item in &module.data {
             match item {
                 ricevm_core::DataItem::Bytes { offset, values } => {
-                    println!("  @{offset}: bytes[{}]", values.len());
+                    println!(
+                        "  {}: bytes[{}]",
+                        format!("@{offset}").yellow(),
+                        values.len()
+                    );
                 }
                 ricevm_core::DataItem::Words { offset, values } => {
-                    println!("  @{offset}: words{values:?}");
+                    println!("  {}: words{values:?}", format!("@{offset}").yellow());
                 }
                 ricevm_core::DataItem::Bigs { offset, values } => {
-                    println!("  @{offset}: bigs{values:?}");
+                    println!("  {}: bigs{values:?}", format!("@{offset}").yellow());
                 }
                 ricevm_core::DataItem::Reals { offset, values } => {
-                    println!("  @{offset}: reals{values:?}");
+                    println!("  {}: reals{values:?}", format!("@{offset}").yellow());
                 }
                 ricevm_core::DataItem::String { offset, value } => {
-                    println!("  @{offset}: \"{value}\"");
+                    println!(
+                        "  {}: {}",
+                        format!("@{offset}").yellow(),
+                        format!("\"{value}\"").green()
+                    );
                 }
                 ricevm_core::DataItem::Array {
                     offset,
                     element_type,
                     length,
                 } => {
-                    println!("  @{offset}: array[{length}] of type {element_type}");
+                    println!(
+                        "  {}: array[{length}] of type {element_type}",
+                        format!("@{offset}").yellow()
+                    );
                 }
                 ricevm_core::DataItem::SetArray { offset, index } => {
-                    println!("  @{offset}: set_array[{index}]");
+                    println!("  {}: set_array[{index}]", format!("@{offset}").yellow());
                 }
                 ricevm_core::DataItem::RestoreBase => {
                     println!("  restore_base");

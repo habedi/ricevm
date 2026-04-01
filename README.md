@@ -19,14 +19,11 @@ the [Limbo programming language](https://en.wikipedia.org/wiki/Limbo_(programmin
 
 ### Features
 
-- **All Dis VM opcodes**: Arithmetic, branching, control flow, string, list, pointer, heap allocation,
-  type conversions, fixed-point math, and module operations
-- **Limbo compiler support**: Runs the Inferno `limbo.dis` compiler to compile `.b` source files to `.dis` bytecode,
-  then executes the output
-- **Built-in modules**: `$Sys` (I/O, formatting, networking), `$Math` (trig, linear algebra),
-  `$Draw` (SDL2 rendering), `$Tk` (widget toolkit), and `$Crypt` (MD5)
-- **Built-in disassembler**: `ricevm dis` prints human-readable module contents
-- **Instruction tracing**: Set `RICEVM_TRACE=1` for step-by-step execution output
+- Supports all 176 Dis VM opcodes
+- Supports running `.dis` files, inclduing the Limbo compiler support from Inferno OS
+- Includes built-in modules like `$Sys`, `$Math`, `$Draw`, and `$Tk` with SDL2 backend
+- Includes a built-in debuagger and a disassembler for `.dis` files
+- Cross-platform; supports running `.dis` files on Windows, Linux, and macOS
 
 See [ROADMAP.md](ROADMAP.md) for the list of implemented and planned features.
 
@@ -43,23 +40,44 @@ See [ROADMAP.md](ROADMAP.md) for the list of implemented and planned features.
 git clone --recursive --depth=1 https://github.com/habedi/ricevm.git
 cd ricevm
 
-# Build
+# Build RiceVM from source
 cargo build --release
 
-# Run a pre-compiled .dis module
-cargo run -p ricevm-cli -- run program.dis --probe external/inferno-os/dis
+# Run a pre-compiled Inferno program
+cargo run -p ricevm-cli -- run external/inferno-os/dis/echo.dis \
+    --probe external/inferno-os/dis -- hello world
 
 # Disassemble a .dis module
-cargo run -p ricevm-cli -- dis program.dis
+cargo run -p ricevm-cli -- dis external/inferno-os/dis/echo.dis
 
-# Compile a Limbo source file and run the output
+# Create a Hello world program in Limbo language (`hello.b`)
+cat > hello.b << 'EOF'
+implement Hello;
+
+include "sys.m";
+include "draw.m";
+
+Hello: module {
+    init: fn(ctxt: ref Draw->Context, argv: list of string);
+};
+
+init(ctxt: ref Draw->Context, argv: list of string) {
+    sys := load Sys Sys->PATH;
+    sys->print("hello world\n");
+}
+EOF
+
+# Compile the Limbo program to Dis bytecode (`hello.dis`) using the Inferno Limbo compiler
 cargo run -p ricevm-cli -- run external/inferno-os/dis/limbo.dis \
     --probe external/inferno-os/dis --probe external/inferno-os/dis/lib \
     -- -I external/inferno-os/module hello.b
+
+# Run the Dis bytecode program (`hello.dis`)
 cargo run -p ricevm-cli -- run hello.dis --probe external/inferno-os/dis
 
-# Run with instruction tracing (for debugging)
-RICEVM_TRACE=1 cargo run -p ricevm-cli -- run program.dis
+# Run the `echo` program in Inferno OS with instruction tracing enabled (good for debugging)
+RICEVM_TRACE=1 cargo run -p ricevm-cli -- run external/inferno-os/dis/echo.dis \
+    --probe external/inferno-os/dis -- hi
 ```
 
 ---

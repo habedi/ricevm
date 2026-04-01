@@ -80,6 +80,101 @@ pub(crate) struct SuspendedThread {
     pub blocked_on: Option<heap::HeapId>,
 }
 
+// $Keyring digest handlers using real MD5/SHA1
+
+/// DigestState stored as a heap record. The first 4 bytes contain a "kind" tag
+/// (0=md5, 1=sha1), followed by the running hash state bytes.
+const DIGEST_MD5: i32 = 0;
+const DIGEST_SHA1: i32 = 1;
+
+fn keyring_md5(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    keyring_digest(vm, DIGEST_MD5)
+}
+
+fn keyring_sha1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    keyring_digest(vm, DIGEST_SHA1)
+}
+
+/// md5/sha1(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState
+///
+/// The DigestState is a heap record storing: [kind(4 bytes), accumulated_data_length(4 bytes), accumulated_data...]
+/// When digest is non-nil, we finalize the hash and write the result.
+fn keyring_digest(vm: &mut VmState<'_>, kind: i32) -> Result<(), ExecError> {
+    use crate::heap::{HeapData, HeapId};
+
+    let frame_base = vm.frames.current_data_offset();
+    let data_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
+    let n = memory::read_word(&vm.frames.data, frame_base + 36) as usize;
+    let digest_id = memory::read_word(&vm.frames.data, frame_base + 40) as HeapId;
+    let state_id = memory::read_word(&vm.frames.data, frame_base + 44) as HeapId;
+
+    // Read input data
+    let input = if data_id != heap::NIL && n > 0 {
+        vm.heap.array_read(data_id, 0, n).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    // Get or create accumulated data from state
+    let mut accumulated = if state_id != heap::NIL {
+        if let Some(obj) = vm.heap.get(state_id) {
+            if let HeapData::Record(data) = &obj.data {
+                // Skip first 4 bytes (kind tag), rest is accumulated data
+                if data.len() > 4 {
+                    data[4..].to_vec()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Append new input
+    accumulated.extend_from_slice(&input);
+
+    // If digest array is provided, finalize and write the hash
+    if digest_id != heap::NIL {
+        let digest_bytes: Vec<u8> = if kind == DIGEST_MD5 {
+            use md5::Digest;
+            let mut hasher = md5::Md5::new();
+            hasher.update(&accumulated);
+            hasher.finalize().to_vec()
+        } else {
+            use sha1::Digest;
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(&accumulated);
+            hasher.finalize().to_vec()
+        };
+        vm.heap.array_write(digest_id, 0, &digest_bytes);
+    }
+
+    // Return updated DigestState: [kind(4), accumulated_data...]
+    let mut state_data = vec![0u8; 4 + accumulated.len()];
+    memory::write_word(&mut state_data, 0, kind);
+    state_data[4..].copy_from_slice(&accumulated);
+    let new_state_id = vm.heap.alloc(0, HeapData::Record(state_data));
+    memory::write_word(&mut vm.frames.data, frame_base, new_state_id as i32);
+    Ok(())
+}
+
+fn keyring_return_nil(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    memory::write_word(&mut vm.frames.data, frame_base, 0);
+    Ok(())
+}
+
+fn keyring_return_zero(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    memory::write_word(&mut vm.frames.data, frame_base, 0);
+    Ok(())
+}
+
 impl<'m> VmState<'m> {
     pub fn new(module: &'m Module) -> Result<Self, ExecError> {
         Self::with_args(module, Vec::new())
@@ -120,15 +215,9 @@ impl<'m> VmState<'m> {
             // Create a Screen record
             let screen_id = heap.alloc(0, heap::HeapData::Record(vec![0u8; 16]));
             memory::write_word(&mut ctx_data, 4, screen_id as i32);
-            // Create a wm channel
-            let wm_chan = heap.alloc(
-                0,
-                heap::HeapData::Channel {
-                    elem_size: 4,
-                    pending: None,
-                },
-            );
-            memory::write_word(&mut ctx_data, 8, wm_chan as i32);
+            // Leave wm channel (offset 8) as nil so standalone mode is used
+            // by wmlib->connect(). Non-nil wm triggers /chan/wmctl lookup which
+            // requires a running Inferno window manager.
             let ctx_id = heap.alloc(0, heap::HeapData::Record(ctx_data));
 
             // Build args list: [module_name, arg1, arg2, ...] as a linked list.
@@ -176,13 +265,82 @@ impl<'m> VmState<'m> {
                 sig: 0x07656377,
                 frame_size: 48,
                 handler: |vm| {
-                    // md5(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState
-                    // Stub: return nil
                     let frame_base = vm.frames.current_data_offset();
                     crate::memory::write_word(&mut vm.frames.data, frame_base, 0);
                     Ok(())
                 },
             }],
+        });
+        modules.register(crate::builtin::BuiltinModule {
+            name: "$Keyring",
+            funcs: vec![
+                crate::builtin::BuiltinFunc {
+                    name: "md5",
+                    sig: 0x07656377,
+                    frame_size: 56,
+                    handler: keyring_md5,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "sha1",
+                    sig: 0x07656377,
+                    frame_size: 56,
+                    handler: keyring_sha1,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "sha224",
+                    sig: 0x07656377,
+                    frame_size: 56,
+                    handler: keyring_sha1, // use sha1 as fallback
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "sha256",
+                    sig: 0x07656377,
+                    frame_size: 56,
+                    handler: keyring_sha1, // use sha1 as fallback
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "readauthinfo",
+                    sig: 0xb2c82015,
+                    frame_size: 40,
+                    handler: keyring_return_nil,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "writeauthinfo",
+                    sig: 0, // accept any
+                    frame_size: 40,
+                    handler: keyring_return_zero,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "getstring",
+                    sig: 0,
+                    frame_size: 40,
+                    handler: keyring_return_nil,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "putstring",
+                    sig: 0,
+                    frame_size: 40,
+                    handler: keyring_return_zero,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "getbytearray",
+                    sig: 0,
+                    frame_size: 40,
+                    handler: keyring_return_nil,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "putbytearray",
+                    sig: 0,
+                    frame_size: 40,
+                    handler: keyring_return_zero,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "auth",
+                    sig: 0,
+                    frame_size: 48,
+                    handler: keyring_return_nil,
+                },
+            ],
         });
 
         let trace = std::env::var("RICEVM_TRACE").is_ok();
@@ -231,6 +389,7 @@ impl<'m> VmState<'m> {
         }
     }
 
+    /// Check if a type (by index) contains any pointer fields.
     pub fn run(&mut self) -> Result<(), ExecError> {
         // Library modules with entry_pc = -1 have no init function.
         if self.module.header.entry_pc < 0 {
@@ -275,7 +434,18 @@ impl<'m> VmState<'m> {
             }
             self.resolve_operands(&inst)?;
             self.next_pc = self.pc + 1;
-            ops::dispatch(self, &inst)?;
+            match ops::dispatch(self, &inst) {
+                Ok(()) => {}
+                Err(ExecError::ThreadFault(ref msg))
+                    if msg.contains("nil")
+                        || msg.contains("out of bounds")
+                        || msg.contains("not a module") =>
+                {
+                    // Try to find an exception handler for nil dereferences
+                    self.raise_exception(msg)?;
+                }
+                Err(e) => return Err(e),
+            }
 
             // Check if the instruction blocked on a channel (recv/alt with no data)
             if let Some(chan_id) = self.blocked_channel.take() {
@@ -349,6 +519,50 @@ impl<'m> VmState<'m> {
     }
 
     /// Unblock threads waiting on a specific channel (called after send).
+    /// Raise a VM exception. Searches the current module's handler table
+    /// for a matching handler at the current PC. If found, jumps to the handler.
+    /// If not found, returns a ThreadFault error.
+    pub(crate) fn raise_exception(&mut self, msg: &str) -> Result<(), ExecError> {
+        let current_pc = self.pc as i32;
+        let str_id = self.heap.alloc(0, heap::HeapData::Str(msg.to_string()));
+
+        // Search current module's handler table
+        let handlers = if let Some(lm_idx) = self.current_loaded_module {
+            self.loaded_modules
+                .get(lm_idx)
+                .map(|lm| &lm.module.handlers)
+        } else {
+            Some(&self.module.handlers)
+        };
+
+        if let Some(handlers) = handlers {
+            for handler in handlers {
+                if current_pc < handler.begin_pc || current_pc >= handler.end_pc {
+                    continue;
+                }
+                for case in &handler.cases {
+                    let matches = match &case.name {
+                        Some(name) => msg.starts_with(name.as_str()),
+                        None => true, // wildcard
+                    };
+                    if matches {
+                        self.next_pc = case.pc as usize;
+                        let frame_base = self.frames.current_data_offset();
+                        let off = frame_base + handler.exception_offset as usize;
+                        if off + 4 <= self.frames.data.len() {
+                            crate::memory::write_word(&mut self.frames.data, off, str_id as i32);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        Err(ExecError::ThreadFault(format!(
+            "unhandled exception: {msg}"
+        )))
+    }
+
     pub(crate) fn unblock_channel(&mut self, chan_id: heap::HeapId) {
         for thread in self.thread_queue.iter_mut() {
             if let Some(blocked_id) = thread.blocked_on {

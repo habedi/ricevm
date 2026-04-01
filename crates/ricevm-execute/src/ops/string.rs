@@ -17,14 +17,14 @@ pub(crate) fn op_lenc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 pub(crate) fn op_indc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let str_id = vm.src_ptr()?;
     let index = vm.mid_word()? as usize;
-    let s = vm
-        .heap
-        .get_string(str_id)
-        .ok_or_else(|| ExecError::ThreadFault("nil string dereference".to_string()))?;
-    let ch = s
-        .chars()
-        .nth(index)
-        .ok_or_else(|| ExecError::ThreadFault(format!("string index out of bounds: {index}")))?;
+    let s = match vm.heap.get_string(str_id) {
+        Some(s) => s.to_string(),
+        None => return vm.raise_exception("nil dereference"),
+    };
+    let ch = match s.chars().nth(index) {
+        Some(c) => c,
+        None => return vm.raise_exception("string index out of bounds"),
+    };
     vm.set_dst_word(ch as i32)
 }
 
@@ -191,6 +191,21 @@ pub(crate) fn op_cvtac(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         let s = match vm.heap.get(arr_id) {
             Some(obj) => match &obj.data {
                 HeapData::Array { data, .. } => String::from_utf8_lossy(data).into_owned(),
+                HeapData::ArraySlice {
+                    parent_id,
+                    byte_start,
+                    length,
+                    elem_size,
+                    ..
+                } => {
+                    let len = length * elem_size;
+                    let pid = *parent_id;
+                    let start = *byte_start;
+                    vm.heap
+                        .array_read(pid, start, len)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .unwrap_or_default()
+                }
                 _ => String::new(),
             },
             None => String::new(),
@@ -460,5 +475,49 @@ mod tests {
 
         let result_id = memory::read_word(&vm.frames.data, fp) as u32;
         assert_eq!(result_id, heap::NIL, "cvtac of nil array should be nil");
+    }
+
+    #[test]
+    fn cvtac_array_slice_converts_to_string() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Create a parent array with "Hello World" bytes
+        let parent_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: b"Hello World".to_vec(),
+                length: 11,
+            },
+        );
+
+        // Create a slice for "World" (bytes 6..11)
+        let slice_id = vm.heap.alloc(
+            0,
+            HeapData::ArraySlice {
+                parent_id,
+                byte_start: 6,
+                elem_type: 0,
+                elem_size: 1,
+                length: 5,
+            },
+        );
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = slice_id as i32;
+        memory::write_word(&mut vm.frames.data, fp, 0);
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_cvtac(&mut vm).expect("cvtac on slice should succeed");
+
+        let result_id = memory::read_word(&vm.frames.data, fp) as u32;
+        let result_str = vm.heap.get_string(result_id).unwrap_or("");
+        assert_eq!(
+            result_str, "World",
+            "cvtac of ArraySlice should produce correct string"
+        );
     }
 }

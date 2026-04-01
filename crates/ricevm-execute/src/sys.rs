@@ -584,12 +584,8 @@ fn sys_pread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         let mut tmp = vec![0u8; count];
         let n = vm.files.read(fd_num, &mut tmp).unwrap_or(-1_i32 as usize) as i32;
 
-        if n > 0
-            && let Some(obj) = vm.heap.get_mut(buf_id)
-            && let HeapData::Array { data, .. } = &mut obj.data
-        {
-            let copy_len = (n as usize).min(data.len());
-            data[..copy_len].copy_from_slice(&tmp[..copy_len]);
+        if n > 0 {
+            vm.heap.array_write(buf_id, 0, &tmp[..(n as usize)]);
         }
         n
     } else {
@@ -619,13 +615,7 @@ fn sys_pwrite(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         }
     };
 
-    let bytes: Vec<u8> = match vm.heap.get(buf_id) {
-        Some(obj) => match &obj.data {
-            HeapData::Array { data, .. } => data[..count.min(data.len())].to_vec(),
-            _ => Vec::new(),
-        },
-        None => Vec::new(),
-    };
+    let bytes: Vec<u8> = vm.heap.array_read(buf_id, 0, count).unwrap_or_default();
 
     let result = if vm.files.seek(fd_num, offset, 0).is_ok() {
         vm.files.write(fd_num, &bytes).unwrap_or(0) as i32
@@ -831,7 +821,13 @@ fn sys_utfbytes(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn sys_chdir(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
-    let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    let raw_path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    // Map Inferno /usr/<name> to the host home directory
+    let path = if let Some(user) = raw_path.strip_prefix("/usr/") {
+        std::env::var("HOME").unwrap_or_else(|_| format!("/home/{user}"))
+    } else {
+        vm.files.resolve_path(&raw_path)
+    };
     let result = match std::env::set_current_dir(&path) {
         Ok(()) => 0,
         Err(e) => {

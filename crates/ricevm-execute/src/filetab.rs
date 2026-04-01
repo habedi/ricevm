@@ -102,11 +102,72 @@ impl FileOps for StderrFile {
 }
 
 /// Wrapper for stdin.
-struct StdinFile;
+/// Buffered stdin that pre-reads in a background thread so reads don't block the VM.
+struct StdinFile {
+    buffer: Arc<Mutex<StdinBuffer>>,
+}
+
+struct StdinBuffer {
+    data: std::collections::VecDeque<u8>,
+    eof: bool,
+}
+
+impl StdinFile {
+    fn new() -> Self {
+        let buffer = Arc::new(Mutex::new(StdinBuffer {
+            data: std::collections::VecDeque::new(),
+            eof: false,
+        }));
+        let buf_clone = Arc::clone(&buffer);
+        std::thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut tmp = [0u8; 4096];
+            loop {
+                match stdin.lock().read(&mut tmp) {
+                    Ok(0) => {
+                        if let Ok(mut b) = buf_clone.lock() {
+                            b.eof = true;
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        if let Ok(mut b) = buf_clone.lock() {
+                            b.data.extend(&tmp[..n]);
+                        }
+                    }
+                    Err(_) => {
+                        if let Ok(mut b) = buf_clone.lock() {
+                            b.eof = true;
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+        Self { buffer }
+    }
+}
 
 impl FileOps for StdinFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        io::stdin().read(buf)
+        // Try to read from buffer; if empty and not EOF, wait briefly
+        for _ in 0..50 {
+            if let Ok(mut b) = self.buffer.lock() {
+                if !b.data.is_empty() {
+                    let n = buf.len().min(b.data.len());
+                    for (i, byte) in b.data.drain(..n).enumerate() {
+                        buf[i] = byte;
+                    }
+                    return Ok(n);
+                }
+                if b.eof {
+                    return Ok(0);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Timeout: treat as EOF (the reader thread may not have started yet)
+        Ok(0)
     }
     fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
         Err(io::Error::new(
@@ -119,6 +180,59 @@ impl FileOps for StdinFile {
             io::ErrorKind::Unsupported,
             "cannot seek stdin",
         ))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Pseudo-random byte generator for /dev/random.
+struct RandomFile;
+
+impl FileOps for RandomFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Simple xorshift-based PRNG seeded from system time
+        let mut seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        for b in buf.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *b = seed as u8;
+        }
+        Ok(buf.len())
+    }
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Ok(_buf.len())
+    }
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Ok(0)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// In-memory read-only file for virtual device files.
+struct MemoryFile(std::io::Cursor<Vec<u8>>);
+
+impl FileOps for MemoryFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        Read::read(&mut self.0, buf)
+    }
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Ok(_buf.len()) // silently accept writes
+    }
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.0.seek(pos)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -334,7 +448,7 @@ impl FileTable {
         ft.files.insert(
             0,
             FileEntry {
-                inner: Box::new(StdinFile),
+                inner: Box::new(StdinFile::new()),
                 path: Some("/dev/stdin".to_string()),
             },
         );
@@ -371,12 +485,79 @@ impl FileTable {
     /// Intercepts `/dev/audio` and `/dev/audioctl` to provide virtual
     /// audio device files. All other paths are opened on the host filesystem.
     pub fn open(&mut self, path: &str, mode: i32) -> io::Result<i32> {
-        // Virtual audio device files.
+        // Virtual device files.
         if path == "/dev/audio" {
             return self.open_audio_file(path);
         }
         if path == "/dev/audioctl" {
             return self.open_audioctl_file(path);
+        }
+        if path == "/dev/sysctl" {
+            return self.open_virtual_file(path, b"RiceVM");
+        }
+        if path == "/dev/sysname" {
+            return self.open_virtual_file(path, b"ricevm");
+        }
+        // /dev/user: current user name (used by many Inferno programs)
+        if path == "/dev/user" {
+            let user = std::env::var("USER").unwrap_or_else(|_| "inferno".to_string());
+            return self.open_virtual_file(path, user.as_bytes());
+        }
+        // /dev/time: nanoseconds since epoch (used by lockfs, profiling tools)
+        if path == "/dev/time" {
+            let ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let time_str = format!("{ns}");
+            return self.open_virtual_file(path, time_str.as_bytes());
+        }
+        // /dev/cons: console (alias for stdin/stdout depending on mode)
+        if path == "/dev/cons" {
+            return if mode & 0x3 == 0 {
+                // OREAD: return stdin
+                Ok(0)
+            } else {
+                // OWRITE/ORDWR: return stdout
+                Ok(1)
+            };
+        }
+        // /dev/null: discard writes, EOF on read
+        if path == "/dev/null" {
+            return self.open_virtual_file(path, b"");
+        }
+        // /dev/random: pseudo-random bytes
+        if path == "/dev/random" || path == "/dev/urandom" {
+            return self.open_random_file(path);
+        }
+        // /dev/drivers: list of available device drivers (stub)
+        if path == "/dev/drivers" {
+            return self.open_virtual_file(path, b"#c cons\n#d ssl\n#e env\n#I ip\n#p prog\n");
+        }
+        // /prog/N/status: process status (stub with running state)
+        if path.starts_with("/prog/") && path.ends_with("/status") {
+            let status = format!(
+                "{:28} {:8} {:12} {:8}\n",
+                "ricevm", "running", "release", "0:00"
+            );
+            return self.open_virtual_file(path, status.as_bytes());
+        }
+        // /prog/N/wait: process wait file (returns EOF immediately)
+        if path.starts_with("/prog/") && path.ends_with("/wait") {
+            return self.open_virtual_file(path, b"");
+        }
+        // /prog/N/ns: namespace listing (stub)
+        if path.starts_with("/prog/") && path.ends_with("/ns") {
+            return self.open_virtual_file(path, b"");
+        }
+        // /prog/N/ctl: process control (accepts writes, returns empty on read)
+        if path.starts_with("/prog/") && path.ends_with("/ctl") {
+            return self.open_virtual_file(path, b"");
+        }
+        // /env/: environment variables
+        if let Some(var_name) = path.strip_prefix("/env/") {
+            let val = std::env::var(var_name).unwrap_or_default();
+            return self.open_virtual_file(path, val.as_bytes());
         }
 
         let resolved = self.resolve_path(path);
@@ -549,6 +730,33 @@ impl FileTable {
 
         self.files.insert(listener_fd, entry);
         result
+    }
+
+    /// Open a virtual file backed by in-memory data.
+    fn open_virtual_file(&mut self, path: &str, data: &[u8]) -> io::Result<i32> {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.files.insert(
+            fd,
+            FileEntry {
+                inner: Box::new(MemoryFile(std::io::Cursor::new(data.to_vec()))),
+                path: Some(path.to_string()),
+            },
+        );
+        Ok(fd)
+    }
+
+    fn open_random_file(&mut self, path: &str) -> io::Result<i32> {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.files.insert(
+            fd,
+            FileEntry {
+                inner: Box::new(RandomFile),
+                path: Some(path.to_string()),
+            },
+        );
+        Ok(fd)
     }
 
     /// Open a virtual /dev/audio file descriptor.

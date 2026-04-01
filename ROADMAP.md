@@ -43,7 +43,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] `lenl` list-length semantics
 - [x] Array operations: `indx`, `indw`, `indf`, `indb`, `indl` (array indexing via heap refs), `newa`, `slicea`, and `slicela`
 - [x] `slicea` creates shared-storage `ArraySlice` views (not copies)
-- [x] `slicela` array append (distinct from `slicea`)
+- [x] `slicela` array append with pointer ref counting (distinct from `slicea`)
 - [x] Module operations: `load`, `mcall`, and `mframe` with name-based dispatch
 - [x] Builtin return value copy in `mcall` (4 bytes via return pointer at offset 16)
 - [x] Tuple-returning functions write all fields through ret pointer directly
@@ -58,7 +58,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Pointer type with heap object tracking and reference counting
 - [x] String type with full Unicode support and copy-on-write
 - [x] Array type with bounds checking and heap array references
-- [x] `ArraySlice` type for shared-storage array views (Bufio buffer semantics)
+- [x] `ArraySlice` type for shared-storage array views (Bufio buffer semantics); fully supported in `cvtac`, `slicela`, `pread`, `pwrite`, and channel operations
 - [x] List type (singly linked with typed head values)
 - [x] Channel type (allocation and simplified send and receive)
 - [x] ADT (abstract data type) support
@@ -81,6 +81,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Channel blocking: `recv` on empty channel suspends thread; `send` on full channel suspends thread; both directions unblock on state change
 - [x] Thread queue with ready/blocked state tracking
 - [x] Deadlock detection (all threads blocked → halt)
+- [x] Non-blocking stdin via background read thread (prevents `sys->read` from freezing all VM threads)
 - [ ] Full preemptive thread scheduling with OS thread pool (infrastructure exists but not connected)
 
 ### Built-in Modules
@@ -106,12 +107,14 @@ This document outlines the features implemented in RiceVM and the future goals f
     - `Image.draw`, `Image.line`, `Image.ellipse`, and `Image.flush`: basic SDL2 rendering
     - `Display.getwindow`, `Screen.allocate`, and `Screen.newwindow`: proper ADT record creation
     - `Font.open` and `Font.width`: default font metrics
-- [x] `$Tk` module (10 functions registered, several signatures still placeholders)
+- [x] `$Tk` module (10 functions with full command dispatch)
     - `toplevel`: creates Toplevel ADT with display, wreq channel, image, and screen rect
-    - `cmd`: processes Tk command strings (widget creation logging, SDL2 update)
-    - `namechan`, `pointer`, `keyboard`, `quote`, and `color`
+    - `cmd`: full command dispatch (widget creation, configure, cget, winfo, bind, send, pack -in/-side, compound commands)
+    - `namechan`: registers named channels for Tk event delivery
+    - `pointer`, `keyboard`, `quote`, `color`, `rect`, `getimage`, and `putimage`
+- [x] `$Keyring` module (11 functions: `md5`, `sha1`, `sha224`, `sha256` with real digests; `readauthinfo`, `writeauthinfo`, `getstring`, `putstring`, `getbytearray`, `putbytearray`, and `auth` stubs)
 - [x] `$Crypt` module (stub with `md5` function for compiler signature computation)
-- [x] Exception handler table lookup for `raise` opcode
+- [x] Exception handler table lookup for `raise` opcode and nil dereference faults
 - [x] Name-based function dispatch with signature-hash fallback for built-in and loaded modules
 
 ### Limbo Compiler Support
@@ -124,7 +127,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Programs with float literals compile correctly
 - [x] Compiled programs execute correctly on RiceVM (echo, cat, basename, rm, mkdir, tr, sleep, date, and wc verified)
 - [x] `sprint`/`fprint` format specifiers: `%d`, `%s`, `%f`, `%g`, `%x`, `%o`, `%c`, `%r`, `%b`, `%u`, `%.*`, width, precision, and flags
-- [ ] Stdin piping for Bufio-based programs compiled from source (partial)
+- [x] Stdin piping for Bufio-based programs (grep, sort, uniq, wc via Bufio->gets)
 
 ### GUI Support
 
@@ -132,10 +135,15 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] `Display.allocate` creates SDL2 window with proper Display/Image/Screen ADTs
 - [x] Proper Inferno ADT record layouts for Display, Image, Screen, Font, and Toplevel
 - [x] Event loop integration via `Image.flush` (polls SDL events, handles window close)
-- [x] Manual milestone: `wm/about.dis` loads, initializes, and enters the event loop without crashing
-- [x] Tk widget rendering (label, button, frame, pack, and canvas)
-- [x] Font rendering (monospace bitmap fallback; SDL2_ttf planned)
+- [x] `wm/about.dis` loads all modules (tkclient, wmlib, titlebar), processes Tk commands, and enters the event loop
+- [x] Tk widget rendering (label, button, frame, pack, canvas, configure, cget, and winfo)
+- [x] Tk command dispatch with widget subcommands, bind, send, and pack -in/-side
+- [x] Named channel support via `Tk->namechan` with send-to-channel from Tk commands
+- [x] Hex color parsing (`#RRGGBB`) for `-bg` and `-fg` widget options
+- [x] Embedded 8x13 bitmap font for all printable ASCII (no external font library needed)
+- [x] Mouse click dispatch to Tk button widgets (sends command to named channels)
 - [x] Mouse and keyboard event delivery to Tk
+- [x] Virtual device files: `/dev/sysctl`, `/dev/sysname`, `/dev/user`, `/dev/time`, `/dev/cons`, `/dev/null`, `/dev/random`, `/dev/drivers`, `/prog/N/status`, `/prog/N/wait`, `/prog/N/ns`, `/prog/N/ctl`, and `/env/*`
 
 ### Audio Support
 
@@ -164,17 +172,17 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 ### Compatibility
 
-- [x] 524 of 844 pre-compiled Inferno `.dis` programs pass (62%)
-- [x] 10 timeouts (down from 115)
+- [x] 546 of 844 pre-compiled Inferno `.dis` programs pass (65%); ~83% effective pass rate excluding programs that need arguments or are library modules
+- [x] 58 timeouts (programs waiting for interactive input; expected with no stdin)
 - [x] Systematic audit against reference xec.c implementation
-- [ ] Target: 600+ programs passing (70%+)
+- [ ] Target: 600+ programs passing (70%+); remaining failures are mostly environment-dependent (Plan 9 namespaces, crypto, device files)
 
 ### Development and Testing
 
 - [x] Cargo workspace with modular crate structure
 - [x] CI pipeline with automated tests
 - [x] Dual license (MIT and Apache 2.0)
-- [x] 202 tests total:
+- [x] 203 tests total:
     - Unit tests for instruction decoding and execution
     - Property-based tests for arithmetic (commutativity, associativity, and identity)
     - Property-based tests for string operations (slicec bounds, addc associativity)
@@ -185,7 +193,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Fuzz testing setup for the module loader (`cargo-fuzz` with `libfuzzer`)
 - [x] 866 pre-compiled `.dis` files available via `external/inferno-os` submodule
 - [x] `make lint` passes (clippy with `-D warnings -D clippy::unwrap_used -D clippy::expect_used`)
-- [x] `make test` passes (202 tests, 0 failures)
+- [x] `make test` passes (203 tests, 0 failures)
 
 ### Documentation
 
@@ -197,13 +205,13 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 #### Design Choices
 
-- Cooperative threading (not preemptive): the run loop rotates threads by quantum; a preemptive scheduler with OS threads exists but is not connected because it would require `Arc<Mutex<>>` refactoring of VmState
+- Cooperative threading with non-blocking stdin: the run loop rotates threads by quantum; stdin reads use a background thread to avoid blocking the VM; a preemptive scheduler with OS threads exists but is not connected because it would require `Arc<Mutex<>>` refactoring of VmState
 - `op_ret` does not restore module context from the frame; the `mcall` wrapper handles module context restoration instead (correct behavior, different structure from reference)
 
 #### Unimplementable on Host OS
 
 - `$Sys` stubs that require Plan 9 namespace semantics: `bind`, `mount`, `unmount`, `export`, `fauth`, and `file2chan` (no host OS equivalent)
-- ~310 pre-compiled programs fail because they need Inferno OS environment features (arguments, `/dev`, `/prog`, `$Keyring`, and network services) not available on the host
+- ~240 pre-compiled programs fail: ~100 need command-line arguments (working correctly), ~50 need Plan 9 namespace/device features, ~30 need crypto modules beyond the current `$Keyring` stub, and ~60 have other environment dependencies
 
 #### Incomplete Modules
 

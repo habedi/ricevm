@@ -78,7 +78,15 @@ cargo run -p ricevm-cli -- run hello.dis --probe external/inferno-os/dis
 # Run the `echo` program in Inferno OS with instruction tracing enabled (good for debugging)
 RICEVM_TRACE=1 cargo run -p ricevm-cli -- run external/inferno-os/dis/echo.dis \
     --probe external/inferno-os/dis -- hi
+
+# Run the `about.dis` program in Inferno OS with the GUI enabled (this needs SDL2)
+cargo run --release --features gui -- run external/inferno-os/dis/wm/about.dis \
+    --probe external/inferno-os/dis \
+    --probe external/inferno-os/dis/lib \
+    --root external/inferno-os
 ```
+
+
 
 ---
 

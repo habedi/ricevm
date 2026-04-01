@@ -139,33 +139,321 @@ fn tk_toplevel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// Returns a result string (empty on success, error message on failure).
 fn tk_cmd(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let _toplevel_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
+    let toplevel_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
     let cmd_id = memory::read_word(&vm.frames.data, frame_base + 36) as HeapId;
     let cmd = vm.heap.get_string(cmd_id).unwrap_or("").to_string();
 
     tracing::debug!(cmd = cmd, "Tk.cmd");
 
-    #[cfg(feature = "gui")]
-    {
-        // Parse basic Tk commands and render via SDL2
-        process_tk_cmd(vm, &cmd);
-    }
+    let result = dispatch_tk_cmd(vm, toplevel_id, &cmd);
 
-    // Return empty string (success)
-    let result_id = vm.heap.alloc(0, HeapData::Str(String::new()));
+    let result_id = vm.heap.alloc(0, HeapData::Str(result));
     memory::write_word(&mut vm.frames.data, frame_base, result_id as i32);
     Ok(())
+}
+
+// Named channels registered via Tk->namechan (maps channel name to heap ID).
+thread_local! {
+    static NAMED_CHANNELS: std::cell::RefCell<std::collections::HashMap<String, HeapId>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+// Widget property storage for cget/configure.
+thread_local! {
+    static WIDGET_PROPS: std::cell::RefCell<std::collections::HashMap<String, std::collections::HashMap<String, String>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Dispatch a Tk command and return a result string.
+fn dispatch_tk_cmd(vm: &mut VmState<'_>, _toplevel_id: HeapId, cmd: &str) -> String {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return String::new();
+    }
+
+    // Handle compound commands separated by semicolons
+    if cmd.contains(';') {
+        let mut last_result = String::new();
+        for sub in cmd.split(';') {
+            let sub = sub.trim();
+            if !sub.is_empty() {
+                last_result = dispatch_tk_cmd(vm, _toplevel_id, sub);
+            }
+        }
+        return last_result;
+    }
+
+    let parts: Vec<&str> = shell_split(cmd);
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    let first = parts[0];
+
+    // Widget subcommand: .name configure/cget/...
+    if first.starts_with('.') {
+        return dispatch_widget_cmd(&parts);
+    }
+
+    match first {
+        "update" | "frame" | "label" | "button" | "entry" | "text" | "canvas" => {
+            #[cfg(feature = "gui")]
+            process_tk_cmd(vm, cmd);
+            String::new()
+        }
+        "pack" => {
+            if parts.get(1).is_some_and(|s| *s == "propagate") {
+                // pack propagate . 0 — ignore
+                return String::new();
+            }
+            #[cfg(feature = "gui")]
+            process_tk_cmd(vm, cmd);
+            String::new()
+        }
+        "bind" => {
+            // bind .widget <Event> {command} — store but don't act
+            String::new()
+        }
+        "send" => {
+            // send channame value — send a string to a named channel
+            if let Some(chan_name) = parts.get(1) {
+                let value = if parts.len() > 2 {
+                    parts[2..].join(" ")
+                } else {
+                    String::new()
+                };
+                send_to_named_channel(vm, chan_name, &value);
+            }
+            String::new()
+        }
+        "winfo" => {
+            // winfo class .name — return widget class name
+            if parts.get(1).is_some_and(|s| *s == "class")
+                && let Some(name) = parts.get(2)
+            {
+                return widget_class(name);
+            }
+            // winfo exists .name
+            if parts.get(1).is_some_and(|s| *s == "exists") {
+                return "1".to_string();
+            }
+            String::new()
+        }
+        "destroy" | "focus" | "raise" | "lower" | "grab" | "selection" | "image" => {
+            // Window management commands — accept silently
+            String::new()
+        }
+        _ => {
+            tracing::trace!(cmd = cmd, "Tk.cmd (unhandled)");
+            String::new()
+        }
+    }
+}
+
+/// Handle .widget subcommands (configure, cget, etc.)
+fn dispatch_widget_cmd(parts: &[&str]) -> String {
+    let name = parts[0];
+    let subcmd = parts.get(1).copied().unwrap_or("");
+
+    match subcmd {
+        "configure" => {
+            // .name configure -opt val ...
+            WIDGET_PROPS.with(|props| {
+                let mut props = props.borrow_mut();
+                let entry = props.entry(name.to_string()).or_default();
+                let mut i = 2;
+                while i + 1 < parts.len() {
+                    let opt = parts[i].trim_start_matches('-');
+                    let val = parts[i + 1]
+                        .trim_matches('\'')
+                        .trim_matches('{')
+                        .trim_matches('}');
+                    entry.insert(opt.to_string(), val.to_string());
+                    i += 2;
+                }
+            });
+            #[cfg(feature = "gui")]
+            {
+                // Update widget in the widget tree if text changed
+                let text = find_option(parts, "-text");
+                let bg = find_option(parts, "-bg");
+                if text.is_some() || bg.is_some() {
+                    WIDGET_TREE.with(|tree| {
+                        let mut tree = tree.borrow_mut();
+                        if let Some(w) = tree.widgets.get_mut(name) {
+                            if let Some(t) = text {
+                                match &mut w.kind {
+                                    widgets::WidgetKind::Label { text } => *text = t,
+                                    widgets::WidgetKind::Button { text, .. } => *text = t,
+                                    _ => {}
+                                }
+                            }
+                            if let Some(b) = bg
+                                && let Some(c) = parse_hex_color(&b)
+                            {
+                                w.bg_color = c;
+                            }
+                            tree.needs_layout = true;
+                        }
+                    });
+                }
+            }
+            String::new()
+        }
+        "cget" => {
+            // .name cget -opt
+            if let Some(opt) = parts.get(2) {
+                let opt = opt.trim_start_matches('-');
+                WIDGET_PROPS.with(|props| {
+                    props
+                        .borrow()
+                        .get(name)
+                        .and_then(|p| p.get(opt))
+                        .cloned()
+                        .unwrap_or_default()
+                })
+            } else {
+                String::new()
+            }
+        }
+        _ => {
+            // Unknown widget command; not an error, just return empty
+            tracing::trace!(name, subcmd, "Tk widget cmd (unhandled)");
+            String::new()
+        }
+    }
+}
+
+/// Return the Tk widget class name (capitalized widget type).
+fn widget_class(_name: &str) -> String {
+    #[cfg(feature = "gui")]
+    {
+        WIDGET_TREE.with(|tree| {
+            let tree = tree.borrow();
+            if let Some(w) = tree.widgets.get(_name) {
+                match &w.kind {
+                    widgets::WidgetKind::Frame => "Frame".to_string(),
+                    widgets::WidgetKind::Label { .. } => "Label".to_string(),
+                    widgets::WidgetKind::Button { .. } => "Button".to_string(),
+                    widgets::WidgetKind::Entry { .. } => "Entry".to_string(),
+                    widgets::WidgetKind::Canvas { .. } => "Canvas".to_string(),
+                    widgets::WidgetKind::Text { .. } => "Text".to_string(),
+                }
+            } else {
+                format!("!widget {_name} not found")
+            }
+        })
+    }
+    #[cfg(not(feature = "gui"))]
+    {
+        format!("!widget {_name} not found")
+    }
+}
+
+/// Send a string value on a named Tk channel.
+fn send_to_named_channel(vm: &mut VmState<'_>, name: &str, value: &str) {
+    let chan_id = NAMED_CHANNELS.with(|nc| nc.borrow().get(name).copied());
+    if let Some(id) = chan_id {
+        let str_id = vm.heap.alloc(0, HeapData::Str(value.to_string()));
+        // Write the string pointer as the channel's pending payload
+        let mut payload = vec![0u8; 4];
+        memory::write_word(&mut payload, 0, str_id as i32);
+        if let Some(obj) = vm.heap.get_mut(id)
+            && let HeapData::Channel { pending, .. } = &mut obj.data
+        {
+            *pending = Some(payload);
+        }
+        // Unblock any thread waiting on this channel
+        vm.unblock_channel(id);
+    }
+}
+
+/// Simple shell-like splitting that handles {braces} and 'quotes'.
+fn shell_split(s: &str) -> Vec<&str> {
+    // For simplicity, just split on whitespace but track brace depth
+    let mut result = Vec::new();
+    let mut start = None;
+    let mut brace_depth = 0i32;
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => {
+                if brace_depth == 0 && start.is_none() {
+                    start = Some(i + 1);
+                }
+                brace_depth += 1;
+            }
+            b'}' => {
+                brace_depth -= 1;
+                if brace_depth == 0
+                    && let Some(st) = start
+                {
+                    result.push(&s[st..i]);
+                    start = None;
+                }
+            }
+            b' ' | b'\t' if brace_depth == 0 => {
+                if let Some(st) = start {
+                    result.push(&s[st..i]);
+                    start = None;
+                }
+            }
+            _ => {
+                if start.is_none() && brace_depth == 0 {
+                    start = Some(i);
+                }
+            }
+        }
+    }
+    if let Some(st) = start {
+        result.push(&s[st..]);
+    }
+    result
+}
+
+/// Find an option value in parts list, handling quotes and braces.
+fn find_option(parts: &[&str], opt: &str) -> Option<String> {
+    for i in 0..parts.len().saturating_sub(1) {
+        if parts[i] == opt {
+            return Some(
+                parts[i + 1]
+                    .trim_matches('\'')
+                    .trim_matches('{')
+                    .trim_matches('}')
+                    .to_string(),
+            );
+        }
+    }
+    None
+}
+
+/// Parse a hex color string like "#aaaaaa" or "#ff5500" to RGBA u32.
+fn parse_hex_color(s: &str) -> Option<u32> {
+    let s = s.strip_prefix('#')?;
+    if s.len() == 6 {
+        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+        Some(((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xFF)
+    } else {
+        None
+    }
 }
 
 /// Tk->namechan: register a named channel for Tk events.
 fn tk_namechan(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let _toplevel_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
-    let _chan_id = memory::read_word(&vm.frames.data, frame_base + 36) as HeapId;
+    let chan_id = memory::read_word(&vm.frames.data, frame_base + 36) as HeapId;
     let name_id = memory::read_word(&vm.frames.data, frame_base + 40) as HeapId;
-    let _name = vm.heap.get_string(name_id).unwrap_or("").to_string();
+    let name = vm.heap.get_string(name_id).unwrap_or("").to_string();
 
-    tracing::debug!(name = _name, "Tk.namechan");
+    tracing::debug!(name = name, chan_id = chan_id, "Tk.namechan");
+
+    // Store the channel mapping
+    NAMED_CHANNELS.with(|nc| {
+        nc.borrow_mut().insert(name, chan_id);
+    });
 
     // Return empty string (success)
     let result_id = vm.heap.alloc(0, HeapData::Str(String::new()));
@@ -310,6 +598,23 @@ pub(crate) mod widgets {
             self.needs_layout = true;
         }
 
+        pub fn reparent(&mut self, child: &str, new_parent: &str) {
+            // Remove from old parent's children list
+            let old_parent = parent_name(child);
+            if let Some(p) = self.widgets.get_mut(&old_parent) {
+                p.children.retain(|c| c != child);
+            } else {
+                self.root_children.retain(|c| c != child);
+            }
+            // Add to new parent's children list
+            if let Some(p) = self.widgets.get_mut(new_parent)
+                && !p.children.contains(&child.to_string())
+            {
+                p.children.push(child.to_string());
+            }
+            self.needs_layout = true;
+        }
+
         pub fn layout(&mut self, width: i32, height: i32) {
             layout_children(
                 &self.root_children.clone(),
@@ -335,6 +640,55 @@ pub(crate) mod widgets {
         }
     }
 
+    const CHAR_W: i32 = 8;
+    const CHAR_H: i32 = 16;
+    const PAD: i32 = 4;
+
+    /// Compute the natural (minimum) size of a widget based on its content.
+    fn natural_size(name: &str, widgets: &HashMap<String, Widget>) -> (i32, i32) {
+        let w = match widgets.get(name) {
+            Some(w) => w,
+            None => return (0, 0),
+        };
+        if !w.children.is_empty() {
+            // Frame: size is sum of children
+            let mut total_w = 0i32;
+            let mut total_h = 0i32;
+            for child in &w.children {
+                let (cw, ch) = natural_size(child, widgets);
+                let side = widgets
+                    .get(child)
+                    .map(|c| c.pack_side)
+                    .unwrap_or(PackSide::Top);
+                match side {
+                    PackSide::Top | PackSide::Bottom => {
+                        total_w = total_w.max(cw);
+                        total_h += ch;
+                    }
+                    PackSide::Left | PackSide::Right => {
+                        total_w += cw;
+                        total_h = total_h.max(ch);
+                    }
+                }
+            }
+            (total_w, total_h)
+        } else {
+            // Leaf widget: size from text content
+            let text_len = match &w.kind {
+                WidgetKind::Label { text } | WidgetKind::Button { text, .. } => text.len() as i32,
+                WidgetKind::Canvas { width, height } => return (*width, *height),
+                _ => 0,
+            };
+            let tw = text_len * CHAR_W + PAD * 2;
+            let th = if text_len > 0 {
+                CHAR_H + PAD * 2
+            } else {
+                CHAR_H
+            };
+            (tw.max(CHAR_W), th)
+        }
+    }
+
     fn layout_children(
         children: &[String],
         widgets: &mut HashMap<String, Widget>,
@@ -353,9 +707,15 @@ pub(crate) mod widgets {
                 continue;
             };
 
+            let (nat_w, nat_h) = natural_size(name, widgets);
+
             let (ww, hh) = match side {
-                PackSide::Top | PackSide::Bottom => (remaining_w, 24.min(remaining_h)),
-                PackSide::Left | PackSide::Right => (100.min(remaining_w), remaining_h),
+                PackSide::Top | PackSide::Bottom => {
+                    (remaining_w, nat_h.max(CHAR_H).min(remaining_h))
+                }
+                PackSide::Left | PackSide::Right => {
+                    (nat_w.max(CHAR_W).min(remaining_w), remaining_h)
+                }
             };
 
             if let Some(w) = widgets.get_mut(name) {
@@ -397,11 +757,11 @@ thread_local! {
 
 /// Process a Tk command string via SDL2.
 #[cfg(feature = "gui")]
-fn process_tk_cmd(vm: &mut VmState<'_>, cmd: &str) {
+fn process_tk_cmd(_vm: &mut VmState<'_>, cmd: &str) {
     use sdl2::pixels::Color;
     use sdl2::rect::Rect as SdlRect;
 
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let parts: Vec<&str> = shell_split(cmd);
     if parts.is_empty() {
         return;
     }
@@ -410,15 +770,18 @@ fn process_tk_cmd(vm: &mut VmState<'_>, cmd: &str) {
 
     match first {
         "update" => {
-            // Layout and render all widgets
+            // Ensure SDL2 window exists
+            super::draw::state::ensure_init("RiceVM", 400, 300);
+            // Layout and render all widgets; collect pending button commands
+            let mut pending_cmds: Vec<String> = Vec::new();
             WIDGET_TREE.with(|tree| {
                 let mut tree = tree.borrow_mut();
                 if tree.needs_layout {
-                    tree.layout(800, 600);
+                    tree.layout(400, 300);
                 }
                 super::draw::state::with(|opt_state| {
                     if let Some(state) = opt_state {
-                        state.canvas.set_draw_color(Color::RGB(0xDD, 0xDD, 0xDD));
+                        state.canvas.set_draw_color(Color::RGB(200, 200, 200));
                         state.canvas.clear();
                         for w in tree.widgets.values() {
                             let bg = inferno_to_sdl_color(w.bg_color);
@@ -431,41 +794,100 @@ fn process_tk_cmd(vm: &mut VmState<'_>, cmd: &str) {
                                 widgets::WidgetKind::Label { text }
                                 | widgets::WidgetKind::Button { text, .. } => {
                                     let fg = inferno_to_sdl_color(w.fg_color);
-                                    state.canvas.set_draw_color(fg);
-                                    // Monospace text approximation: 8px per char
-                                    for (i, _ch) in text.chars().enumerate() {
-                                        let cx = w.x + 4 + (i as i32) * 8;
-                                        let cy = w.y + 4;
-                                        let _ = state.canvas.fill_rect(SdlRect::new(cx, cy, 6, 12));
-                                    }
+                                    draw_text(&mut state.canvas, text, w.x + 4, w.y + 2, fg);
                                 }
-                                widgets::WidgetKind::Button { .. } => {
-                                    state.canvas.set_draw_color(Color::BLACK);
-                                    let _ = state
-                                        .canvas
-                                        .draw_rect(SdlRect::new(w.x, w.y, w.w as u32, w.h as u32));
+                                _ => {}
+                            }
+                            // Draw button border
+                            if matches!(&w.kind, widgets::WidgetKind::Button { .. }) {
+                                state.canvas.set_draw_color(Color::BLACK);
+                                let _ = state
+                                    .canvas
+                                    .draw_rect(SdlRect::new(w.x, w.y, w.w as u32, w.h as u32));
+                            }
+                        }
+                        state.canvas.present();
+                        // Poll events and dispatch to widgets
+                        for event in state.event_pump.poll_iter() {
+                            match event {
+                                sdl2::event::Event::Quit { .. } => {
+                                    std::process::exit(0);
+                                }
+                                sdl2::event::Event::MouseButtonDown { x, y, .. } => {
+                                    // Find which button was clicked
+                                    let clicked_cmd = tree
+                                        .widgets
+                                        .values()
+                                        .find(|w| {
+                                            matches!(&w.kind, widgets::WidgetKind::Button { .. })
+                                                && x >= w.x
+                                                && x < w.x + w.w
+                                                && y >= w.y
+                                                && y < w.y + w.h
+                                        })
+                                        .and_then(|w| {
+                                            if let widgets::WidgetKind::Button { command, .. } =
+                                                &w.kind
+                                            {
+                                                if !command.is_empty() {
+                                                    Some(command.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                    if let Some(cmd) = clicked_cmd {
+                                        pending_cmds.push(cmd);
+                                    }
                                 }
                                 _ => {}
                             }
                         }
-                        state.canvas.present();
                     }
                 });
             });
+            // Dispatch pending button commands (outside tree borrow)
+            for cmd in pending_cmds {
+                // Button commands are Tk send commands like "send wm_title exit"
+                let parts: Vec<&str> = shell_split(&cmd);
+                if parts.first().is_some_and(|s| *s == "send") {
+                    if let Some(chan_name) = parts.get(1) {
+                        let value = if parts.len() > 2 {
+                            parts[2..].join(" ")
+                        } else {
+                            String::new()
+                        };
+                        send_to_named_channel(_vm, chan_name, &value);
+                    }
+                }
+            }
         }
         "pack" => {
-            // pack .name -side top|bottom|left|right
-            if let Some(name) = parts.get(1) {
-                let side = parse_pack_side(&parts);
+            // pack .name1 .name2 ... -side top -in .parent
+            let side = parse_pack_side(&parts);
+            let parent = extract_option_str(&parts, "-in");
+            // Collect widget names (arguments before options)
+            for part in parts.iter().skip(1) {
+                if part.starts_with('-') {
+                    break;
+                }
+                let name = *part;
                 WIDGET_TREE.with(|tree| {
-                    tree.borrow_mut().pack(name, side);
+                    let mut tree = tree.borrow_mut();
+                    tree.pack(name, side);
+                    // Handle -in: re-parent the widget
+                    if let Some(ref parent_name) = parent {
+                        tree.reparent(name, parent_name);
+                    }
                 });
             }
         }
         "label" | "button" | "entry" | "text" | "canvas" | "frame" => {
             if let Some(name) = parts.get(1) {
-                let text = extract_option(&parts, "-text").unwrap_or_default();
-                let command = extract_option(&parts, "-command").unwrap_or_default();
+                let text = extract_option_str(&parts, "-text").unwrap_or_default();
+                let command = extract_option_str(&parts, "-command").unwrap_or_default();
                 let kind = match first {
                     "label" => widgets::WidgetKind::Label { text },
                     "button" => widgets::WidgetKind::Button { text, command },
@@ -480,13 +902,31 @@ fn process_tk_cmd(vm: &mut VmState<'_>, cmd: &str) {
                     _ => widgets::WidgetKind::Frame,
                 };
                 let bg = extract_color_option(&parts, "-bg");
+                let fg = extract_color_option(&parts, "-fg");
                 WIDGET_TREE.with(|tree| {
                     let mut tree = tree.borrow_mut();
                     tree.add_widget(name.to_string(), kind);
-                    if let Some(color) = bg
-                        && let Some(w) = tree.widgets.get_mut(*name)
-                    {
-                        w.bg_color = color;
+                    if let Some(w) = tree.widgets.get_mut(*name) {
+                        if let Some(color) = bg {
+                            w.bg_color = color;
+                        }
+                        if let Some(color) = fg {
+                            w.fg_color = color;
+                        }
+                    }
+                });
+                // Also store properties for cget
+                WIDGET_PROPS.with(|props| {
+                    let mut props = props.borrow_mut();
+                    let entry = props.entry(name.to_string()).or_default();
+                    if let Some(t) = extract_option_str(&parts, "-text") {
+                        entry.insert("text".to_string(), t);
+                    }
+                    if let Some(b) = extract_option_str(&parts, "-bg") {
+                        entry.insert("bg".to_string(), b);
+                    }
+                    if let Some(f) = extract_option_str(&parts, "-fg") {
+                        entry.insert("fg".to_string(), f);
                     }
                 });
             }
@@ -499,12 +939,347 @@ fn process_tk_cmd(vm: &mut VmState<'_>, cmd: &str) {
 
 #[cfg(feature = "gui")]
 fn inferno_to_sdl_color(c: u32) -> sdl2::pixels::Color {
-    sdl2::pixels::Color::RGBA(
+    // Inferno color format: 0xRRGGBBAA
+    sdl2::pixels::Color::RGB(
         ((c >> 24) & 0xFF) as u8,
         ((c >> 16) & 0xFF) as u8,
         ((c >> 8) & 0xFF) as u8,
-        (c & 0xFF) as u8,
     )
+}
+
+/// Draw a text string on the SDL2 canvas using a simple bitmap font.
+/// Each character is rendered as a 7x13 glyph using point-by-point drawing.
+#[cfg(feature = "gui")]
+fn draw_text(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    text: &str,
+    x: i32,
+    y: i32,
+    color: sdl2::pixels::Color,
+) {
+    canvas.set_draw_color(color);
+    let glyph_w = 8i32;
+    let glyph_h = 13i32;
+    for (i, ch) in text.chars().enumerate() {
+        let cx = x + (i as i32) * glyph_w;
+        if let Some(glyph) = bitmap_font::glyph(ch) {
+            for (row, &bits) in glyph.iter().enumerate() {
+                for col in 0..8u32 {
+                    if bits & (0x80 >> col) != 0 {
+                        let _ = canvas
+                            .draw_point(sdl2::rect::Point::new(cx + col as i32, y + row as i32));
+                    }
+                }
+            }
+        } else {
+            // Unknown character: draw a small box
+            let _ = canvas.draw_rect(sdl2::rect::Rect::new(cx, y + 1, 6, glyph_h as u32 - 2));
+        }
+    }
+}
+
+/// Embedded 8x13 bitmap font for printable ASCII (based on fixed/misc-fixed style).
+/// Each glyph is 13 bytes; each byte is one row where bit 7 = leftmost pixel.
+#[cfg(feature = "gui")]
+mod bitmap_font {
+    pub fn glyph(ch: char) -> Option<&'static [u8; 13]> {
+        let idx = ch as u32;
+        if (32..=126).contains(&idx) {
+            Some(&FONT[(idx - 32) as usize])
+        } else {
+            None
+        }
+    }
+
+    // Minimal 8x13 bitmap font for ASCII 32-126 (95 glyphs).
+    // Each glyph: 13 rows of 8 bits. Bit 7 = leftmost pixel.
+    static FONT: [[u8; 13]; 95] = [
+        [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // ' '
+        [
+            0x00, 0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00,
+        ], // '!'
+        [
+            0x00, 0x00, 0x24, 0x24, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // '"'
+        [
+            0x00, 0x00, 0x24, 0x24, 0x7E, 0x24, 0x7E, 0x24, 0x24, 0x00, 0x00, 0x00, 0x00,
+        ], // '#'
+        [
+            0x00, 0x00, 0x10, 0x3C, 0x50, 0x38, 0x14, 0x78, 0x10, 0x00, 0x00, 0x00, 0x00,
+        ], // '$'
+        [
+            0x00, 0x00, 0x22, 0x52, 0x24, 0x08, 0x10, 0x24, 0x4A, 0x44, 0x00, 0x00, 0x00,
+        ], // '%'
+        [
+            0x00, 0x00, 0x30, 0x48, 0x48, 0x30, 0x4A, 0x44, 0x3A, 0x00, 0x00, 0x00, 0x00,
+        ], // '&'
+        [
+            0x00, 0x00, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // '\''
+        [
+            0x00, 0x00, 0x08, 0x10, 0x20, 0x20, 0x20, 0x20, 0x10, 0x08, 0x00, 0x00, 0x00,
+        ], // '('
+        [
+            0x00, 0x00, 0x20, 0x10, 0x08, 0x08, 0x08, 0x08, 0x10, 0x20, 0x00, 0x00, 0x00,
+        ], // ')'
+        [
+            0x00, 0x00, 0x00, 0x10, 0x54, 0x38, 0x54, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // '*'
+        [
+            0x00, 0x00, 0x00, 0x10, 0x10, 0x7C, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // '+'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x10, 0x20, 0x00, 0x00,
+        ], // ','
+        [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // '-'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+        ], // '.'
+        [
+            0x00, 0x00, 0x04, 0x04, 0x08, 0x08, 0x10, 0x20, 0x40, 0x40, 0x00, 0x00, 0x00,
+        ], // '/'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x44, 0x44, 0x44, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // '0'
+        [
+            0x00, 0x00, 0x10, 0x30, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // '1'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x04, 0x08, 0x10, 0x20, 0x7C, 0x00, 0x00, 0x00, 0x00,
+        ], // '2'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x04, 0x18, 0x04, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // '3'
+        [
+            0x00, 0x00, 0x08, 0x18, 0x28, 0x48, 0x7C, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00,
+        ], // '4'
+        [
+            0x00, 0x00, 0x7C, 0x40, 0x78, 0x04, 0x04, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // '5'
+        [
+            0x00, 0x00, 0x18, 0x20, 0x40, 0x78, 0x44, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // '6'
+        [
+            0x00, 0x00, 0x7C, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00,
+        ], // '7'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x44, 0x38, 0x44, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // '8'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x44, 0x3C, 0x04, 0x08, 0x30, 0x00, 0x00, 0x00, 0x00,
+        ], // '9'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // ':'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x10, 0x10, 0x20, 0x00, 0x00, 0x00,
+        ], // ';'
+        [
+            0x00, 0x00, 0x04, 0x08, 0x10, 0x20, 0x10, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00,
+        ], // '<'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x7C, 0x00, 0x7C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // '='
+        [
+            0x00, 0x00, 0x20, 0x10, 0x08, 0x04, 0x08, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00,
+        ], // '>'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x04, 0x08, 0x10, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00,
+        ], // '?'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x4C, 0x54, 0x4C, 0x40, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // '@'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x44, 0x7C, 0x44, 0x44, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'A'
+        [
+            0x00, 0x00, 0x78, 0x44, 0x44, 0x78, 0x44, 0x44, 0x78, 0x00, 0x00, 0x00, 0x00,
+        ], // 'B'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x40, 0x40, 0x40, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'C'
+        [
+            0x00, 0x00, 0x78, 0x44, 0x44, 0x44, 0x44, 0x44, 0x78, 0x00, 0x00, 0x00, 0x00,
+        ], // 'D'
+        [
+            0x00, 0x00, 0x7C, 0x40, 0x40, 0x78, 0x40, 0x40, 0x7C, 0x00, 0x00, 0x00, 0x00,
+        ], // 'E'
+        [
+            0x00, 0x00, 0x7C, 0x40, 0x40, 0x78, 0x40, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00,
+        ], // 'F'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x40, 0x4C, 0x44, 0x44, 0x3C, 0x00, 0x00, 0x00, 0x00,
+        ], // 'G'
+        [
+            0x00, 0x00, 0x44, 0x44, 0x44, 0x7C, 0x44, 0x44, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'H'
+        [
+            0x00, 0x00, 0x38, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'I'
+        [
+            0x00, 0x00, 0x1C, 0x08, 0x08, 0x08, 0x08, 0x48, 0x30, 0x00, 0x00, 0x00, 0x00,
+        ], // 'J'
+        [
+            0x00, 0x00, 0x44, 0x48, 0x50, 0x60, 0x50, 0x48, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'K'
+        [
+            0x00, 0x00, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x7C, 0x00, 0x00, 0x00, 0x00,
+        ], // 'L'
+        [
+            0x00, 0x00, 0x44, 0x6C, 0x54, 0x54, 0x44, 0x44, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'M'
+        [
+            0x00, 0x00, 0x44, 0x64, 0x54, 0x4C, 0x44, 0x44, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'N'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x44, 0x44, 0x44, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'O'
+        [
+            0x00, 0x00, 0x78, 0x44, 0x44, 0x78, 0x40, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00,
+        ], // 'P'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x44, 0x44, 0x54, 0x48, 0x34, 0x00, 0x00, 0x00, 0x00,
+        ], // 'Q'
+        [
+            0x00, 0x00, 0x78, 0x44, 0x44, 0x78, 0x50, 0x48, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'R'
+        [
+            0x00, 0x00, 0x38, 0x44, 0x40, 0x38, 0x04, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'S'
+        [
+            0x00, 0x00, 0x7C, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00,
+        ], // 'T'
+        [
+            0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x44, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'U'
+        [
+            0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x28, 0x28, 0x10, 0x00, 0x00, 0x00, 0x00,
+        ], // 'V'
+        [
+            0x00, 0x00, 0x44, 0x44, 0x44, 0x54, 0x54, 0x6C, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'W'
+        [
+            0x00, 0x00, 0x44, 0x44, 0x28, 0x10, 0x28, 0x44, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'X'
+        [
+            0x00, 0x00, 0x44, 0x44, 0x28, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00,
+        ], // 'Y'
+        [
+            0x00, 0x00, 0x7C, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7C, 0x00, 0x00, 0x00, 0x00,
+        ], // 'Z'
+        [
+            0x00, 0x00, 0x38, 0x20, 0x20, 0x20, 0x20, 0x20, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // '['
+        [
+            0x00, 0x00, 0x40, 0x40, 0x20, 0x10, 0x08, 0x04, 0x04, 0x00, 0x00, 0x00, 0x00,
+        ], // '\\'
+        [
+            0x00, 0x00, 0x38, 0x08, 0x08, 0x08, 0x08, 0x08, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // ']'
+        [
+            0x00, 0x00, 0x10, 0x28, 0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // '^'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7C, 0x00, 0x00, 0x00,
+        ], // '_'
+        [
+            0x00, 0x00, 0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // '`'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x38, 0x04, 0x3C, 0x44, 0x3C, 0x00, 0x00, 0x00, 0x00,
+        ], // 'a'
+        [
+            0x00, 0x00, 0x40, 0x40, 0x78, 0x44, 0x44, 0x44, 0x78, 0x00, 0x00, 0x00, 0x00,
+        ], // 'b'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x38, 0x44, 0x40, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'c'
+        [
+            0x00, 0x00, 0x04, 0x04, 0x3C, 0x44, 0x44, 0x44, 0x3C, 0x00, 0x00, 0x00, 0x00,
+        ], // 'd'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x38, 0x44, 0x7C, 0x40, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'e'
+        [
+            0x00, 0x00, 0x18, 0x24, 0x20, 0x78, 0x20, 0x20, 0x20, 0x00, 0x00, 0x00, 0x00,
+        ], // 'f'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x3C, 0x44, 0x44, 0x3C, 0x04, 0x38, 0x00, 0x00, 0x00,
+        ], // 'g'
+        [
+            0x00, 0x00, 0x40, 0x40, 0x78, 0x44, 0x44, 0x44, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'h'
+        [
+            0x00, 0x00, 0x10, 0x00, 0x30, 0x10, 0x10, 0x10, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'i'
+        [
+            0x00, 0x00, 0x08, 0x00, 0x18, 0x08, 0x08, 0x08, 0x48, 0x30, 0x00, 0x00, 0x00,
+        ], // 'j'
+        [
+            0x00, 0x00, 0x40, 0x40, 0x48, 0x50, 0x60, 0x50, 0x48, 0x00, 0x00, 0x00, 0x00,
+        ], // 'k'
+        [
+            0x00, 0x00, 0x30, 0x10, 0x10, 0x10, 0x10, 0x10, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'l'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x68, 0x54, 0x54, 0x54, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'm'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x78, 0x44, 0x44, 0x44, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'n'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x38, 0x44, 0x44, 0x44, 0x38, 0x00, 0x00, 0x00, 0x00,
+        ], // 'o'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x78, 0x44, 0x44, 0x78, 0x40, 0x40, 0x00, 0x00, 0x00,
+        ], // 'p'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x3C, 0x44, 0x44, 0x3C, 0x04, 0x04, 0x00, 0x00, 0x00,
+        ], // 'q'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x58, 0x64, 0x40, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00,
+        ], // 'r'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x3C, 0x40, 0x38, 0x04, 0x78, 0x00, 0x00, 0x00, 0x00,
+        ], // 's'
+        [
+            0x00, 0x00, 0x20, 0x20, 0x78, 0x20, 0x20, 0x24, 0x18, 0x00, 0x00, 0x00, 0x00,
+        ], // 't'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x44, 0x44, 0x44, 0x44, 0x3C, 0x00, 0x00, 0x00, 0x00,
+        ], // 'u'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x44, 0x44, 0x44, 0x28, 0x10, 0x00, 0x00, 0x00, 0x00,
+        ], // 'v'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x44, 0x54, 0x54, 0x54, 0x28, 0x00, 0x00, 0x00, 0x00,
+        ], // 'w'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x44, 0x28, 0x10, 0x28, 0x44, 0x00, 0x00, 0x00, 0x00,
+        ], // 'x'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x44, 0x44, 0x44, 0x3C, 0x04, 0x38, 0x00, 0x00, 0x00,
+        ], // 'y'
+        [
+            0x00, 0x00, 0x00, 0x00, 0x7C, 0x08, 0x10, 0x20, 0x7C, 0x00, 0x00, 0x00, 0x00,
+        ], // 'z'
+        [
+            0x00, 0x00, 0x0C, 0x10, 0x10, 0x20, 0x10, 0x10, 0x0C, 0x00, 0x00, 0x00, 0x00,
+        ], // '{'
+        [
+            0x00, 0x00, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00,
+        ], // '|'
+        [
+            0x00, 0x00, 0x60, 0x10, 0x10, 0x08, 0x10, 0x10, 0x60, 0x00, 0x00, 0x00, 0x00,
+        ], // '}'
+        [
+            0x00, 0x00, 0x24, 0x54, 0x48, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ], // '~'
+    ];
 }
 
 #[cfg(feature = "gui")]
@@ -522,15 +1297,14 @@ fn parse_pack_side(parts: &[&str]) -> widgets::PackSide {
     widgets::PackSide::Top
 }
 
-#[cfg(feature = "gui")]
-fn extract_option(parts: &[&str], opt: &str) -> Option<String> {
+/// Extract a string option value from parts, handling braces and quotes.
+fn extract_option_str(parts: &[&str], opt: &str) -> Option<String> {
     for i in 0..parts.len().saturating_sub(1) {
         if parts[i] == opt {
             return Some(
                 parts[i + 1]
                     .trim_matches('"')
-                    .trim_matches('{')
-                    .trim_matches('}')
+                    .trim_matches('\'')
                     .to_string(),
             );
         }
@@ -540,19 +1314,20 @@ fn extract_option(parts: &[&str], opt: &str) -> Option<String> {
 
 #[cfg(feature = "gui")]
 fn extract_int_option(parts: &[&str], opt: &str) -> Option<i32> {
-    extract_option(parts, opt)?.parse().ok()
+    extract_option_str(parts, opt)?.parse().ok()
 }
 
 #[cfg(feature = "gui")]
 fn extract_color_option(parts: &[&str], opt: &str) -> Option<u32> {
-    let val = extract_option(parts, opt)?;
+    let val = extract_option_str(parts, opt)?;
     match val.as_str() {
         "white" => Some(0xFFFFFFFF),
         "black" => Some(0x000000FF),
         "red" => Some(0xFF0000FF),
         "green" => Some(0x00FF00FF),
         "blue" => Some(0x0000FFFF),
+        "yellow" => Some(0xFFFF00FF),
         "gray" | "grey" => Some(0xBBBBBBFF),
-        _ => None,
+        _ => parse_hex_color(&val),
     }
 }

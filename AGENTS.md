@@ -36,8 +36,8 @@ Priorities, in order:
 
 - `crates/ricevm-core/`: Shared types (Module, Opcode, Instruction, TypeDescriptor, and errors). No runtime logic.
 - `crates/ricevm-loader/`: Binary format parser for `.dis` module files. One public function: `load(&[u8]) -> Result<Module, LoadError>`.
-- `crates/ricevm-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, $Crypt, and audio), and
-  file-based module loading.
+- `crates/ricevm-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, $Keyring, $Crypt, and audio),
+  virtual device files, and file-based module loading.
 - `crates/ricevm-cli/`: CLI with `run` and `dis` subcommands.
 - `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
   `libinterp/xec.c` for correctness validation).
@@ -68,12 +68,12 @@ ricevm-cli
 | `address.rs`   | Operand resolution with `ModuleMp` virtual ranges and `decode_virtual_addr`            |
 | `memory.rs`    | Typed read/write on byte buffers with bounds checking                                  |
 | `data.rs`      | Module data (MP) initialization with type-aware elem sizes and nested arrays           |
-| `filetab.rs`   | Portable file descriptor table with in-memory pipe support                             |
+| `filetab.rs`   | Portable file descriptor table with in-memory pipe, virtual device files, and non-blocking stdin |
 | `ops/`         | 176 instruction handlers organized by category                                         |
 | `sys.rs`       | Built-in `$Sys` module (43 functions with tuple return support, `%b`, `%u`, and `%.*`) |
 | `math.rs`      | Built-in `$Math` module (66 functions including linear algebra)                        |
 | `draw.rs`      | Built-in `$Draw` module (SDL2 backend, optional `gui` feature)                         |
-| `tk.rs`        | Built-in `$Tk` module (widget toolkit stubs)                                           |
+| `tk.rs`        | Built-in `$Tk` module (widget toolkit with embedded bitmap font and SDL2 rendering)    |
 | `audio.rs`     | `/dev/audio` and `/dev/audioctl` support (cpal backend, optional `audio` feature)      |
 | `builtin.rs`   | `ModuleRegistry` for built-in module registration with name and signature lookup       |
 | `scheduler.rs` | Preemptive thread scheduler infrastructure (not yet connected to main loop)            |
@@ -85,7 +85,10 @@ ricevm-cli
 - The heap uses `HashMap<u32, HeapObject>` with monotonic IDs starting at `HEAP_ID_BASE` (0x0100_0000);
   pointers stored as `Word` (i32) in frames.
 - Array element references use a `heap_refs` table with `HEAP_REF_FLAG` sentinel, resolved during double-indirect addressing.
-- `ArraySlice` heap type provides shared-storage views into parent arrays (required for Bufio buffer semantics).
+- `ArraySlice` heap type provides shared-storage views into parent arrays (required for Bufio buffer semantics);
+  all operations (`cvtac`, `slicela`, `pread`, `pwrite`, channel send/recv) resolve slices to their parent.
+- `slicela` adjusts reference counts for pointer-containing elements (e.g., `array of string`) to prevent
+  premature freeing during operations like mergesort.
 - Unified virtual address space: frame addresses are low, each module's MP has a unique range starting at
   `MP_BASE` (0x0080_0000) with `MP_STRIDE` (0x0010_0000) between modules, heap IDs above `HEAP_ID_BASE`.
   The `decode_virtual_addr()` function decodes addresses back to `AddrTarget`.
@@ -108,7 +111,14 @@ ricevm-cli
   both directions unblock on state change. Cloned MP adjusts heap ref counts.
 - Alt table format: `{nsend, nrecv}` header followed by 8-byte `{channel_ptr, data_ptr}` entries.
 - Per-thread error string (`last_error`) implements the `werrstr`/`%r` mechanism.
-- Portable I/O via `FileTable` (no `libc` dependency) with in-memory pipe support.
+- Portable I/O via `FileTable` (no `libc` dependency) with in-memory pipe support and non-blocking stdin
+  (background reader thread prevents `sys->read` from freezing all VM threads).
+- Virtual device files: `/dev/sysctl`, `/dev/sysname`, `/dev/user`, `/dev/time`, `/dev/cons`, `/dev/null`,
+  `/dev/random`, `/dev/drivers`, `/prog/N/{status,wait,ns,ctl}`, and `/env/*`.
+- `$Keyring` module provides real MD5 and SHA1 digests via the `md-5` and `sha1` crates;
+  auth functions (`readauthinfo`, `auth`, etc.) are stubs returning nil.
+- Nil dereferences (channel, array, string, list) are caught in the run loop and dispatched to
+  exception handler tables, matching the reference Dis VM behavior.
 - Library modules with `entry_pc = -1` return success immediately (no init function).
 - SDL2 for GUI is behind an optional `gui` feature flag.
 - Audio support (`/dev/audio` and `/dev/audioctl`) is behind an optional `audio` feature flag (cpal backend).
@@ -148,7 +158,7 @@ Run `make lint` and `make test` for any change. Key targets:
 - Integration tests for the loader live in `crates/ricevm-loader/tests/`.
 - Pipeline tests (loader to executor) live in `crates/ricevm-cli/tests/`, including tests with real Inferno `.dis` files.
 - Property-based tests cover arithmetic commutativity/associativity, string slice bounds, and conversion roundtrips.
-- Regression tests exist for every major bug fix (movmp, casew, slicea, channel blocking, spawn, etc.).
+- Regression tests exist for every major bug fix (movmp, casew, slicea, slicela ref counting, cvtac ArraySlice, byte2char, channel blocking, spawn, etc.).
 - Fuzz testing for the loader is set up in `crates/ricevm-loader/fuzz/`.
 - No public API change is complete without a corresponding test.
 - The Limbo compiler (`external/inferno-os/dis/limbo.dis`) can compile and run programs as an end-to-end validation:

@@ -58,10 +58,10 @@ pub(crate) fn op_indx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
     let index = raw_index as usize;
 
-    let obj = vm
-        .heap
-        .get(arr_id)
-        .ok_or_else(|| ExecError::ThreadFault("nil array dereference".to_string()))?;
+    let obj = match vm.heap.get(arr_id) {
+        Some(o) => o,
+        None => return vm.raise_exception("nil dereference"),
+    };
 
     match &obj.data {
         crate::heap::HeapData::Array {
@@ -231,7 +231,7 @@ pub(crate) fn op_slicela(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 
     // Read src array data (resolving ArraySlice to parent).
-    let (src_data, src_len, elem_size) = {
+    let (src_data, src_len, elem_size, _elem_type) = {
         let obj = vm
             .heap
             .get(src_id)
@@ -241,22 +241,23 @@ pub(crate) fn op_slicela(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 data,
                 length,
                 elem_size,
-                ..
-            } => (data.clone(), *length, *elem_size),
+                elem_type,
+            } => (data.clone(), *length, *elem_size, *elem_type),
             heap::HeapData::ArraySlice {
                 parent_id,
                 byte_start,
                 elem_size,
                 length,
-                ..
+                elem_type,
             } => {
                 let pid = *parent_id;
                 let bs = *byte_start;
                 let es = *elem_size;
                 let len = *length;
+                let et = *elem_type;
                 let byte_len = len * es;
                 let data = vm.heap.array_read(pid, bs, byte_len).unwrap_or_default();
-                (data, len, es)
+                (data, len, es, et)
             }
             _ => {
                 return Err(ExecError::ThreadFault(
@@ -266,11 +267,57 @@ pub(crate) fn op_slicela(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         }
     };
 
-    // Write into dst array.
-    if let Some(obj) = vm.heap.get_mut(dst_id)
+    // Resolve dst: if it's an ArraySlice, redirect write to the parent array.
+    let (real_dst_id, dst_byte_offset) = {
+        if let Some(obj) = vm.heap.get(dst_id) {
+            match &obj.data {
+                heap::HeapData::ArraySlice {
+                    parent_id,
+                    byte_start,
+                    ..
+                } => (*parent_id, *byte_start),
+                _ => (dst_id, 0),
+            }
+        } else {
+            (dst_id, 0)
+        }
+    };
+
+    // For pointer-sized elements, collect old dst values before overwrite
+    // so we can adjust reference counts (inc new, dec old).
+    let mut old_ptrs = Vec::new();
+    let mut new_ptrs = Vec::new();
+    if elem_size == 4 {
+        let copy_start = dst_byte_offset + insert_pos * elem_size;
+        if let Some(obj) = vm.heap.get(real_dst_id)
+            && let heap::HeapData::Array { data, .. } = &obj.data
+        {
+            for i in 0..src_len {
+                let off = copy_start + i * 4;
+                if off + 4 <= data.len() {
+                    let id = crate::memory::read_word(data, off) as u32;
+                    if id != heap::NIL && vm.heap.contains(id) {
+                        old_ptrs.push(id);
+                    }
+                }
+            }
+        }
+        for i in 0..src_len {
+            let off = i * 4;
+            if off + 4 <= src_data.len() {
+                let id = crate::memory::read_word(&src_data, off) as u32;
+                if id != heap::NIL && vm.heap.contains(id) {
+                    new_ptrs.push(id);
+                }
+            }
+        }
+    }
+
+    // Write into dst array (now always the root Array).
+    if let Some(obj) = vm.heap.get_mut(real_dst_id)
         && let heap::HeapData::Array { data, length, .. } = &mut obj.data
     {
-        let copy_start = insert_pos * elem_size;
+        let copy_start = dst_byte_offset + insert_pos * elem_size;
         let copy_bytes = src_len * elem_size;
         let needed = copy_start + copy_bytes;
         if needed > data.len() {
@@ -278,7 +325,18 @@ pub(crate) fn op_slicela(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         }
         data[copy_start..copy_start + copy_bytes]
             .copy_from_slice(&src_data[..copy_bytes.min(src_data.len())]);
-        *length = (insert_pos + src_len).max(*length);
+        // Only update root length when writing directly to root (not through a slice).
+        if dst_byte_offset == 0 {
+            *length = (insert_pos + src_len).max(*length);
+        }
+    }
+
+    // Adjust ref counts: inc new pointers, dec old ones.
+    for id in &new_ptrs {
+        vm.heap.inc_ref(*id);
+    }
+    for id in &old_ptrs {
+        vm.heap.dec_ref(*id);
     }
 
     Ok(())

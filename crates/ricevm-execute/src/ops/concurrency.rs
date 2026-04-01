@@ -375,16 +375,15 @@ fn write_addr_bytes(
         AddrTarget::Immediate => Err(ExecError::Other("cannot write to immediate".to_string())),
         AddrTarget::None => Ok(()),
         AddrTarget::HeapArray { id, offset } => {
-            if let Some(obj) = vm.heap.get_mut(id) {
-                match &mut obj.data {
-                    HeapData::Array { data: buf, .. } | HeapData::Record(buf) => {
-                        if offset < buf.len() {
-                            let copy_len = data.len().min(buf.len() - offset);
-                            buf[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
-                        }
-                    }
-                    _ => {}
-                }
+            // Try array_write first (handles Array and ArraySlice)
+            vm.heap.array_write(id, offset, data);
+            // Also handle Record objects
+            if let Some(obj) = vm.heap.get_mut(id)
+                && let HeapData::Record(buf) = &mut obj.data
+                && offset < buf.len()
+            {
+                let copy_len = data.len().min(buf.len() - offset);
+                buf[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
             }
             Ok(())
         }
@@ -515,7 +514,10 @@ fn execute_alt(vm: &mut VmState<'_>, select_first_if_none: bool) -> Result<AltOu
 /// src = data to send, dst = channel pointer.
 pub(crate) fn op_send(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let chan_id = vm.dst_ptr()?;
-    let (elem_size, pending) = channel_ref(vm, chan_id)?;
+    let (elem_size, pending) = match channel_ref(vm, chan_id) {
+        Ok(v) => v,
+        Err(_) => return vm.raise_exception("nil dereference"),
+    };
 
     if pending.is_some() {
         // Channel full: signal the run loop to block this thread
@@ -537,7 +539,10 @@ pub(crate) fn op_send(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// src = channel pointer, dst = destination for received data.
 pub(crate) fn op_recv(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let chan_id = vm.src_ptr()?;
-    let (_elem_size, pending) = channel_ref(vm, chan_id)?;
+    let (_elem_size, pending) = match channel_ref(vm, chan_id) {
+        Ok(v) => v,
+        Err(_) => return vm.raise_exception("nil dereference"),
+    };
 
     if let Some(data) = pending {
         // Channel has data:consume it

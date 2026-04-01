@@ -69,6 +69,7 @@ poetry.lock
 
 # Rust specific
 /target/
+/.cargo/
 .cargo-ok
 cobertura.xml
 tarpaulin-report.html

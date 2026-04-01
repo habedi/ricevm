@@ -53,8 +53,7 @@ impl DrawState {
             .map_err(|e| e.to_string())?;
         let canvas = window
             .into_canvas()
-            .accelerated()
-            .present_vsync()
+            .software()
             .build()
             .map_err(|e| e.to_string())?;
         let event_pump = sdl_context.event_pump()?;
@@ -603,6 +602,17 @@ pub(crate) mod state {
 
     pub fn set(s: DrawState) {
         DRAW.with(|d| *d.borrow_mut() = Some(s));
+    }
+
+    /// Ensure SDL2 is initialized, creating a default window if needed.
+    pub fn ensure_init(title: &str, width: u32, height: u32) {
+        DRAW.with(|d| {
+            if d.borrow().is_none() {
+                if let Ok(ds) = DrawState::new(title, width, height) {
+                    *d.borrow_mut() = Some(ds);
+                }
+            }
+        });
     }
 
     pub fn with<F, R>(f: F) -> R

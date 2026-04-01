@@ -16,6 +16,7 @@ audio = ["ricevm_execute/audio"]
 ricevm_core.workspace = true
 ricevm_loader.workspace = true
 ricevm_execute.workspace = true
+ricevm_limbo = { path = "../ricevm-limbo", package = "ricevm-limbo" }
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true

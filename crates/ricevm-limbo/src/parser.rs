@@ -163,10 +163,7 @@ impl Parser {
             }
         }
 
-        Err(self.err(format!(
-            "unexpected token at top level: {:?}",
-            self.peek()
-        )))
+        Err(self.err(format!("unexpected token at top level: {:?}", self.peek())))
     }
 
     /// Determine what follows an identifier at the top level.
@@ -177,13 +174,21 @@ impl Parser {
             match &self.tokens[i].kind {
                 TokenKind::Dot => {
                     i += 1; // skip dot
-                    if i < self.tokens.len()
-                        && matches!(self.tokens[i].kind, TokenKind::Ident(_))
-                    {
+                    if i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Ident(_)) {
                         i += 1; // skip ident after dot
                     }
                 }
                 TokenKind::LParen => return LookAhead::FuncDef,
+                TokenKind::LBracket => {
+                    // Skip polymorphic params: name[T1, T2]
+                    i += 1;
+                    while i < self.tokens.len() && self.tokens[i].kind != TokenKind::RBracket {
+                        i += 1;
+                    }
+                    if i < self.tokens.len() {
+                        i += 1;
+                    } // skip ]
+                }
                 TokenKind::Colon => return LookAhead::ColonDecl,
                 TokenKind::Comma => return LookAhead::ColonDecl,
                 TokenKind::Assign => return LookAhead::Assign,
@@ -242,6 +247,27 @@ impl Parser {
             }
             TokenKind::Adt => {
                 self.advance();
+                // Skip optional polymorphic type parameters: [T1, T2]
+                if self.at(&TokenKind::LBracket) {
+                    self.advance();
+                    while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
+                        self.advance();
+                    }
+                    if self.at(&TokenKind::RBracket) {
+                        self.advance();
+                    }
+                }
+                // Skip optional 'for { ... }' clause
+                if self.at(&TokenKind::For) {
+                    self.advance();
+                    self.expect(&TokenKind::LBrace)?;
+                    while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+                        self.advance();
+                    }
+                    if self.at(&TokenKind::RBrace) {
+                        self.advance();
+                    }
+                }
                 self.expect(&TokenKind::LBrace)?;
                 let (members, pick) = self.parse_adt_members()?;
                 self.expect(&TokenKind::RBrace)?;
@@ -505,10 +531,7 @@ impl Parser {
         if let TokenKind::Ident(_) = self.peek() {
             let next = self.pos + 1;
             if next < self.tokens.len() {
-                matches!(
-                    self.tokens[next].kind,
-                    TokenKind::Comma | TokenKind::Colon
-                )
+                matches!(self.tokens[next].kind, TokenKind::Comma | TokenKind::Colon)
             } else {
                 false
             }
@@ -546,11 +569,32 @@ impl Parser {
         let mut qualifier = None;
         let mut name = self.expect_ident()?;
 
+        // Skip optional polymorphic params: func[T1, T2]
+        if self.at(&TokenKind::LBracket) {
+            self.advance();
+            while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
+                self.advance();
+            }
+            if self.at(&TokenKind::RBracket) {
+                self.advance();
+            }
+        }
+
         // Qualified name: A.B(
         while self.at(&TokenKind::Dot) {
             self.advance();
             qualifier = Some(name);
             name = self.expect_ident()?;
+            // Skip polymorphic params after qualifier
+            if self.at(&TokenKind::LBracket) {
+                self.advance();
+                while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
+                    self.advance();
+                }
+                if self.at(&TokenKind::RBracket) {
+                    self.advance();
+                }
+            }
         }
 
         let sig = self.parse_func_sig(name.clone())?;
@@ -571,10 +615,36 @@ impl Parser {
         // Could start with 'fn' keyword or directly with '('
         if self.at(&TokenKind::Fn) {
             self.advance();
+            // Skip optional polymorphic params after fn keyword
+            if self.at(&TokenKind::LBracket) {
+                self.advance();
+                while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
+                    self.advance();
+                }
+                if self.at(&TokenKind::RBracket) {
+                    self.advance();
+                }
+            }
         }
 
         self.expect(&TokenKind::LParen)?;
-        let params = self.parse_params()?;
+        let params = if self.at(&TokenKind::Star) {
+            self.advance(); // varargs: fn(*)
+            Vec::new()
+        } else {
+            let p = self.parse_params()?;
+            // Skip trailing varargs: , *
+            if self.at(&TokenKind::Comma) {
+                let saved = self.pos;
+                self.advance();
+                if self.at(&TokenKind::Star) {
+                    self.advance(); // consume *
+                } else {
+                    self.pos = saved; // restore
+                }
+            }
+            p
+        };
         self.expect(&TokenKind::RParen)?;
 
         let ret = if self.at(&TokenKind::Colon) {
@@ -583,6 +653,37 @@ impl Parser {
         } else {
             None
         };
+
+        // Skip optional 'raises (exceptions)' or 'raises ExcName' clause
+        if self.at(&TokenKind::Raise) || matches!(self.peek(), TokenKind::Ident(n) if n == "raises")
+        {
+            self.advance();
+            if self.at(&TokenKind::LParen) {
+                self.advance();
+                while !self.at(&TokenKind::RParen) && !self.at(&TokenKind::Eof) {
+                    self.advance();
+                }
+                if self.at(&TokenKind::RParen) {
+                    self.advance();
+                }
+            } else if let TokenKind::Ident(_) = self.peek() {
+                self.advance(); // consume exception name
+            }
+        }
+
+        // Skip optional 'for { ... }' polymorphic clause
+        if self.at(&TokenKind::For) {
+            self.advance();
+            if self.at(&TokenKind::LBrace) {
+                self.advance();
+                while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+                    self.advance();
+                }
+                if self.at(&TokenKind::RBrace) {
+                    self.advance();
+                }
+            }
+        }
 
         Ok(FuncSig {
             name,
@@ -606,6 +707,12 @@ impl Parser {
                 false
             };
 
+            // Check for varargs: *, in param list
+            if self.at(&TokenKind::Star) {
+                self.advance();
+                break; // varargs ends the param list
+            }
+
             // Parse parameter names
             let mut names = Vec::new();
             let is_nil = self.at(&TokenKind::Nil);
@@ -615,9 +722,7 @@ impl Parser {
             } else {
                 names.push(self.expect_ident()?);
             }
-            while self.at(&TokenKind::Comma)
-                && !self.is_param_type_next()
-            {
+            while self.at(&TokenKind::Comma) && !self.is_param_type_next() {
                 self.advance();
                 if self.at(&TokenKind::Nil) {
                     self.advance();
@@ -751,8 +856,18 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
-                // Check for Module->Type
-                if self.at(&TokenKind::Arrow) {
+                // Skip optional polymorphic params: Type[T1, T2]
+                if self.at(&TokenKind::LBracket) {
+                    self.advance();
+                    while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
+                        self.advance();
+                    }
+                    if self.at(&TokenKind::RBracket) {
+                        self.advance();
+                    }
+                }
+                // Check for Module->Type or Type.SubType
+                if self.at(&TokenKind::Arrow) || self.at(&TokenKind::Dot) {
                     self.advance();
                     let member = self.expect_ident()?;
                     Type::Named(QualName {
@@ -804,26 +919,9 @@ impl Parser {
                     if let TokenKind::Ident(_) = self.peek() {
                         self.advance();
                     }
-                    // Parse exception handler body as a case-like block
+                    // Parse exception handler body: { pattern => stmts; ... }
                     self.expect(&TokenKind::LBrace)?;
-                    while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
-                        // Skip to => then parse statements
-                        while !self.at(&TokenKind::FatArrow)
-                            && !self.at(&TokenKind::RBrace)
-                            && !self.at(&TokenKind::Eof)
-                        {
-                            self.advance();
-                        }
-                        if self.at(&TokenKind::FatArrow) {
-                            self.advance();
-                        }
-                        while !self.at(&TokenKind::RBrace)
-                            && !self.at(&TokenKind::Eof)
-                            && !self.is_case_pattern_start()
-                        {
-                            self.parse_stmt()?; // consume handler body
-                        }
-                    }
+                    self.parse_exception_body()?;
                     self.expect(&TokenKind::RBrace)?;
                 }
                 Ok(Stmt::Block(block))
@@ -930,33 +1028,23 @@ impl Parser {
                 Ok(Stmt::Empty)
             }
             TokenKind::Exception => {
-                // Exception handler block (standalone): exception [id] { ... }
                 self.advance();
                 if let TokenKind::Ident(_) = self.peek() {
                     self.advance();
                 }
                 self.expect(&TokenKind::LBrace)?;
-                while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
-                    while !self.at(&TokenKind::FatArrow)
-                        && !self.at(&TokenKind::RBrace)
-                        && !self.at(&TokenKind::Eof)
-                    {
-                        self.advance();
-                    }
-                    if self.at(&TokenKind::FatArrow) {
-                        self.advance();
-                    }
-                    while !self.at(&TokenKind::RBrace)
-                        && !self.at(&TokenKind::Eof)
-                        && !self.is_case_pattern_start()
-                    {
-                        self.parse_stmt()?;
-                    }
-                }
+                self.parse_exception_body()?;
                 self.expect(&TokenKind::RBrace)?;
-                Ok(Stmt::Empty) // exception handler consumed
+                Ok(Stmt::Empty)
             }
             _ => {
+                // Check for label: name: stmt (where stmt is for/while/case/alt/etc.)
+                if self.is_label() {
+                    let label = self.expect_ident()?;
+                    self.expect(&TokenKind::Colon)?;
+                    let stmt = self.parse_stmt()?;
+                    return Ok(Stmt::Label(label, Box::new(stmt)));
+                }
                 // Check for local variable declaration: name: type [= expr];
                 // or local import: Name: import module;
                 if self.is_local_var_decl() {
@@ -979,20 +1067,134 @@ impl Parser {
         }
     }
 
+    /// Parse the body of an exception handler block: `pattern => stmts; ...`
+    fn parse_exception_body(&mut self) -> Result<(), ParseError> {
+        while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+            // Parse pattern: string literal, "*", or identifier, possibly with "or"
+            let mut depth = 0;
+            loop {
+                match self.peek() {
+                    TokenKind::FatArrow if depth == 0 => {
+                        self.advance();
+                        break;
+                    }
+                    TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => {
+                        depth += 1;
+                        self.advance();
+                    }
+                    TokenKind::RParen | TokenKind::RBracket => {
+                        depth -= 1;
+                        self.advance();
+                    }
+                    TokenKind::RBrace => {
+                        if depth > 0 {
+                            depth -= 1;
+                            self.advance();
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                    TokenKind::Eof => return Ok(()),
+                    _ => {
+                        self.advance();
+                    }
+                }
+            }
+            // Parse handler body statements until next pattern or closing brace
+            while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+                // Check if next tokens form a new pattern (string/ident/star followed by =>)
+                if self.is_exception_pattern_start() {
+                    break;
+                }
+                self.parse_stmt()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Check if the current position starts an exception pattern.
+    fn is_exception_pattern_start(&self) -> bool {
+        // Patterns: "string", *, identifier — all followed eventually by =>
+        match self.peek() {
+            TokenKind::Star => return true,
+            TokenKind::StringLit(_) | TokenKind::Ident(_) => {}
+            _ => return false,
+        }
+        // Look ahead for => (possibly through "or" separators)
+        let mut i = self.pos + 1;
+        while i < self.tokens.len() {
+            match &self.tokens[i].kind {
+                TokenKind::FatArrow => return true,
+                TokenKind::Or => {
+                    i += 1;
+                } // skip 'or' separator
+                TokenKind::StringLit(_) | TokenKind::Ident(_) | TokenKind::Star => {
+                    i += 1;
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Check if the current position is a label: `name: stmt`
+    fn is_label(&self) -> bool {
+        if !matches!(self.peek(), TokenKind::Ident(_)) {
+            return false;
+        }
+        let i = self.pos + 1;
+        if i >= self.tokens.len() || self.tokens[i].kind != TokenKind::Colon {
+            return false;
+        }
+        if i + 1 >= self.tokens.len() {
+            return false;
+        }
+        matches!(
+            self.tokens[i + 1].kind,
+            TokenKind::For
+                | TokenKind::While
+                | TokenKind::Do
+                | TokenKind::Case
+                | TokenKind::Alt
+                | TokenKind::Pick
+                | TokenKind::LBrace
+        )
+    }
+
     /// Check if the current position starts a local variable declaration:
     /// `name [, name]* : type [= expr] ;`
+    /// Must distinguish from labels (`name: stmt`) and expressions (`name(args)`).
     fn is_local_var_decl(&self) -> bool {
         if !matches!(self.peek(), TokenKind::Ident(_)) {
             return false;
         }
         let mut i = self.pos + 1;
+        // Single ident + colon: check for label (name: followed by statement keyword)
+        if i < self.tokens.len()
+            && self.tokens[i].kind == TokenKind::Colon
+            && i + 1 < self.tokens.len()
+        {
+            let after = &self.tokens[i + 1].kind;
+            if matches!(
+                after,
+                TokenKind::For
+                    | TokenKind::While
+                    | TokenKind::Do
+                    | TokenKind::Case
+                    | TokenKind::Alt
+                    | TokenKind::Pick
+                    | TokenKind::LBrace
+                    | TokenKind::Semicolon
+            ) {
+                return false; // it's a label
+            }
+        }
         // Skip comma-separated names
         while i < self.tokens.len() {
             match &self.tokens[i].kind {
                 TokenKind::Comma => {
                     i += 1;
-                    if i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Ident(_))
-                    {
+                    if i < self.tokens.len() && matches!(self.tokens[i].kind, TokenKind::Ident(_)) {
                         i += 1;
                     }
                 }
@@ -1157,11 +1359,25 @@ impl Parser {
             let patterns = self.parse_case_patterns()?;
             self.expect(&TokenKind::FatArrow)?;
             let mut body = Vec::new();
-            while !self.at(&TokenKind::RBrace)
-                && !self.at(&TokenKind::Eof)
-                && !self.is_case_pattern_start()
-            {
-                body.push(self.parse_stmt()?);
+            loop {
+                if self.at(&TokenKind::RBrace) || self.at(&TokenKind::Eof) {
+                    break;
+                }
+                if self.is_case_pattern_start() {
+                    break;
+                }
+                match self.parse_stmt() {
+                    Ok(s) => body.push(s),
+                    Err(_) => {
+                        while !self.at(&TokenKind::RBrace)
+                            && !self.at(&TokenKind::Eof)
+                            && !self.is_case_pattern_start()
+                        {
+                            self.advance();
+                        }
+                        break;
+                    }
+                }
             }
             arms.push(CaseArm { patterns, body });
         }
@@ -1194,25 +1410,74 @@ impl Parser {
     }
 
     fn is_case_pattern_start(&self) -> bool {
-        // A case pattern starts with an expression or *
-        // followed eventually by =>
         if self.at(&TokenKind::Star) {
             return true;
         }
-        // Look ahead for => after expressions
+        // Patterns must start with an expression token, not a statement/block token
+        if matches!(
+            self.peek(),
+            TokenKind::LBrace
+                | TokenKind::If
+                | TokenKind::For
+                | TokenKind::While
+                | TokenKind::Do
+                | TokenKind::Return
+                | TokenKind::Break
+                | TokenKind::Continue
+                | TokenKind::Exit
+                | TokenKind::Spawn
+                | TokenKind::Raise
+                | TokenKind::Alt
+                | TokenKind::Pick
+                | TokenKind::Case
+                | TokenKind::Semicolon
+        ) {
+            return false;
+        }
+        // Fast path: single-token pattern followed by =>
+        if self.pos + 1 < self.tokens.len()
+            && matches!(self.tokens[self.pos + 1].kind, TokenKind::FatArrow)
+        {
+            return true;
+        }
         let mut depth = 0;
         let mut i = self.pos;
-        while i < self.tokens.len() {
+        let limit = (self.pos + 60).min(self.tokens.len()); // limit lookahead
+        while i < limit {
             match &self.tokens[i].kind {
                 TokenKind::FatArrow if depth == 0 => return true,
                 TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
-                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => {
+                TokenKind::RParen | TokenKind::RBracket => {
                     if depth == 0 {
                         return false;
                     }
                     depth -= 1;
                 }
+                TokenKind::RBrace => {
+                    if depth < 1 {
+                        return false;
+                    } // at case level, stop
+                    depth -= 1;
+                }
                 TokenKind::Semicolon if depth == 0 => return false,
+                // Statement keywords at depth 0 mean this isn't a pattern
+                TokenKind::If
+                | TokenKind::For
+                | TokenKind::While
+                | TokenKind::Do
+                | TokenKind::Case
+                | TokenKind::Return
+                | TokenKind::Break
+                | TokenKind::Continue
+                | TokenKind::Exit
+                | TokenKind::Spawn
+                | TokenKind::Raise
+                | TokenKind::Alt
+                | TokenKind::Pick
+                    if depth == 0 =>
+                {
+                    return false;
+                }
                 _ => {}
             }
             i += 1;
@@ -1229,16 +1494,20 @@ impl Parser {
                 self.advance();
                 AltGuard::Wildcard
             } else {
-                // Parse: var := <-chan or chan <-= val
+                // Parse guard: expr [or expr]* =>
+                // Consume everything until => at depth 0
                 let expr = self.parse_expr()?;
-                AltGuard::Recv(None, expr) // simplified
+                while self.at(&TokenKind::Or) {
+                    self.advance();
+                    let _ = self.parse_expr()?; // consume alternative guard
+                }
+                AltGuard::Recv(None, expr)
             };
             self.expect(&TokenKind::FatArrow)?;
             let mut body = Vec::new();
             while !self.at(&TokenKind::RBrace)
                 && !self.at(&TokenKind::Eof)
-                && !self.is_case_pattern_start()
-                && !self.at(&TokenKind::Star)
+                && !self.is_alt_guard_start()
             {
                 body.push(self.parse_stmt()?);
             }
@@ -1246,6 +1515,23 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(Stmt::Alt(AltStmt { arms, span }))
+    }
+
+    fn is_alt_guard_start(&self) -> bool {
+        if self.at(&TokenKind::Star) {
+            return true;
+        }
+        // Look for => within a limited range, not crossing { or ;
+        let mut i = self.pos;
+        let limit = (self.pos + 30).min(self.tokens.len());
+        while i < limit {
+            match &self.tokens[i].kind {
+                TokenKind::FatArrow => return true,
+                TokenKind::Semicolon | TokenKind::LBrace | TokenKind::RBrace => return false,
+                _ => i += 1,
+            }
+        }
+        false
     }
 
     // ── Expressions (Pratt parser) ─────────────────────────────
@@ -1362,17 +1648,15 @@ impl Parser {
                                     Expr::Ident(n, _) => names.push(n.clone()),
                                     Expr::Nil(_) => names.push("nil".to_string()),
                                     _ => {
-                                        return Err(self.err(
-                                            "tuple := elements must be identifiers",
-                                        ))
+                                        return Err(
+                                            self.err("tuple := elements must be identifiers")
+                                        );
                                     }
                                 }
                             }
                             lhs = Expr::TupleDeclAssign(names, Box::new(rhs), span);
                         } else {
-                            return Err(self.err(
-                                "left side of := must be identifier or tuple",
-                            ));
+                            return Err(self.err("left side of := must be identifier or tuple"));
                         }
                     }
                 }
@@ -1458,9 +1742,14 @@ impl Parser {
                 self.parse_expr_bp(14)
             }
             TokenKind::Star => {
-                // Wildcard: used in array initializers `* => expr`
+                // Dereference: *expr
                 self.advance();
-                Ok(Expr::Ident("*".to_string(), span))
+                // Check if this is a wildcard in initializer context (followed by =>)
+                if self.at(&TokenKind::FatArrow) {
+                    return Ok(Expr::Ident("*".to_string(), span));
+                }
+                let expr = self.parse_expr_bp(14)?;
+                Ok(Expr::Unary(UnaryOp::Ref, Box::new(expr), span)) // deref uses Ref variant for now
             }
             TokenKind::Minus => {
                 self.advance();
@@ -1548,7 +1837,11 @@ impl Parser {
                     let ty = self.parse_type()?;
                     // array of type monexp (cast)
                     let expr = self.parse_expr_bp(14)?;
-                    Ok(Expr::Cast(Box::new(Type::Array(Box::new(ty))), Box::new(expr), span))
+                    Ok(Expr::Cast(
+                        Box::new(Type::Array(Box::new(ty))),
+                        Box::new(expr),
+                        span,
+                    ))
                 }
             }
             TokenKind::Chan => {
@@ -1606,13 +1899,69 @@ impl Parser {
                 }
             }
             // Type cast: int expr, string expr, etc.
-            TokenKind::Int | TokenKind::Byte | TokenKind::Big | TokenKind::Real | TokenKind::String_ => {
+            TokenKind::Int
+            | TokenKind::Byte
+            | TokenKind::Big
+            | TokenKind::Real
+            | TokenKind::String_ => {
                 let ty = self.parse_type()?;
+                // If next token is ] or , or ) or => — this is a type expression, not a cast
+                if matches!(
+                    self.peek(),
+                    TokenKind::RBracket
+                        | TokenKind::Comma
+                        | TokenKind::RParen
+                        | TokenKind::FatArrow
+                        | TokenKind::Semicolon
+                        | TokenKind::RBrace
+                ) {
+                    // Treat as type name in expression context (e.g., array index with type)
+                    return Ok(Expr::Ident(format!("{ty:?}"), span));
+                }
                 let expr = self.parse_expr_bp(14)?;
                 Ok(Expr::Cast(Box::new(ty), Box::new(expr), span))
             }
+            TokenKind::LBrace => {
+                // Recovery: skip balanced braces in expression context
+                self.advance();
+                let mut depth = 1;
+                while depth > 0 && !self.at(&TokenKind::Eof) {
+                    if self.at(&TokenKind::LBrace) {
+                        depth += 1;
+                    } else if self.at(&TokenKind::RBrace) {
+                        depth -= 1;
+                    }
+                    self.advance();
+                }
+                Ok(Expr::Nil(span))
+            }
             _ => Err(self.err(format!("unexpected token in expression: {:?}", self.peek()))),
         }
+    }
+
+    /// Parse an expression that may be a qualified initializer:
+    /// `qual => expr`, `qual to qual => expr`, `qual or qual => expr`
+    fn parse_init_expr(&mut self) -> Result<Expr, ParseError> {
+        let expr = self.parse_expr()?;
+        // Check for qualifier patterns
+        if self.at(&TokenKind::FatArrow) || self.at(&TokenKind::To) || self.at(&TokenKind::Or) {
+            // Skip all qualifier parts until we hit =>
+            loop {
+                if self.at(&TokenKind::FatArrow) {
+                    self.advance();
+                    return self.parse_expr();
+                } else if self.at(&TokenKind::Or) {
+                    self.advance();
+                    let _ = self.parse_expr()?; // consume next qual
+                } else if self.at(&TokenKind::To) {
+                    self.advance();
+                    let _ = self.parse_expr()?; // consume range end
+                } else {
+                    break;
+                }
+            }
+        }
+        Ok(expr)
     }
 
     fn parse_expr_list(&mut self) -> Result<Vec<Expr>, ParseError> {
@@ -1623,7 +1972,7 @@ impl Parser {
         {
             return Ok(exprs);
         }
-        exprs.push(self.parse_expr()?);
+        exprs.push(self.parse_init_expr()?);
         while self.at(&TokenKind::Comma) {
             self.advance();
             if self.at(&TokenKind::RParen)
@@ -1632,7 +1981,7 @@ impl Parser {
             {
                 break;
             }
-            exprs.push(self.parse_expr()?);
+            exprs.push(self.parse_init_expr()?);
         }
         Ok(exprs)
     }

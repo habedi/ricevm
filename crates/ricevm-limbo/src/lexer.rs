@@ -122,6 +122,11 @@ impl<'src> Lexer<'src> {
         let span = self.span();
         let ch = self.peek();
 
+        // Float literal starting with '.' (e.g., .000001)
+        if ch == b'.' && self.peek2().is_ascii_digit() {
+            return self.lex_dot_number(span);
+        }
+
         // Identifiers and keywords
         if ch.is_ascii_alphabetic() || ch == b'_' {
             return self.lex_ident(span);
@@ -158,6 +163,30 @@ impl<'src> Lexer<'src> {
 
         let kind = TokenKind::keyword(word).unwrap_or_else(|| TokenKind::Ident(word.to_string()));
         Ok(Token { kind, span })
+    }
+
+    fn lex_dot_number(&mut self, span: Span) -> Result<Token, LexError> {
+        let start = self.pos;
+        self.advance(); // skip '.'
+        while self.pos < self.src.len() && self.peek().is_ascii_digit() {
+            self.advance();
+        }
+        if self.peek() == b'e' || self.peek() == b'E' {
+            self.advance();
+            if self.peek() == b'+' || self.peek() == b'-' {
+                self.advance();
+            }
+            while self.pos < self.src.len() && self.peek().is_ascii_digit() {
+                self.advance();
+            }
+        }
+        let text = std::str::from_utf8(&self.src[start..self.pos])
+            .map_err(|_| self.err("invalid float"))?;
+        let val: f64 = text.parse().map_err(|e| self.err(format!("{e}")))?;
+        Ok(Token {
+            kind: TokenKind::RealLit(val),
+            span,
+        })
     }
 
     fn lex_number(&mut self, span: Span) -> Result<Token, LexError> {
@@ -198,17 +227,16 @@ impl<'src> Lexer<'src> {
             }
             let digits = std::str::from_utf8(&self.src[digits_start..self.pos])
                 .map_err(|_| self.err("invalid radix digits"))?;
-            let val =
-                i64::from_str_radix(digits, radix).map_err(|e| self.err(format!("{e}")))?;
+            let val = i64::from_str_radix(digits, radix).map_err(|e| self.err(format!("{e}")))?;
             return Ok(Token {
                 kind: TokenKind::IntLit(val),
                 span,
             });
         }
 
-        // Check for float: digits.digits or digits.digitsE... or digits E...
+        // Check for float: digits.digits, digits., digits.digitsE..., digits E...
         let mut is_float = false;
-        if self.peek() == b'.' && self.peek2().is_ascii_digit() {
+        if self.peek() == b'.' && !self.peek2().is_ascii_alphabetic() && self.peek2() != b'.' {
             is_float = true;
             self.advance(); // skip '.'
             while self.pos < self.src.len() && self.peek().is_ascii_digit() {

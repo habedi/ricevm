@@ -38,7 +38,9 @@ Priorities, in order:
 - `crates/ricevm-loader/`: Binary format parser for `.dis` module files. One public function: `load(&[u8]) -> Result<Module, LoadError>`.
 - `crates/ricevm-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, $Keyring, $Crypt, and audio),
   virtual device files, and file-based module loading.
-- `crates/ricevm-cli/`: CLI with `run` and `dis` subcommands.
+- `crates/ricevm-limbo/`: Built-in Limbo compiler. Lexer, parser, code generator, and .dis binary writer.
+  Compiles Limbo source to Dis bytecode end-to-end without depending on the reference limbo.dis compiler in the Inferno OS.
+- `crates/ricevm-cli/`: CLI with `run`, `dis`, and `compile` subcommands.
 - `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
   `libinterp/xec.c` for correctness validation).
 - `Makefile`: GNU Make wrapper around `cargo` commands (`make test`, `make build`, `make lint`, etc.).
@@ -143,14 +145,15 @@ Always compare against these files when fixing instruction correctness issues.
 
 Run `make lint` and `make test` for any change. Key targets:
 
-| Target   | Command         | What It Runs                                                                    |
-|----------|-----------------|---------------------------------------------------------------------------------|
-| Format   | `make format`   | `cargo fmt`                                                                     |
-| Lint     | `make lint`     | `cargo clippy` with `-D warnings -D clippy::unwrap_used -D clippy::expect_used` |
-| Test     | `make test`     | All workspace tests with `--nocapture`                                          |
-| Build    | `make build`    | Release build                                                                   |
-| Coverage | `make coverage` | `cargo tarpaulin` with XML and HTML output                                      |
-| Audit    | `make audit`    | `cargo audit` on dependencies                                                   |
+| Target      | Command            | What It Runs                                                                    |
+|-------------|---------------------|---------------------------------------------------------------------------------|
+| Format      | `make format`       | `cargo fmt`                                                                     |
+| Lint        | `make lint`         | `cargo clippy` with `-D warnings -D clippy::unwrap_used -D clippy::expect_used` |
+| Test        | `make test`         | All workspace tests with `--nocapture`                                          |
+| Test Limbo  | `make test-limbo`   | Built-in vs reference compiler correctness and coverage                         |
+| Build       | `make build`        | Release build                                                                   |
+| Coverage    | `make coverage`     | `cargo tarpaulin` with XML and HTML output                                      |
+| Audit       | `make audit`        | `cargo audit` on dependencies                                                   |
 
 ## Testing Expectations
 
@@ -161,13 +164,13 @@ Run `make lint` and `make test` for any change. Key targets:
 - Regression tests exist for every major bug fix (movmp, casew, slicea, slicela ref counting, cvtac ArraySlice, byte2char, channel blocking, spawn, etc.).
 - Fuzz testing for the loader is set up in `crates/ricevm-loader/fuzz/`.
 - No public API change is complete without a corresponding test.
-- The Limbo compiler (`external/inferno-os/dis/limbo.dis`) can compile and run programs as an end-to-end validation:
+- The built-in Limbo compiler can compile and run programs:
   ```
-  ricevm-cli run external/inferno-os/dis/limbo.dis \
-      --probe external/inferno-os/dis --probe external/inferno-os/dis/lib \
-      -- -I external/inferno-os/module hello.b
+  ricevm-cli compile hello.b
   ricevm-cli run hello.dis --probe external/inferno-os/dis
   ```
+- `make test-limbo` compiles programs with both the built-in and reference compilers, runs both outputs on RiceVM, and
+  compares results. Phase 1 checks correctness (11 tests), Phase 2 checks compilation coverage (159 Inferno programs).
 
 ## Commit and PR Hygiene
 

@@ -10,3 +10,6 @@ description = "The Limbo programming language compiler for RiceVM"
 [dependencies]
 ricevm_core.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+ricevm_loader.workspace = true

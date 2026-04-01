@@ -105,21 +105,21 @@ pub enum TokenKind {
     StarEq,     // *=
     SlashEq,    // /=
     PercentEq,  // %=
-    AmpEq,     // &=
-    PipeEq,    // |=
-    CaretEq,   // ^=
-    LshiftEq,  // <<=
-    RshiftEq,  // >>=
+    AmpEq,      // &=
+    PipeEq,     // |=
+    CaretEq,    // ^=
+    LshiftEq,   // <<=
+    RshiftEq,   // >>=
     Inc,        // ++
     Dec,        // --
 
     // Delimiters
-    LParen,    // (
-    RParen,    // )
-    LBracket,  // [
-    RBracket,  // ]
-    LBrace,    // {
-    RBrace,    // }
+    LParen,   // (
+    RParen,   // )
+    LBracket, // [
+    RBracket, // ]
+    LBrace,   // {
+    RBrace,   // }
 
     // Punctuation
     Comma,     // ,

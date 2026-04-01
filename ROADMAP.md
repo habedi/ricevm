@@ -160,6 +160,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Argument parsing via `clap`
 - [x] Tracing and logging setup via `tracing-subscriber`
 - [x] `run` subcommand to execute a `.dis` module file
+- [x] `compile` subcommand to compile Limbo `.b` source to `.dis` bytecode
 - [x] `dis` subcommand for human-readable disassembly
 - [x] `--probe` flag to add module probing paths
 - [x] `--root` flag for Inferno root path mapping
@@ -182,7 +183,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Cargo workspace with modular crate structure
 - [x] CI pipeline with automated tests
 - [x] Dual license (MIT and Apache 2.0)
-- [x] 203 tests total:
+- [x] 233 tests total:
     - Unit tests for instruction decoding and execution
     - Property-based tests for arithmetic (commutativity, associativity, and identity)
     - Property-based tests for string operations (slicec bounds, addc associativity)
@@ -193,7 +194,35 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Fuzz testing setup for the module loader (`cargo-fuzz` with `libfuzzer`)
 - [x] 866 pre-compiled `.dis` files available via `external/inferno-os` submodule
 - [x] `make lint` passes (clippy with `-D warnings -D clippy::unwrap_used -D clippy::expect_used`)
-- [x] `make test` passes (203 tests, 0 failures)
+- [x] `make test` passes (233 tests, 0 failures)
+
+### Built-in Limbo Compiler (`ricevm-limbo` crate)
+
+- [x] Lexer: all 48 Limbo keywords, operators, string/char/number/real literals with trailing and leading dots (~680 lines)
+- [x] Parser: recursive descent with Pratt expression parsing; 159/159 (100%) Inferno cmd/ programs parse (~2200 lines)
+- [x] Polymorphic type parameters (`Type[T]`, `func[T]`, `adt[T]`), `raises` clauses, varargs `fn(args, *)`
+- [x] Dereference operator (`*expr`), `Type.SubType` qualified types, exception handler blocks
+- [x] AST: complete type definitions for all Limbo language constructs (395 lines)
+- [x] Code generator: if/else, while, for, do-while, case, all arithmetic/comparison/logic operators (~1300 lines)
+- [x] String operations: concatenation (Addc with chaining), comparison (Beqc/Bnec), indexing (Indc), assignment (Insc), length (Lenc)
+- [x] List operations: hd (Headp), tl (Tail), cons (Consp), nil comparison, list literals
+- [x] Array operations: creation (Newa), byte conversion (Cvtca), length (Lena), slicing (Slicea), slice assignment (Slicela)
+- [x] Channel operations: creation (Newcw), send (Send), receive (Recv)
+- [x] Thread creation: spawn with correct per-function frame type descriptors
+- [x] Multiple functions per module with local calls (Frame + Call) and return values through return pointer
+- [x] Module loading: $Sys and generic modules via Load instruction
+- [x] Ref ADT allocation (New) and field access (double-indirect read and write)
+- [x] Type conversions: int, big, real, string, array casts (Cvtwl, Cvtwf, Cvtwc, Cvtcw, Cvtac, Cvtca)
+- [x] Real and big literal support (Movf, Movl from 8-byte-aligned data section)
+- [x] Include file processing: reads .m module interface files, extracts types, constants, and function signatures
+- [x] Symbol table with type resolution and constant evaluation
+- [x] .dis binary writer: complete format with operand encoding, handler tables, and null terminators
+- [x] CLI integration: `ricevm-cli compile source.b [-o output.dis] [-I include_path]`
+- [x] `make test-limbo`: 11 correctness tests (built-in vs reference compiler output comparison)
+- [x] 155/159 Inferno programs compile with both built-in and reference compilers (100% reference coverage)
+- [ ] Full type checker (validation, not just inference)
+- [ ] Alt statement codegen
+- [ ] Exception handler block codegen
 
 ### Documentation
 

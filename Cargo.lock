@@ -734,6 +734,7 @@ dependencies = [
  "colored",
  "ricevm-core",
  "ricevm-execute",
+ "ricevm-limbo",
  "ricevm-loader",
  "tracing",
  "tracing-subscriber",
@@ -768,6 +769,7 @@ name = "ricevm-limbo"
 version = "0.1.0-alpha.1"
 dependencies = [
  "ricevm-core",
+ "ricevm-loader",
  "thiserror 2.0.18",
 ]
 

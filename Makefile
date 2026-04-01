@@ -1,5 +1,5 @@
 # Variables
-BINARY_NAME := ricevm
+BINARY_NAME := ricevm-cli
 BINARY := target/release/$(BINARY_NAME)
 PATH := /snap/bin:$(PATH)
 DEBUG_PROJ := 0
@@ -113,6 +113,11 @@ testdata: ## Download the datasets used in tests
 nextest: ## Run tests using nextest
 	@echo "Running tests using nextest..."
 	@DEBUG_PROJ=$(DEBUG_PROJ) RUST_BACKTRACE=$(RUST_BACKTRACE) cargo nextest run
+
+.PHONY: test-limbo
+test-limbo: build ## Compile Limbo programs with both reference and built-in compilers, and compare outputs
+	@echo "Testing Limbo compiler correctness..."
+	@$(SHELL) scripts/test-limbo.sh
 
 .PHONY: setup-hooks
 setup-hooks: ## Install Git hooks (pre-commit and pre-push)

@@ -47,6 +47,17 @@ enum Command {
         /// Path to the .dis module file
         path: PathBuf,
     },
+    /// Compile a Limbo source file (.b) to Dis bytecode (.dis)
+    Compile {
+        /// Path to the Limbo source file (.b)
+        path: PathBuf,
+        /// Output .dis file path (default: input with .dis extension)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Include search paths for .m module interface files
+        #[arg(short = 'I', long = "include")]
+        include_paths: Vec<PathBuf>,
+    },
     /// Debug a .dis module file interactively
     Debug {
         /// Path to the .dis module file
@@ -154,6 +165,65 @@ fn run(cli: Cli) -> i32 {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("{}: {}", "error".red().bold(), e);
+                    1
+                }
+            }
+        }
+        Command::Compile {
+            path,
+            output,
+            include_paths,
+        } => {
+            let src = match fs::read_to_string(&path) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "{} cannot read {}: {e}",
+                        "error:".red().bold(),
+                        path.display()
+                    );
+                    return 2;
+                }
+            };
+            let filename = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("input.b");
+            let opts = ricevm_limbo::CompileOptions {
+                include_paths: include_paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect(),
+            };
+            let start = Instant::now();
+            match ricevm_limbo::compile_with_options(&src, filename, &opts) {
+                Ok(module) => {
+                    let bytes = ricevm_limbo::writer::write_dis(&module);
+                    let out_path = output.unwrap_or_else(|| path.with_extension("dis"));
+                    match fs::write(&out_path, &bytes) {
+                        Ok(()) => {
+                            let elapsed = start.elapsed();
+                            eprintln!(
+                                "{} {} ({} bytes, {:.2}s)",
+                                "✓".green().bold(),
+                                out_path.display(),
+                                bytes.len(),
+                                elapsed.as_secs_f64()
+                            );
+                            0
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "{} cannot write {}: {e}",
+                                "error:".red().bold(),
+                                out_path.display()
+                            );
+                            2
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{} {e}", "error:".red().bold());
                     1
                 }
             }

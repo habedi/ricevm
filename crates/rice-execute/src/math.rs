@@ -671,7 +671,11 @@ fn math_iamax(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let result = x
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|(_, a), (_, b)| {
+            a.abs()
+                .partial_cmp(&b.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|(i, _)| i as i32)
         .unwrap_or(0);
     memory::write_word(&mut vm.frames.data, base, result);

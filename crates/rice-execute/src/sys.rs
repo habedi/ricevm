@@ -30,6 +30,32 @@ fn write_ptr(data: &mut [u8], offset: usize, id: HeapId) {
     memory::write_word(data, offset, id as i32);
 }
 
+/// Read the return-value pointer stored at frame_base+16 and write a word
+/// through it at the given byte offset within the caller's return area.
+/// This is required for tuple returns: the callee must write each tuple
+/// field directly into the caller's frame via the ret pointer.
+fn write_ret_word(vm: &mut VmState<'_>, frame_base: usize, field_offset: usize, val: i32) {
+    let ret_ptr = memory::read_word(&vm.frames.data, frame_base + 16);
+    if ret_ptr != 0 {
+        let target = crate::address::decode_virtual_addr(ret_ptr, 0);
+        match target {
+            crate::address::AddrTarget::Frame(off) => {
+                memory::write_word(&mut vm.frames.data, off + field_offset, val);
+            }
+            crate::address::AddrTarget::Mp(off) => {
+                if off + field_offset + 4 <= vm.mp.len() {
+                    memory::write_word(&mut vm.mp, off + field_offset, val);
+                }
+            }
+            _ => {}
+        }
+    }
+    // Also write at frame_base for compatibility with mcall single-word copy
+    if field_offset == 0 {
+        memory::write_word(&mut vm.frames.data, frame_base, val);
+    }
+}
+
 /// Format a printf-style string with arguments from the frame.
 fn format_string(
     vm: &VmState<'_>,
@@ -60,10 +86,22 @@ fn format_string(
         let mut space_sign = false;
         while let Some(&fc) = chars.peek() {
             match fc {
-                '-' => { left_align = true; chars.next(); }
-                '0' => { zero_pad = true; chars.next(); }
-                '+' => { plus_sign = true; chars.next(); }
-                ' ' => { space_sign = true; chars.next(); }
+                '-' => {
+                    left_align = true;
+                    chars.next();
+                }
+                '0' => {
+                    zero_pad = true;
+                    chars.next();
+                }
+                '+' => {
+                    plus_sign = true;
+                    chars.next();
+                }
+                ' ' => {
+                    space_sign = true;
+                    chars.next();
+                }
                 _ => break,
             }
         }
@@ -106,8 +144,7 @@ fn format_string(
                 format!("{:<width$}", s, width = w)
             } else if zero_pad {
                 // For zero-padding, handle negative numbers specially
-                if s.starts_with('-') {
-                    let digits = &s[1..];
+                if let Some(digits) = s.strip_prefix('-') {
                     format!("-{:0>width$}", digits, width = w - 1)
                 } else {
                     format!("{:0>width$}", s, width = w)
@@ -127,7 +164,11 @@ fn format_string(
                     "<nil>".to_string()
                 };
                 let s = if let Some(prec) = precision {
-                    if prec < s.len() { s[..prec].to_string() } else { s }
+                    if prec < s.len() {
+                        s[..prec].to_string()
+                    } else {
+                        s
+                    }
                 } else {
                     s
                 };
@@ -140,7 +181,11 @@ fn format_string(
                     // Precision for integers means minimum digits
                     let abs_s = format!("{}", val.unsigned_abs());
                     let padded = format!("{:0>width$}", abs_s, width = prec);
-                    if val < 0 { format!("-{padded}") } else { padded }
+                    if val < 0 {
+                        format!("-{padded}")
+                    } else {
+                        padded
+                    }
                 } else {
                     val.to_string()
                 };
@@ -430,10 +475,7 @@ fn sys_write(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
 
     let fd_num = get_fd_num(vm, fd_id);
-    let bytes: Vec<u8> = vm
-        .heap
-        .array_read(buf_id, 0, count)
-        .unwrap_or_default();
+    let bytes: Vec<u8> = vm.heap.array_read(buf_id, 0, count).unwrap_or_default();
 
     let n = match vm.files.write(fd_num, &bytes) {
         Ok(n) => n as i32,
@@ -451,7 +493,9 @@ fn sys_pread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
     let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
-    let offset = memory::read_big(&vm.frames.data, frame_base + ARG_START + 12);
+    // big (8 bytes) is aligned to 8-byte boundary: fd(4)+buf(4)+n(4)=offset 44,
+    // aligned up to 48 = ARG_START + 16
+    let offset = memory::read_big(&vm.frames.data, frame_base + ARG_START + 16);
     let fd_num = get_fd_num(vm, fd_id);
 
     let original_pos = match vm.files.seek(fd_num, 0, 1) {
@@ -488,7 +532,9 @@ fn sys_pwrite(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
     let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
-    let offset = memory::read_big(&vm.frames.data, frame_base + ARG_START + 12);
+    // big (8 bytes) is aligned to 8-byte boundary: fd(4)+buf(4)+n(4)=offset 44,
+    // aligned up to 48 = ARG_START + 16
+    let offset = memory::read_big(&vm.frames.data, frame_base + ARG_START + 16);
     let fd_num = get_fd_num(vm, fd_id);
 
     let original_pos = match vm.files.seek(fd_num, 0, 1) {
@@ -536,8 +582,11 @@ fn sys_fd2path(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let fd_num = get_fd_num(vm, fd_id);
-    // Portable: return a placeholder since we can't resolve fd→path without OS-specific APIs
-    let result = format!("/fd/{fd_num}");
+    // Use the file table's stored path when available, fall back to placeholder
+    let result = match vm.files.get_path(fd_num) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => format!("/fd/{fd_num}"),
+    };
     let str_id = vm.heap.alloc(0, HeapData::Str(result));
     write_ptr(&mut vm.frames.data, frame_base, str_id);
     Ok(())
@@ -615,9 +664,9 @@ fn sys_tokenize(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         );
     }
 
-    // Return (count, list) — count at offset 0, list at offset 4
-    memory::write_word(&mut vm.frames.data, frame_base, count);
-    write_ptr(&mut vm.frames.data, frame_base + 4, list_id);
+    // Return (count, list) — write through ret pointer into caller's frame
+    write_ret_word(vm, frame_base, 0, count);
+    write_ret_word(vm, frame_base, 4, list_id as i32);
     Ok(())
 }
 
@@ -626,38 +675,37 @@ fn sys_byte2char(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let n = memory::read_word(&vm.frames.data, frame_base + ARG_START + 4) as usize;
 
-    let (char_val, bytes_consumed, status) =
-        if let Some(data) = vm.heap.array_read(buf_id, 0, n) {
-            match std::str::from_utf8(&data) {
-                Ok(s) => {
+    let (char_val, bytes_consumed, status) = if let Some(data) = vm.heap.array_read(buf_id, 0, n) {
+        match std::str::from_utf8(&data) {
+            Ok(s) => {
+                if let Some(ch) = s.chars().next() {
+                    (ch as i32, ch.len_utf8() as i32, 0)
+                } else {
+                    (0, 0, -1)
+                }
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                if valid > 0 {
+                    let s = std::str::from_utf8(&data[..valid]).unwrap_or("");
                     if let Some(ch) = s.chars().next() {
                         (ch as i32, ch.len_utf8() as i32, 0)
                     } else {
-                        (0, 0, -1)
+                        (0xFFFD, 1, 0)
                     }
-                }
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    if valid > 0 {
-                        let s = std::str::from_utf8(&data[..valid]).unwrap_or("");
-                        if let Some(ch) = s.chars().next() {
-                            (ch as i32, ch.len_utf8() as i32, 0)
-                        } else {
-                            (0xFFFD, 1, 0)
-                        }
-                    } else {
-                        (0xFFFD, 1, 0) // replacement character
-                    }
+                } else {
+                    (0xFFFD, 1, 0) // replacement character
                 }
             }
-        } else {
-            (0, 0, -1)
-        };
+        }
+    } else {
+        (0, 0, -1)
+    };
 
-    // Return (char, bytes_consumed, status)
-    memory::write_word(&mut vm.frames.data, frame_base, char_val);
-    memory::write_word(&mut vm.frames.data, frame_base + 4, bytes_consumed);
-    memory::write_word(&mut vm.frames.data, frame_base + 8, status);
+    // Return (char, bytes_consumed, status) — write through ret pointer
+    write_ret_word(vm, frame_base, 0, char_val);
+    write_ret_word(vm, frame_base, 4, bytes_consumed);
+    write_ret_word(vm, frame_base, 8, status);
     Ok(())
 }
 
@@ -672,8 +720,7 @@ fn sys_char2byte(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let encoded = ch.encode_utf8(&mut utf8_buf);
     let bytes_written = encoded.len();
 
-    vm.heap
-        .array_write(buf_id, n, &utf8_buf[..bytes_written]);
+    vm.heap.array_write(buf_id, n, &utf8_buf[..bytes_written]);
 
     memory::write_word(&mut vm.frames.data, frame_base, bytes_written as i32);
     Ok(())
@@ -742,7 +789,7 @@ fn sys_seek(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     // Non-seekable standard streams: return 0 position without actually seeking.
     // Bufio calls seek on stdin to get the current position, and an error would
     // make it think the file is invalid.
-    if fd_num >= 0 && fd_num <= 2 {
+    if (0..=2).contains(&fd_num) {
         memory::write_big(&mut vm.frames.data, frame_base, 0i64);
         let ret_ptr = memory::read_word(&vm.frames.data, frame_base + 16);
         if ret_ptr > 0 && (ret_ptr as usize) + 8 <= vm.frames.data.len() {
@@ -881,13 +928,13 @@ fn sys_fstat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             let dir_id = build_dir_record(vm, &meta, name);
-            // Return (0, Dir) at frame+0 and frame+4
-            memory::write_word(&mut vm.frames.data, frame_base, 0);
-            write_ptr(&mut vm.frames.data, frame_base + 4, dir_id);
+            // Return (0, Dir) — write through ret pointer into caller's frame
+            write_ret_word(vm, frame_base, 0, 0);
+            write_ret_word(vm, frame_base, 4, dir_id as i32);
         }
         Err(e) => {
             vm.last_error = format!("{e}");
-            memory::write_word(&mut vm.frames.data, frame_base, -1);
+            write_ret_word(vm, frame_base, 0, -1);
         }
     }
     Ok(())
@@ -905,12 +952,13 @@ fn sys_stat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             let dir_id = build_dir_record(vm, &meta, name);
-            memory::write_word(&mut vm.frames.data, frame_base, 0);
-            write_ptr(&mut vm.frames.data, frame_base + 4, dir_id);
+            // Return (0, Dir) — write through ret pointer into caller's frame
+            write_ret_word(vm, frame_base, 0, 0);
+            write_ret_word(vm, frame_base, 4, dir_id as i32);
         }
         Err(e) => {
             vm.last_error = format!("{e}");
-            memory::write_word(&mut vm.frames.data, frame_base, -1);
+            write_ret_word(vm, frame_base, 0, -1);
         }
     }
     Ok(())
@@ -947,12 +995,13 @@ fn sys_dirread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     length: count,
                 },
             );
-            memory::write_word(&mut vm.frames.data, frame_base, count as i32);
-            write_ptr(&mut vm.frames.data, frame_base + 4, arr_id);
+            // Return (count, array of Dir) — write through ret pointer
+            write_ret_word(vm, frame_base, 0, count as i32);
+            write_ret_word(vm, frame_base, 4, arr_id as i32);
         }
         Err(e) => {
             vm.last_error = format!("{e}");
-            memory::write_word(&mut vm.frames.data, frame_base, -1);
+            write_ret_word(vm, frame_base, 0, -1);
         }
     }
     Ok(())
@@ -976,7 +1025,9 @@ fn sys_fauth(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_fversion(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    memory::write_word(&mut vm.frames.data, frame_base, -1);
+    // fversion returns (int, string) — write through ret pointer
+    write_ret_word(vm, frame_base, 0, -1);
+    write_ret_word(vm, frame_base, 4, 0); // nil string
     Ok(())
 }
 
@@ -1040,19 +1091,20 @@ fn sys_dial(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     .unwrap_or_default();
                 let fd = vm.files.insert_tcp_stream(stream, Some(peer.clone()));
                 let conn = build_connection(vm, fd, fd, &peer);
-                memory::write_word(&mut vm.frames.data, frame_base, 0);
-                write_ptr(&mut vm.frames.data, frame_base + 4, conn);
+                // Return (0, Connection) — write through ret pointer
+                write_ret_word(vm, frame_base, 0, 0);
+                write_ret_word(vm, frame_base, 4, conn as i32);
             }
             Err(e) => {
                 vm.last_error = format!("{e}");
-                memory::write_word(&mut vm.frames.data, frame_base, -1);
-                memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
+                write_ret_word(vm, frame_base, 0, -1);
+                write_ret_word(vm, frame_base, 4, 0);
             }
         },
         None => {
             vm.last_error = "invalid dial address".to_string();
-            memory::write_word(&mut vm.frames.data, frame_base, -1);
-            memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
+            write_ret_word(vm, frame_base, 0, -1);
+            write_ret_word(vm, frame_base, 4, 0);
         }
     }
     Ok(())
@@ -1072,19 +1124,20 @@ fn sys_announce(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     .unwrap_or_default();
                 let lfd = vm.files.insert_tcp_listener(listener, Some(local.clone()));
                 let conn = build_connection(vm, -1, lfd, &local);
-                memory::write_word(&mut vm.frames.data, frame_base, 0);
-                write_ptr(&mut vm.frames.data, frame_base + 4, conn);
+                // Return (0, Connection) — write through ret pointer
+                write_ret_word(vm, frame_base, 0, 0);
+                write_ret_word(vm, frame_base, 4, conn as i32);
             }
             Err(e) => {
                 vm.last_error = format!("{e}");
-                memory::write_word(&mut vm.frames.data, frame_base, -1);
-                memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
+                write_ret_word(vm, frame_base, 0, -1);
+                write_ret_word(vm, frame_base, 4, 0);
             }
         },
         None => {
             vm.last_error = "invalid announce address".to_string();
-            memory::write_word(&mut vm.frames.data, frame_base, -1);
-            memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
+            write_ret_word(vm, frame_base, 0, -1);
+            write_ret_word(vm, frame_base, 4, 0);
         }
     }
     Ok(())
@@ -1106,21 +1159,22 @@ fn sys_listen(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     };
 
     if cfd_num < 0 {
-        memory::write_word(&mut vm.frames.data, frame_base, -1);
-        memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
+        write_ret_word(vm, frame_base, 0, -1);
+        write_ret_word(vm, frame_base, 4, 0);
         return Ok(());
     }
 
     match vm.files.accept_on(cfd_num) {
         Ok((stream_fd, addr)) => {
             let conn = build_connection(vm, stream_fd, cfd_num, &addr);
-            memory::write_word(&mut vm.frames.data, frame_base, 0);
-            write_ptr(&mut vm.frames.data, frame_base + 4, conn);
+            // Return (0, Connection) — write through ret pointer
+            write_ret_word(vm, frame_base, 0, 0);
+            write_ret_word(vm, frame_base, 4, conn as i32);
         }
         Err(e) => {
             vm.last_error = format!("{e}");
-            memory::write_word(&mut vm.frames.data, frame_base, -1);
-            memory::write_word(&mut vm.frames.data, frame_base + 4, 0);
+            write_ret_word(vm, frame_base, 0, -1);
+            write_ret_word(vm, frame_base, 4, 0);
         }
     }
     Ok(())
@@ -1229,7 +1283,8 @@ mod tests {
         write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
         write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, buf_id);
         memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 3);
-        memory::write_big(&mut vm.frames.data, frame_base + ARG_START + 12, 2);
+        // big offset is aligned to 8 bytes: ARG_START+12 = 44, rounds up to 48 = ARG_START+16
+        memory::write_big(&mut vm.frames.data, frame_base + ARG_START + 16, 2);
         vm.files.seek(fd, 5, 0).expect("seek should succeed");
 
         sys_pread(&mut vm).expect("pread should succeed");
@@ -1270,7 +1325,8 @@ mod tests {
         write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
         write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, buf_id);
         memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 3);
-        memory::write_big(&mut vm.frames.data, frame_base + ARG_START + 12, 1);
+        // big offset is aligned to 8 bytes: ARG_START+12 = 44, rounds up to 48 = ARG_START+16
+        memory::write_big(&mut vm.frames.data, frame_base + ARG_START + 16, 1);
         vm.files.seek(fd, 4, 0).expect("seek should succeed");
 
         sys_pwrite(&mut vm).expect("pwrite should succeed");

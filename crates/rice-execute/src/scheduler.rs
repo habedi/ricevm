@@ -235,30 +235,36 @@ impl<'m> PreemptiveScheduler<'m> {
     }
 
     pub fn add_thread(&mut self, thread: VmThread) {
-        self.threads.lock().unwrap().push_back(thread);
+        self.threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(thread);
     }
 
     pub fn spawn_thread(&mut self, frames: FrameStack, mp: Vec<u8>, pc: usize) -> u32 {
         let id = self.next_thread_id;
         self.next_thread_id += 1;
-        self.threads.lock().unwrap().push_back(VmThread {
-            frames,
-            mp,
-            pc,
-            next_pc: 0,
-            halted: false,
-            src: AddrTarget::None,
-            mid: AddrTarget::None,
-            dst: AddrTarget::None,
-            imm_src: 0,
-            imm_mid: 0,
-            imm_dst: 0,
+        self.threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push_back(VmThread {
+                frames,
+                mp,
+                pc,
+                next_pc: 0,
+                halted: false,
+                src: AddrTarget::None,
+                mid: AddrTarget::None,
+                dst: AddrTarget::None,
+                imm_src: 0,
+                imm_mid: 0,
+                imm_dst: 0,
 
-            heap_refs: Vec::new(),
-            last_error: String::new(),
-            id,
-            state: ThreadState::Ready,
-        });
+                heap_refs: Vec::new(),
+                last_error: String::new(),
+                id,
+                state: ThreadState::Ready,
+            });
         self.condvar.notify_one();
         id
     }
@@ -299,13 +305,15 @@ fn worker_loop(
     loop {
         // Pop a ready thread
         let mut thread = {
-            let mut queue = threads.lock().unwrap();
+            let mut queue = threads.lock().unwrap_or_else(|e| e.into_inner());
             loop {
                 // Remove halted threads
                 queue.retain(|t| t.state != ThreadState::Exited);
                 // Find a ready thread
                 if let Some(idx) = queue.iter().position(|t| t.state == ThreadState::Ready) {
-                    let mut t = queue.remove(idx).unwrap();
+                    let Some(mut t) = queue.remove(idx) else {
+                        return Ok(());
+                    };
                     t.state = ThreadState::Running;
                     break t;
                 }
@@ -314,19 +322,19 @@ fn worker_loop(
                     return Ok(());
                 }
                 // All threads are blocked; wait for a signal.
-                queue = condvar.wait(queue).unwrap();
+                queue = condvar.wait(queue).unwrap_or_else(|e| e.into_inner());
             }
         };
 
         // Execute the thread for one quanta
         let result = {
-            let mut state = shared.lock().unwrap();
+            let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
             run_thread_quanta_shared(&mut state, &mut thread, DEFAULT_QUANTA)
         };
 
         // Return thread to queue
         {
-            let mut queue = threads.lock().unwrap();
+            let mut queue = threads.lock().unwrap_or_else(|e| e.into_inner());
             if thread.halted {
                 thread.state = ThreadState::Exited;
             } else if thread.state == ThreadState::Running {

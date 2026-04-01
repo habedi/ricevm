@@ -79,6 +79,10 @@ pub(crate) fn op_insc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 /// addc src, mid, dst — string concatenation: dst = mid + src
 /// Two-operand form: addc src, dst — dst = dst + src
+/// Reference: addstring(S(m), S(s), R.m == R.d)
+///   - nil + nil = nil (H)
+///   - nil + s2 = dup(s2)
+///   - s1 + nil = dup(s1) (or s1 if append)
 pub(crate) fn op_addc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s2_id = vm.src_ptr()?;
     // Two-operand: mid is None, so use dst as s1.
@@ -87,6 +91,19 @@ pub(crate) fn op_addc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     } else {
         vm.mid_ptr()?
     };
+
+    let s1_is_nil = s1_id == heap::NIL || vm.heap.get_string(s1_id).is_none();
+    let s2_is_nil = s2_id == heap::NIL || vm.heap.get_string(s2_id).is_none();
+
+    if s1_is_nil && s2_is_nil {
+        // nil + nil = nil (reference returns H)
+        let old_dst = vm.dst_ptr()?;
+        vm.set_dst_ptr(heap::NIL)?;
+        if old_dst != heap::NIL {
+            vm.heap.dec_ref(old_dst);
+        }
+        return Ok(());
+    }
 
     let s1 = vm.heap.get_string(s1_id).unwrap_or("").to_string();
     let s2 = vm.heap.get_string(s2_id).unwrap_or("").to_string();
@@ -97,7 +114,9 @@ pub(crate) fn op_addc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     // dec_ref old dst, set new
     let old_dst = vm.dst_ptr()?;
     vm.set_dst_ptr(new_id)?;
-    vm.heap.dec_ref(old_dst);
+    if old_dst != heap::NIL {
+        vm.heap.dec_ref(old_dst);
+    }
     Ok(())
 }
 
@@ -120,7 +139,21 @@ pub(crate) fn op_slicec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         .ok_or_else(|| ExecError::ThreadFault("slicec on non-string".to_string()))?
         .to_string();
 
-    let sliced: String = s.chars().skip(start).take(end - start).collect();
+    let char_count = s.chars().count();
+    if end < start || end > char_count {
+        return Err(ExecError::ThreadFault(format!(
+            "string slice out of bounds: [{}..{}] len={}",
+            start, end, char_count
+        )));
+    }
+    let nc = end - start;
+    if nc == 0 {
+        // Reference returns H (nil) for empty slices
+        vm.set_dst_ptr(heap::NIL)?;
+        vm.heap.dec_ref(str_id);
+        return Ok(());
+    }
+    let sliced: String = s.chars().skip(start).take(nc).collect();
     let new_id = vm.heap.alloc(0, HeapData::Str(sliced));
     vm.set_dst_ptr(new_id)?;
     vm.heap.dec_ref(str_id);
@@ -148,21 +181,23 @@ pub(crate) fn op_cvtca(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 /// cvtac src, dst — convert byte array to string
+/// Reference: if a == H, ds = H; else ds = c2string(a->data, a->len)
 pub(crate) fn op_cvtac(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let arr_id = vm.src_ptr()?;
-    let s = if arr_id == heap::NIL {
-        String::new()
+    if arr_id == heap::NIL {
+        // Reference returns H (nil) for nil array
+        vm.move_ptr_to_dst(heap::NIL)
     } else {
-        match vm.heap.get(arr_id) {
+        let s = match vm.heap.get(arr_id) {
             Some(obj) => match &obj.data {
                 HeapData::Array { data, .. } => String::from_utf8_lossy(data).into_owned(),
                 _ => String::new(),
             },
             None => String::new(),
-        }
-    };
-    let new_id = vm.heap.alloc(0, HeapData::Str(s));
-    vm.move_ptr_to_dst(new_id)
+        };
+        let new_id = vm.heap.alloc(0, HeapData::Str(s));
+        vm.move_ptr_to_dst(new_id)
+    }
 }
 
 /// lenl src, dst — list length
@@ -355,7 +390,7 @@ mod tests {
         let test_str = "abcdef";
         let str_id = vm.heap.alloc(0, HeapData::Str(test_str.to_string()));
 
-        // Slice [3..3) should give empty string
+        // Slice [3..3) should give nil (reference returns H for empty slice)
         vm.src = AddrTarget::Immediate;
         vm.imm_src = 3;
         vm.mid = AddrTarget::Immediate;
@@ -366,7 +401,64 @@ mod tests {
         op_slicec(&mut vm).expect("slicec should succeed");
 
         let result_id = memory::read_word(&vm.frames.data, fp) as u32;
-        let result = vm.heap.get_string(result_id).unwrap();
-        assert_eq!(result, "");
+        assert_eq!(result_id, heap::NIL, "empty slice should return NIL");
+    }
+
+    #[test]
+    fn slicec_bounds_check() {
+        // Reference: if v < start || v > l, error(exBounds)
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let str_id = vm.heap.alloc(0, HeapData::Str("abc".to_string()));
+
+        // end > len should fail
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 0;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 5; // out of bounds
+        memory::write_word(&mut vm.frames.data, fp, str_id as i32);
+        vm.dst = AddrTarget::Frame(fp);
+
+        let err = op_slicec(&mut vm);
+        assert!(err.is_err(), "slicec should fail for out-of-bounds end");
+    }
+
+    #[test]
+    fn addc_nil_plus_nil_is_nil() {
+        // Reference: addstring(H, H, ...) returns H
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = heap::NIL as i32;
+        vm.mid = AddrTarget::None;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_addc(&mut vm).expect("addc should succeed");
+
+        let result_id = memory::read_word(&vm.frames.data, fp) as u32;
+        assert_eq!(result_id, heap::NIL, "nil + nil should be nil");
+    }
+
+    #[test]
+    fn cvtac_nil_array_returns_nil() {
+        // Reference: if a == H, ds = H
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = heap::NIL as i32;
+        memory::write_word(&mut vm.frames.data, fp, 0);
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_cvtac(&mut vm).expect("cvtac should succeed");
+
+        let result_id = memory::read_word(&vm.frames.data, fp) as u32;
+        assert_eq!(result_id, heap::NIL, "cvtac of nil array should be nil");
     }
 }

@@ -37,7 +37,11 @@ pub fn execute(module: &Module) -> Result<(), ExecError> {
 /// The module name is automatically prepended as argv[0].
 pub fn execute_with_args(module: &Module, args: Vec<String>) -> Result<(), ExecError> {
     let entry_pc = module.header.entry_pc;
-    if entry_pc < 0 || entry_pc as usize >= module.code.len() {
+    // Library modules with entry_pc = -1 have no init function — return success.
+    if entry_pc < 0 {
+        return Ok(());
+    }
+    if entry_pc as usize >= module.code.len() {
         return Err(ExecError::InvalidPc(entry_pc));
     }
     tracing::info!(
@@ -54,7 +58,10 @@ pub fn execute_with_args(module: &Module, args: Vec<String>) -> Result<(), ExecE
 /// Run a loaded Dis module under the interactive debugger.
 pub fn debug(module: &Module) -> Result<(), ExecError> {
     let entry_pc = module.header.entry_pc;
-    if entry_pc < 0 || entry_pc as usize >= module.code.len() {
+    if entry_pc < 0 {
+        return Ok(());
+    }
+    if entry_pc as usize >= module.code.len() {
         return Err(ExecError::InvalidPc(entry_pc));
     }
     let mut dbg = debugger::Debugger::new(module)?;

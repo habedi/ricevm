@@ -40,9 +40,7 @@ pub(crate) fn op_movm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// The actual size to copy comes from types[mid].size.
 pub(crate) fn op_movmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let type_idx = vm.mid_word()? as usize;
-    let size = vm
-        .current_type_size(type_idx)
-        .unwrap_or(type_idx); // fallback to raw value if type not found
+    let size = vm.current_type_size(type_idx).unwrap_or(type_idx); // fallback to raw value if type not found
     if size == 0 {
         return Ok(());
     }
@@ -156,10 +154,10 @@ fn write_block(vm: &mut VmState<'_>, target: AddrTarget, data: &[u8]) {
             }
         }
         AddrTarget::ModuleMp { module_idx, offset } => {
-            if let Some(mp) = vm.module_mp_mut(module_idx) {
-                if offset + data.len() <= mp.len() {
-                    mp[offset..offset + data.len()].copy_from_slice(data);
-                }
+            if let Some(mp) = vm.module_mp_mut(module_idx)
+                && offset + data.len() <= mp.len()
+            {
+                mp[offset..offset + data.len()].copy_from_slice(data);
             }
         }
         AddrTarget::HeapArray { id, offset } => {
@@ -357,13 +355,11 @@ mod tests {
         let fp_base = vm.frames.current_data_offset();
 
         // Source: 16 bytes of recognizable data
-        vm.frames.data[fp_base..fp_base + 16]
-            .copy_from_slice(&[0xAA; 16]);
+        vm.frames.data[fp_base..fp_base + 16].copy_from_slice(&[0xAA; 16]);
 
         // Place a sentinel pattern after the destination area
         let dst_off = fp_base + 32;
-        vm.frames.data[dst_off + 8..dst_off + 16]
-            .copy_from_slice(&[0xBB; 8]);
+        vm.frames.data[dst_off + 8..dst_off + 16].copy_from_slice(&[0xBB; 8]);
 
         vm.src = AddrTarget::Frame(fp_base);
         vm.mid = AddrTarget::Immediate;

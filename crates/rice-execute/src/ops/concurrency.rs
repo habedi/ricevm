@@ -278,11 +278,11 @@ fn read_addr_bytes(
             }
         }
         AddrTarget::ModuleMp { module_idx, offset } => {
-            if let Some(mp) = vm.module_mp(module_idx) {
-                if offset < mp.len() {
-                    let copy_len = size.min(mp.len() - offset);
-                    buf[..copy_len].copy_from_slice(&mp[offset..offset + copy_len]);
-                }
+            if let Some(mp) = vm.module_mp(module_idx)
+                && offset < mp.len()
+            {
+                let copy_len = size.min(mp.len() - offset);
+                buf[..copy_len].copy_from_slice(&mp[offset..offset + copy_len]);
             }
         }
         AddrTarget::Immediate => match size {
@@ -325,11 +325,11 @@ fn write_addr_bytes(
             Ok(())
         }
         AddrTarget::ModuleMp { module_idx, offset } => {
-            if let Some(mp) = vm.module_mp_mut(module_idx) {
-                if offset < mp.len() {
-                    let copy_len = data.len().min(mp.len() - offset);
-                    mp[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
-                }
+            if let Some(mp) = vm.module_mp_mut(module_idx)
+                && offset < mp.len()
+            {
+                let copy_len = data.len().min(mp.len() - offset);
+                mp[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
             }
             Ok(())
         }
@@ -395,7 +395,9 @@ fn write_table_bytes(vm: &mut VmState<'_>, base: TableBase, offset: usize, data:
     }
 }
 
-fn parse_alt_table(vm: &VmState<'_>) -> Result<(TableBase, usize, Vec<AltEntry>), ExecError> {
+fn parse_alt_table(
+    vm: &VmState<'_>,
+) -> Result<(TableBase, usize, usize, Vec<AltEntry>), ExecError> {
     let (base, table_offset) = match vm.src {
         AddrTarget::Frame(off) => (TableBase::Frame, off),
         AddrTarget::Mp(off) => (TableBase::Mp, off),
@@ -406,13 +408,18 @@ fn parse_alt_table(vm: &VmState<'_>) -> Result<(TableBase, usize, Vec<AltEntry>)
         }
     };
 
-    let count = read_table_word(vm, base, table_offset).max(0) as usize;
+    // Reference layout: { nsend (word), nrecv (word), entries[] }
+    // Each entry is { channel_ptr (word), data_ptr (word) } = 8 bytes
+    // First nsend entries are send, next nrecv are recv.
+    let nsend = read_table_word(vm, base, table_offset).max(0) as usize;
+    let nrecv = read_table_word(vm, base, table_offset + 4).max(0) as usize;
+    let count = nsend + nrecv;
     let mut entries = Vec::with_capacity(count);
     for idx in 0..count {
-        let base_off = table_offset + 4 + idx * 12;
+        let base_off = table_offset + 8 + idx * 8;
         let channel_id = read_table_word(vm, base, base_off) as HeapId;
-        let is_send = read_table_word(vm, base, base_off + 4) != 0;
-        let data_offset = read_table_word(vm, base, base_off + 8).max(0) as usize;
+        let data_offset = read_table_word(vm, base, base_off + 4).max(0) as usize;
+        let is_send = idx < nsend;
         entries.push(AltEntry {
             channel_id,
             is_send,
@@ -420,13 +427,19 @@ fn parse_alt_table(vm: &VmState<'_>) -> Result<(TableBase, usize, Vec<AltEntry>)
         });
     }
 
-    Ok((base, count, entries))
+    Ok((base, nsend, nrecv, entries))
 }
 
 fn execute_alt(vm: &mut VmState<'_>, select_first_if_none: bool) -> Result<AltOutcome, ExecError> {
-    let (base, count, entries) = parse_alt_table(vm)?;
+    let (base, nsend, nrecv, entries) = parse_alt_table(vm)?;
+    let count = nsend + nrecv;
 
+    // Collect ready indices first, then pick one (reference picks randomly,
+    // we pick the first ready one for determinism in our cooperative model).
     for (idx, entry) in entries.iter().copied().enumerate() {
+        if entry.channel_id == heap::NIL {
+            continue; // skip nil channels (reference skips them in altrdy)
+        }
         let (elem_size, pending) = channel_ref(vm, entry.channel_id)?;
         let ready = if entry.is_send {
             pending.is_none()
@@ -482,7 +495,7 @@ pub(crate) fn op_send(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// src = channel pointer, dst = destination for received data.
 pub(crate) fn op_recv(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let chan_id = vm.src_ptr()?;
-    let (elem_size, pending) = channel_ref(vm, chan_id)?;
+    let (_elem_size, pending) = channel_ref(vm, chan_id)?;
 
     if let Some(data) = pending {
         // Channel has data — consume it
@@ -513,10 +526,10 @@ pub(crate) fn op_alt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 /// nbalt src, dst — simplified non-blocking channel select.
-/// Returns the chosen index, or `N` when no entries are ready.
+/// Returns the chosen index, or `nsend + nrecv` when no entries are ready.
 pub(crate) fn op_nbalt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let count = match parse_alt_table(vm) {
-        Ok((_, count, _)) => count,
+        Ok((_, nsend, nrecv, _)) => nsend + nrecv,
         Err(err) => return Err(err),
     };
 
@@ -621,13 +634,16 @@ mod tests {
         let fp_base = vm.frames.current_data_offset();
         let table_off = fp_base + 8;
 
-        memory::write_word(&mut vm.frames.data, table_off, 2);
-        memory::write_word(&mut vm.frames.data, table_off + 4, chan_a as i32);
-        memory::write_word(&mut vm.frames.data, table_off + 8, 0);
+        // Reference format: { nsend, nrecv, entries[8 bytes each] }
+        // Two recv entries, zero send entries
+        memory::write_word(&mut vm.frames.data, table_off, 0); // nsend = 0
+        memory::write_word(&mut vm.frames.data, table_off + 4, 2); // nrecv = 2
+        // Entry 0 (recv): channel=chan_a, data_ptr
+        memory::write_word(&mut vm.frames.data, table_off + 8, chan_a as i32);
         memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+        // Entry 1 (recv): channel=chan_b, data_ptr
         memory::write_word(&mut vm.frames.data, table_off + 16, chan_b as i32);
-        memory::write_word(&mut vm.frames.data, table_off + 20, 0);
-        memory::write_word(&mut vm.frames.data, table_off + 24, (fp_base + 44) as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 20, (fp_base + 44) as i32);
 
         vm.src = AddrTarget::Frame(table_off);
         vm.dst = AddrTarget::Frame(fp_base);
@@ -651,10 +667,12 @@ mod tests {
         let fp_base = vm.frames.current_data_offset();
         let table_off = fp_base + 8;
 
+        // Reference format: { nsend=1, nrecv=0, entries[8 bytes each] }
         memory::write_word(&mut vm.frames.data, fp_base + 32, 99);
-        memory::write_word(&mut vm.frames.data, table_off, 1);
-        memory::write_word(&mut vm.frames.data, table_off + 4, chan as i32);
-        memory::write_word(&mut vm.frames.data, table_off + 8, 1);
+        memory::write_word(&mut vm.frames.data, table_off, 1); // nsend = 1
+        memory::write_word(&mut vm.frames.data, table_off + 4, 0); // nrecv = 0
+        // Entry 0 (send): channel=chan, data_ptr
+        memory::write_word(&mut vm.frames.data, table_off + 8, chan as i32);
         memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 32) as i32);
 
         vm.src = AddrTarget::Frame(table_off);

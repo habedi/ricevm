@@ -232,6 +232,11 @@ impl<'m> VmState<'m> {
     }
 
     pub fn run(&mut self) -> Result<(), ExecError> {
+        // Library modules with entry_pc = -1 have no init function.
+        if self.module.header.entry_pc < 0 {
+            return Ok(());
+        }
+
         const GC_INTERVAL: usize = 10_000;
         const THREAD_QUANTUM: usize = 2048;
         let mut quantum_counter = 0usize;
@@ -467,18 +472,17 @@ impl<'m> VmState<'m> {
     /// Write bytes to a heap array element. Resolves ArraySlice to parent.
     pub(crate) fn heap_write(&mut self, id: heap::HeapId, offset: usize, bytes: &[u8]) {
         // Check for ArraySlice first and redirect to parent.
-        if let Some(obj) = self.heap.get(id) {
-            if let heap::HeapData::ArraySlice {
+        if let Some(obj) = self.heap.get(id)
+            && let heap::HeapData::ArraySlice {
                 parent_id,
                 byte_start,
                 ..
             } = &obj.data
-            {
-                let pid = *parent_id;
-                let bs = *byte_start;
-                self.heap_write(pid, bs + offset, bytes);
-                return;
-            }
+        {
+            let pid = *parent_id;
+            let bs = *byte_start;
+            self.heap_write(pid, bs + offset, bytes);
+            return;
         }
         if let Some(obj) = self.heap.get_mut(id) {
             match &mut obj.data {
@@ -539,7 +543,9 @@ impl<'m> VmState<'m> {
         if module_idx == 0 {
             None
         } else {
-            self.loaded_modules.get_mut(module_idx - 1).map(|lm| &mut lm.mp)
+            self.loaded_modules
+                .get_mut(module_idx - 1)
+                .map(|lm| &mut lm.mp)
         }
     }
 
@@ -586,10 +592,10 @@ impl<'m> VmState<'m> {
                 Ok(())
             }
             AddrTarget::ModuleMp { module_idx, offset } => {
-                if let Some(mp) = self.module_mp_mut(module_idx) {
-                    if offset + 4 <= mp.len() {
-                        memory::write_word(mp, offset, val);
-                    }
+                if let Some(mp) = self.module_mp_mut(module_idx)
+                    && offset + 4 <= mp.len()
+                {
+                    memory::write_word(mp, offset, val);
                 }
                 Ok(())
             }
@@ -609,8 +615,15 @@ impl<'m> VmState<'m> {
             AddrTarget::Frame(off) => Ok(memory::read_big(&self.frames.data, off)),
             AddrTarget::Mp(off) => Ok(memory::read_big(&self.mp, off)),
             AddrTarget::ModuleMp { module_idx, offset } => {
-                let mp = match self.module_mp(module_idx) { Some(mp) => mp, None => return Ok(0) };
-                if offset + 8 <= mp.len() { Ok(memory::read_big(mp, offset)) } else { Ok(0) }
+                let mp = match self.module_mp(module_idx) {
+                    Some(mp) => mp,
+                    None => return Ok(0),
+                };
+                if offset + 8 <= mp.len() {
+                    Ok(memory::read_big(mp, offset))
+                } else {
+                    Ok(0)
+                }
             }
             AddrTarget::Immediate => Ok(imm as Big),
             AddrTarget::None => Ok(0),
@@ -632,8 +645,10 @@ impl<'m> VmState<'m> {
                 Ok(())
             }
             AddrTarget::ModuleMp { module_idx, offset } => {
-                if let Some(mp) = self.module_mp_mut(module_idx) {
-                    if offset + 8 <= mp.len() { memory::write_big(mp, offset, val); }
+                if let Some(mp) = self.module_mp_mut(module_idx)
+                    && offset + 8 <= mp.len()
+                {
+                    memory::write_big(mp, offset, val);
                 }
                 Ok(())
             }
@@ -653,8 +668,15 @@ impl<'m> VmState<'m> {
             AddrTarget::Frame(off) => Ok(memory::read_real(&self.frames.data, off)),
             AddrTarget::Mp(off) => Ok(memory::read_real(&self.mp, off)),
             AddrTarget::ModuleMp { module_idx, offset } => {
-                let mp = match self.module_mp(module_idx) { Some(mp) => mp, None => return Ok(0.0) };
-                if offset + 8 <= mp.len() { Ok(memory::read_real(mp, offset)) } else { Ok(0.0) }
+                let mp = match self.module_mp(module_idx) {
+                    Some(mp) => mp,
+                    None => return Ok(0.0),
+                };
+                if offset + 8 <= mp.len() {
+                    Ok(memory::read_real(mp, offset))
+                } else {
+                    Ok(0.0)
+                }
             }
             AddrTarget::Immediate => Ok(0.0),
             AddrTarget::None => Ok(0.0),
@@ -676,8 +698,10 @@ impl<'m> VmState<'m> {
                 Ok(())
             }
             AddrTarget::ModuleMp { module_idx, offset } => {
-                if let Some(mp) = self.module_mp_mut(module_idx) {
-                    if offset + 8 <= mp.len() { memory::write_real(mp, offset, val); }
+                if let Some(mp) = self.module_mp_mut(module_idx)
+                    && offset + 8 <= mp.len()
+                {
+                    memory::write_real(mp, offset, val);
                 }
                 Ok(())
             }
@@ -697,8 +721,15 @@ impl<'m> VmState<'m> {
             AddrTarget::Frame(off) => Ok(memory::read_byte(&self.frames.data, off)),
             AddrTarget::Mp(off) => Ok(memory::read_byte(&self.mp, off)),
             AddrTarget::ModuleMp { module_idx, offset } => {
-                let mp = match self.module_mp(module_idx) { Some(mp) => mp, None => return Ok(0) };
-                if offset < mp.len() { Ok(memory::read_byte(mp, offset)) } else { Ok(0) }
+                let mp = match self.module_mp(module_idx) {
+                    Some(mp) => mp,
+                    None => return Ok(0),
+                };
+                if offset < mp.len() {
+                    Ok(memory::read_byte(mp, offset))
+                } else {
+                    Ok(0)
+                }
             }
             AddrTarget::Immediate => Ok(imm as Byte),
             AddrTarget::None => Ok(0),
@@ -719,8 +750,10 @@ impl<'m> VmState<'m> {
                 Ok(())
             }
             AddrTarget::ModuleMp { module_idx, offset } => {
-                if let Some(mp) = self.module_mp_mut(module_idx) {
-                    if offset < mp.len() { memory::write_byte(mp, offset, val); }
+                if let Some(mp) = self.module_mp_mut(module_idx)
+                    && offset < mp.len()
+                {
+                    memory::write_byte(mp, offset, val);
                 }
                 Ok(())
             }

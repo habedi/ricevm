@@ -326,11 +326,7 @@ mod tests {
     fn property_shlw_zero_is_identity() {
         for seed in 0..1000u64 {
             let v = (seed.wrapping_mul(2654435761).wrapping_add(1)) as i32;
-            assert_eq!(
-                v.wrapping_shl(0),
-                v,
-                "shlw by 0 should be identity for {v}"
-            );
+            assert_eq!(v.wrapping_shl(0), v, "shlw by 0 should be identity for {v}");
         }
     }
 
@@ -338,11 +334,7 @@ mod tests {
     fn property_shrw_zero_is_identity() {
         for seed in 0..1000u64 {
             let v = (seed.wrapping_mul(2654435761).wrapping_add(1)) as i32;
-            assert_eq!(
-                v.wrapping_shr(0),
-                v,
-                "shrw by 0 should be identity for {v}"
-            );
+            assert_eq!(v.wrapping_shr(0), v, "shrw by 0 should be identity for {v}");
         }
     }
 
@@ -430,11 +422,7 @@ mod tests {
     fn property_modw_by_one_is_zero() {
         for seed in 0..1000u64 {
             let v = (seed.wrapping_mul(2654435761).wrapping_add(1)) as i32;
-            assert_eq!(
-                v.wrapping_rem(1),
-                0,
-                "modw by 1 should be zero for {v}"
-            );
+            assert_eq!(v.wrapping_rem(1), 0, "modw by 1 should be zero for {v}");
         }
     }
 
@@ -448,12 +436,18 @@ mod tests {
         let inv = false;
         let mut r: i32 = 1;
         loop {
-            if n & 1 != 0 { r = r.wrapping_mul(x); }
+            if n & 1 != 0 {
+                r = r.wrapping_mul(x);
+            }
             n >>= 1;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             x = x.wrapping_mul(x);
         }
-        if inv { r = 1_i32.wrapping_div(r); }
+        if inv {
+            r = 1_i32.wrapping_div(r);
+        }
         assert_eq!(r, 1024);
     }
 
@@ -465,12 +459,18 @@ mod tests {
         let inv = true;
         let mut r: i32 = 1;
         loop {
-            if n & 1 != 0 { r = r.wrapping_mul(x); }
+            if n & 1 != 0 {
+                r = r.wrapping_mul(x);
+            }
             n >>= 1;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             x = x.wrapping_mul(x);
         }
-        if inv { r = 1_i32.wrapping_div(r); }
+        if inv {
+            r = 1_i32.wrapping_div(r);
+        }
         assert_eq!(r, 0); // 1/8 = 0 in integer division
     }
 
@@ -482,12 +482,18 @@ mod tests {
         let inv = false;
         let mut r: f64 = 1.0;
         loop {
-            if n & 1 != 0 { r *= x; }
+            if n & 1 != 0 {
+                r *= x;
+            }
             n >>= 1;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             x *= x;
         }
-        if inv { r = 1.0 / r; }
+        if inv {
+            r = 1.0 / r;
+        }
         assert_eq!(r, 8.0);
     }
 
@@ -499,12 +505,18 @@ mod tests {
         let inv = true;
         let mut r: f64 = 1.0;
         loop {
-            if n & 1 != 0 { r *= x; }
+            if n & 1 != 0 {
+                r *= x;
+            }
             n >>= 1;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             x *= x;
         }
-        if inv { r = 1.0 / r; }
+        if inv {
+            r = 1.0 / r;
+        }
         assert_eq!(r, 0.25);
     }
 }

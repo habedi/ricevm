@@ -189,10 +189,10 @@ struct PipeReader(PipeBuffer);
 
 impl FileOps for PipeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut queue = self.0.lock().unwrap();
+        let mut queue = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let n = buf.len().min(queue.len());
         for b in buf.iter_mut().take(n) {
-            *b = queue.pop_front().unwrap();
+            *b = queue.pop_front().unwrap_or(0);
         }
         Ok(n)
     }
@@ -227,7 +227,7 @@ impl FileOps for PipeWriter {
         ))
     }
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut queue = self.0.lock().unwrap();
+        let mut queue = self.0.lock().unwrap_or_else(|e| e.into_inner());
         queue.extend(buf);
         Ok(buf.len())
     }
@@ -490,7 +490,9 @@ mod tests {
         assert_eq!(written, data.len());
 
         let mut buf = vec![0u8; 32];
-        let n = ft.read(read_fd, &mut buf).expect("pipe read should succeed");
+        let n = ft
+            .read(read_fd, &mut buf)
+            .expect("pipe read should succeed");
         assert_eq!(n, data.len());
         assert_eq!(&buf[..n], data);
     }

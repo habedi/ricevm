@@ -209,7 +209,10 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                             .iter()
                             .position(|e| e.name == *name)
                             .or_else(|| {
-                                module.exports.iter().position(|e| e.signature as u32 == sig)
+                                module
+                                    .exports
+                                    .iter()
+                                    .position(|e| e.signature as u32 == sig)
                             })
                     })
                     .collect()
@@ -646,7 +649,9 @@ pub(crate) fn op_casec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         // value > lo: check hi
         let hi_id = read_table(vm, l_off + 1)? as heap::HeapId;
         if hi_id == heap::NIL
-            || value_str.as_str().cmp(vm.heap.get_string(hi_id).unwrap_or(""))
+            || value_str
+                .as_str()
+                .cmp(vm.heap.get_string(hi_id).unwrap_or(""))
                 == std::cmp::Ordering::Greater
         {
             t_off = l_off + 3;
@@ -857,8 +862,8 @@ mod tests {
         //
         // Table layout: [count, lo0, hi0, pc0, lo1, hi1, pc1, lo2, hi2, pc2, default]
         let table_off = fp + 4;
-        memory::write_word(&mut vm.frames.data, table_off, 3);      // count
-        memory::write_word(&mut vm.frames.data, table_off + 4, 0);  // lo0
+        memory::write_word(&mut vm.frames.data, table_off, 3); // count
+        memory::write_word(&mut vm.frames.data, table_off + 4, 0); // lo0
         memory::write_word(&mut vm.frames.data, table_off + 8, 10); // hi0
         memory::write_word(&mut vm.frames.data, table_off + 12, 100); // pc0
         memory::write_word(&mut vm.frames.data, table_off + 16, 10); // lo1
@@ -929,8 +934,8 @@ mod tests {
         let fp = vm.frames.current_data_offset();
 
         let table_off = fp + 4;
-        memory::write_word(&mut vm.frames.data, table_off, 1);      // count
-        memory::write_word(&mut vm.frames.data, table_off + 4, 5);  // lo
+        memory::write_word(&mut vm.frames.data, table_off, 1); // count
+        memory::write_word(&mut vm.frames.data, table_off + 4, 5); // lo
         memory::write_word(&mut vm.frames.data, table_off + 8, 15); // hi
         memory::write_word(&mut vm.frames.data, table_off + 12, 42); // pc
         memory::write_word(&mut vm.frames.data, table_off + 16, 99); // default

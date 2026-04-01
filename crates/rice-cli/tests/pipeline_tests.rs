@@ -205,11 +205,8 @@ fn load_and_execute_echo_with_args() {
     let module = ricevm_loader::load(&bytes).expect("should parse echo.dis");
 
     // Execute echo with "hello world" arguments
-    ricevm_execute::execute_with_args(
-        &module,
-        vec!["hello".to_string(), "world".to_string()],
-    )
-    .expect("echo.dis with args should execute cleanly");
+    ricevm_execute::execute_with_args(&module, vec!["hello".to_string(), "world".to_string()])
+        .expect("echo.dis with args should execute cleanly");
 }
 
 /// Integration test: Compile hello.b end-to-end using limbo.dis, then run the output.
@@ -226,15 +223,17 @@ fn compile_and_run_hello_world() {
         "../external/inferno-os/module",
         "../../external/inferno-os/module",
     ];
-    let hello_paths = [
-        "hello.b",
-        "../hello.b",
-        "../../hello.b",
-    ];
+    let hello_paths = ["hello.b", "../hello.b", "../../hello.b"];
 
-    let limbo_path = limbo_paths.iter().find(|p| std::path::Path::new(p).exists());
-    let _module_path = module_paths.iter().find(|p| std::path::Path::new(p).exists());
-    let hello_path = hello_paths.iter().find(|p| std::path::Path::new(p).exists());
+    let limbo_path = limbo_paths
+        .iter()
+        .find(|p| std::path::Path::new(p).exists());
+    let _module_path = module_paths
+        .iter()
+        .find(|p| std::path::Path::new(p).exists());
+    let hello_path = hello_paths
+        .iter()
+        .find(|p| std::path::Path::new(p).exists());
 
     if limbo_path.is_none() || _module_path.is_none() || hello_path.is_none() {
         eprintln!(
@@ -246,8 +245,14 @@ fn compile_and_run_hello_world() {
     // Verify limbo.dis loads correctly as a module
     let limbo_bytes = std::fs::read(limbo_path.unwrap()).expect("should read limbo.dis");
     let limbo_module = ricevm_loader::load(&limbo_bytes).expect("should parse limbo.dis");
-    assert!(!limbo_module.name.is_empty(), "limbo module should have a name");
-    assert!(!limbo_module.code.is_empty(), "limbo module should have code");
+    assert!(
+        !limbo_module.name.is_empty(),
+        "limbo module should have a name"
+    );
+    assert!(
+        !limbo_module.code.is_empty(),
+        "limbo module should have code"
+    );
 
     // Verify hello.b exists and contains the expected source
     let hello_src = std::fs::read_to_string(hello_path.unwrap()).expect("should read hello.b");
@@ -287,12 +292,15 @@ fn load_multiple_dis_files() {
         if !std::path::Path::new(&path).exists() {
             continue;
         }
-        let bytes = std::fs::read(&path).expect(&format!("should read {prog}"));
-        let module = ricevm_loader::load(&bytes).expect(&format!("should parse {prog}"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|_| panic!("should read {prog}"));
+        let module = ricevm_loader::load(&bytes).unwrap_or_else(|_| panic!("should parse {prog}"));
         assert!(!module.name.is_empty(), "{prog} should have a module name");
         assert!(!module.code.is_empty(), "{prog} should have instructions");
         loaded += 1;
     }
 
-    assert!(loaded >= 2, "should have loaded at least 2 .dis files, got {loaded}");
+    assert!(
+        loaded >= 2,
+        "should have loaded at least 2 .dis files, got {loaded}"
+    );
 }

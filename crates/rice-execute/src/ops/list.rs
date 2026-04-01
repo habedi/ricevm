@@ -20,10 +20,10 @@ fn cons_bytes(vm: &mut VmState<'_>, size: usize) -> Result<(), ExecError> {
             head.copy_from_slice(&vm.mp[off..off + size]);
         }
         crate::address::AddrTarget::ModuleMp { module_idx, offset } => {
-            if let Some(mp) = vm.module_mp(module_idx) {
-                if offset + size <= mp.len() {
-                    head.copy_from_slice(&mp[offset..offset + size]);
-                }
+            if let Some(mp) = vm.module_mp(module_idx)
+                && offset + size <= mp.len()
+            {
+                head.copy_from_slice(&mp[offset..offset + size]);
             }
         }
         crate::address::AddrTarget::Immediate => {

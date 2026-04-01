@@ -10,6 +10,7 @@ use crate::memory;
 /// Returns a flat byte buffer of size `data_size`, with values written
 /// at their specified offsets. Strings are allocated on the heap and
 /// their HeapId is stored as a Word at the offset.
+#[allow(dead_code)]
 pub(crate) fn init_mp(data_size: usize, items: &[DataItem], heap: &mut Heap) -> Vec<u8> {
     init_mp_with_types(data_size, items, heap, &[])
 }
@@ -84,11 +85,7 @@ pub(crate) fn init_mp_with_types(
                 let len = *length as usize;
                 let et = *element_type as usize;
                 // Look up element size from type descriptors; default to 4.
-                let elem_size = types
-                    .get(et)
-                    .map(|td| td.size as usize)
-                    .unwrap_or(4)
-                    .max(1);
+                let elem_size = types.get(et).map(|td| td.size as usize).unwrap_or(4).max(1);
                 let data = vec![0u8; len * elem_size];
                 let arr_id = heap.alloc(
                     et as u32,
@@ -110,9 +107,8 @@ pub(crate) fn init_mp_with_types(
                 // Read the array HeapId from the active buffer (MP or parent array).
                 // When inside a nested array context (array_stack non-empty),
                 // the offset refers to the current array's data, not MP.
-                let arr_id = if !array_stack.is_empty() {
+                let arr_id = if let Some(&(parent_arr_id, _, _)) = array_stack.last() {
                     // Inside array context: read from the array's heap data
-                    let &(parent_arr_id, _, _) = array_stack.last().unwrap();
                     if let Some(obj) = heap.get(parent_arr_id) {
                         match &obj.data {
                             HeapData::Array { data, .. } if off + 4 <= data.len() => {
@@ -260,7 +256,10 @@ mod tests {
         let obj = heap.get(arr_id).expect("array should exist");
         match &obj.data {
             HeapData::Array {
-                elem_size, data, length, ..
+                elem_size,
+                data,
+                length,
+                ..
             } => {
                 assert_eq!(*elem_size, 8, "elem_size should come from types[6].size");
                 assert_eq!(*length, 3);

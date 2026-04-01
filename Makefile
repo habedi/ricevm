@@ -6,7 +6,7 @@ DEBUG_PROJ := 0
 RUST_BACKTRACE := 1
 ASSET_DIR := assets
 TEST_DATA_DIR := tests/testdata
-SHELL := /bin/bash
+SHELL := /usr/bin/bash
 
 # Default target
 .DEFAULT_GOAL := help

@@ -189,32 +189,25 @@ impl Heap {
 
     /// Write bytes to an array or array slice, resolving slices to their parent.
     pub fn array_write(&mut self, id: HeapId, offset: usize, data: &[u8]) {
-        if let Some(obj) = self.get(id) {
-            if let HeapData::ArraySlice {
+        if let Some(obj) = self.get(id)
+            && let HeapData::ArraySlice {
                 parent_id,
                 byte_start,
                 ..
             } = &obj.data
-            {
-                let pid = *parent_id;
-                let bs = *byte_start;
-                self.array_write(pid, bs + offset, data);
-                return;
-            }
+        {
+            let pid = *parent_id;
+            let bs = *byte_start;
+            self.array_write(pid, bs + offset, data);
+            return;
         }
-        if let Some(obj) = self.get_mut(id) {
-            match &mut obj.data {
-                HeapData::Array {
-                    data: arr_data, ..
-                } => {
-                    let end = (offset + data.len()).min(arr_data.len());
-                    let copy_len = end.saturating_sub(offset);
-                    if copy_len > 0 {
-                        arr_data[offset..offset + copy_len]
-                            .copy_from_slice(&data[..copy_len]);
-                    }
-                }
-                _ => {}
+        if let Some(obj) = self.get_mut(id)
+            && let HeapData::Array { data: arr_data, .. } = &mut obj.data
+        {
+            let end = (offset + data.len()).min(arr_data.len());
+            let copy_len = end.saturating_sub(offset);
+            if copy_len > 0 {
+                arr_data[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
             }
         }
     }
@@ -222,10 +215,8 @@ impl Heap {
     /// Get the mutable data buffer of an array, resolving slices to their
     /// parent. Returns (data, byte_offset) where byte_offset is the start
     /// offset within the parent's data for slice types, or 0 for arrays.
-    pub fn array_data_mut(
-        &mut self,
-        id: HeapId,
-    ) -> Option<(&mut Vec<u8>, usize)> {
+    #[allow(dead_code)]
+    pub fn array_data_mut(&mut self, id: HeapId) -> Option<(&mut Vec<u8>, usize)> {
         // First resolve ArraySlice to its parent.
         let (root_id, byte_start) = {
             let obj = self.get(id)?;

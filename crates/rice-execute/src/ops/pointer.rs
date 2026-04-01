@@ -182,7 +182,9 @@ pub(crate) fn op_slicea(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         root_length
     } else {
         // For slices, the relevant length is the slice length
-        let obj = vm.heap.get(arr_id).unwrap();
+        let Some(obj) = vm.heap.get(arr_id) else {
+            return Err(ExecError::Other(format!("invalid heap id {arr_id}")));
+        };
         match &obj.data {
             heap::HeapData::ArraySlice { length, .. } => *length,
             _ => root_length,
@@ -256,26 +258,27 @@ pub(crate) fn op_slicela(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 let data = vm.heap.array_read(pid, bs, byte_len).unwrap_or_default();
                 (data, len, es)
             }
-            _ => return Err(ExecError::ThreadFault("slicela: src not an array".to_string())),
+            _ => {
+                return Err(ExecError::ThreadFault(
+                    "slicela: src not an array".to_string(),
+                ));
+            }
         }
     };
 
     // Write into dst array.
-    if let Some(obj) = vm.heap.get_mut(dst_id) {
-        if let heap::HeapData::Array {
-            data, length, ..
-        } = &mut obj.data
-        {
-            let copy_start = insert_pos * elem_size;
-            let copy_bytes = src_len * elem_size;
-            let needed = copy_start + copy_bytes;
-            if needed > data.len() {
-                data.resize(needed, 0);
-            }
-            data[copy_start..copy_start + copy_bytes]
-                .copy_from_slice(&src_data[..copy_bytes.min(src_data.len())]);
-            *length = (insert_pos + src_len).max(*length);
+    if let Some(obj) = vm.heap.get_mut(dst_id)
+        && let heap::HeapData::Array { data, length, .. } = &mut obj.data
+    {
+        let copy_start = insert_pos * elem_size;
+        let copy_bytes = src_len * elem_size;
+        let needed = copy_start + copy_bytes;
+        if needed > data.len() {
+            data.resize(needed, 0);
         }
+        data[copy_start..copy_start + copy_bytes]
+            .copy_from_slice(&src_data[..copy_bytes.min(src_data.len())]);
+        *length = (insert_pos + src_len).max(*length);
     }
 
     Ok(())

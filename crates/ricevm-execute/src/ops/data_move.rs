@@ -19,8 +19,7 @@ pub(crate) fn op_movf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 pub(crate) fn op_movl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let val = vm.src_big()?;
-    vm.set_dst_big(val)
+    vm.set_dst_big(vm.src_big()?)
 }
 
 /// movm src, mid, dst:copy a block of `mid` bytes from src to dst
@@ -40,12 +39,59 @@ pub(crate) fn op_movm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// The actual size to copy comes from types[mid].size.
 pub(crate) fn op_movmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let type_idx = vm.mid_word()? as usize;
-    let size = vm.current_type_size(type_idx).unwrap_or(type_idx); // fallback to raw value if type not found
+    let types = if let Some(lm_idx) = vm.current_loaded_module {
+        vm.loaded_modules.get(lm_idx).map(|lm| &lm.module.types)
+    } else {
+        Some(&vm.module.types)
+    };
+    let (size, ptr_map) = if let Some(td) = types.and_then(|t| t.get(type_idx)) {
+        (td.size as usize, td.pointer_map.bytes.clone())
+    } else {
+        (type_idx, Vec::new()) // fallback to raw value if type not found
+    };
     if size == 0 {
         return Ok(());
     }
 
+    // incmem: increment ref counts for pointers in the source (before copy)
     let src_bytes = read_block(vm, vm.src, size);
+    for (byte_idx, &map_byte) in ptr_map.iter().enumerate() {
+        for bit in 0..8u32 {
+            if map_byte & (1 << bit) != 0 {
+                let ptr_offset = (byte_idx * 8 + bit as usize) * 4;
+                if ptr_offset + 4 <= src_bytes.len() {
+                    let ptr_val = crate::memory::read_word(&src_bytes, ptr_offset) as u32;
+                    if ptr_val != crate::heap::NIL
+                        && ptr_val >= crate::heap::HEAP_ID_BASE
+                        && vm.heap.contains(ptr_val)
+                    {
+                        vm.heap.inc_ref(ptr_val);
+                    }
+                }
+            }
+        }
+    }
+
+    // freeptrs: decrement ref counts for pointers in the destination (about to be overwritten)
+    let dst_bytes = read_block(vm, vm.dst, size);
+    for (byte_idx, &map_byte) in ptr_map.iter().enumerate() {
+        for bit in 0..8u32 {
+            if map_byte & (1 << bit) != 0 {
+                let ptr_offset = (byte_idx * 8 + bit as usize) * 4;
+                if ptr_offset + 4 <= dst_bytes.len() {
+                    let ptr_val = crate::memory::read_word(&dst_bytes, ptr_offset) as u32;
+                    if ptr_val != crate::heap::NIL
+                        && ptr_val >= crate::heap::HEAP_ID_BASE
+                        && vm.heap.contains(ptr_val)
+                    {
+                        vm.heap.dec_ref(ptr_val);
+                    }
+                }
+            }
+        }
+    }
+
+    // Copy the bytes
     write_block(vm, vm.dst, &src_bytes);
     Ok(())
 }

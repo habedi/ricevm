@@ -118,20 +118,28 @@ fn format_string(
             }
         }
 
-        // Parse optional precision: '.' followed by digits
+        // Parse optional precision: '.' followed by digits or '*' (from argument)
         let mut precision: Option<usize> = None;
         if chars.peek() == Some(&'.') {
             chars.next();
-            let mut p: usize = 0;
-            while let Some(&pc) = chars.peek() {
-                if pc.is_ascii_digit() {
-                    chars.next();
-                    p = p * 10 + (pc as usize - '0' as usize);
-                } else {
-                    break;
+            if chars.peek() == Some(&'*') {
+                chars.next();
+                // Precision comes from the next argument (word)
+                let p = memory::read_word(&vm.frames.data, arg_offset) as usize;
+                arg_offset += 4;
+                precision = Some(p);
+            } else {
+                let mut p: usize = 0;
+                while let Some(&pc) = chars.peek() {
+                    if pc.is_ascii_digit() {
+                        chars.next();
+                        p = p * 10 + (pc as usize - '0' as usize);
+                    } else {
+                        break;
+                    }
                 }
+                precision = Some(p);
             }
-            precision = Some(p);
         }
 
         // Helper: apply width/alignment to an already-formatted string
@@ -264,6 +272,72 @@ fn format_string(
                     output.push_str(&vm.last_error);
                 }
             }
+            // 'b' prefix: big (64-bit) integer format modifier
+            // %bd = big decimal, %bx = big hex, %bo = big octal
+            // %bud = big unsigned decimal, %bux = big unsigned hex
+            Some('b') => {
+                let unsigned = chars.next_if_eq(&'u').is_some();
+                match chars.next() {
+                    Some('d') => {
+                        let val = memory::read_big(&vm.frames.data, arg_offset);
+                        let s = if unsigned {
+                            (val as u64).to_string()
+                        } else {
+                            val.to_string()
+                        };
+                        output.push_str(&apply_width(s));
+                    }
+                    Some('x') => {
+                        let val = memory::read_big(&vm.frames.data, arg_offset) as u64;
+                        let s = if let Some(prec) = precision {
+                            format!("{:0>width$x}", val, width = prec)
+                        } else {
+                            format!("{val:x}")
+                        };
+                        output.push_str(&apply_width(s));
+                    }
+                    Some('X') => {
+                        let val = memory::read_big(&vm.frames.data, arg_offset) as u64;
+                        let s = if let Some(prec) = precision {
+                            format!("{:0>width$X}", val, width = prec)
+                        } else {
+                            format!("{val:X}")
+                        };
+                        output.push_str(&apply_width(s));
+                    }
+                    Some('o') => {
+                        let val = memory::read_big(&vm.frames.data, arg_offset) as u64;
+                        let s = format!("{val:o}");
+                        output.push_str(&apply_width(s));
+                    }
+                    _ => {
+                        output.push_str("<bad %b>");
+                    }
+                }
+                arg_offset += 8; // big values are 8 bytes
+            }
+            // 'u' prefix for unsigned word (rarely used without 'b')
+            Some('u') => {
+                match chars.next() {
+                    Some('d') => {
+                        let val = memory::read_word(&vm.frames.data, arg_offset) as u32;
+                        output.push_str(&apply_width(val.to_string()));
+                    }
+                    Some('x') => {
+                        let val = memory::read_word(&vm.frames.data, arg_offset) as u32;
+                        let s = if let Some(prec) = precision {
+                            format!("{:0>width$x}", val, width = prec)
+                        } else {
+                            format!("{val:x}")
+                        };
+                        output.push_str(&apply_width(s));
+                    }
+                    _ => {
+                        output.push_str("<bad %u>");
+                    }
+                }
+                arg_offset += 4;
+            }
             Some(other) => {
                 output.push('%');
                 output.push(other);
@@ -299,7 +373,7 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
             bf("fprint", 0xf46486c8, 64, sys_fprint),
             bf("fstat", 0xda4499c2, 40, sys_fstat),
             bf("fversion", 0xfe9c0a06, 48, sys_fversion),
-            bf("fwstat", 0x50a6c7e0, 104, sys_stub),
+            bf("fwstat", 0x50a6c7e0, 104, sys_fwstat),
             bf("iounit", 0x5583b730, 40, sys_iounit),
             bf("listen", 0xb97416e0, 48, sys_listen),
             bf("millisec", 0x616977e8, 32, sys_millisec),
@@ -317,13 +391,13 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
             bf("sleep", 0xe67bf126, 40, sys_sleep),
             bf("sprint", 0x4c0624b6, 64, sys_sprint),
             bf("stat", 0x319328dd, 40, sys_stat),
-            bf("stream", 0xb9e8f9ea, 48, sys_stub),
+            bf("stream", 0xb9e8f9ea, 48, sys_stream),
             bf("tokenize", 0x57338f20, 40, sys_tokenize),
             bf("unmount", 0x21e337e3, 40, sys_stub), // unsupported on host OS
             bf("utfbytes", 0x01d4a1f4, 40, sys_utfbytes),
             bf("werrstr", 0xc6935858, 40, sys_werrstr),
             bf("write", 0x7cfef557, 48, sys_write),
-            bf("wstat", 0x56b02096, 104, sys_stub), // requires OS-specific permissions API
+            bf("wstat", 0x56b02096, 104, sys_wstat),
         ],
     }
 }
@@ -675,28 +749,35 @@ fn sys_byte2char(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let n = memory::read_word(&vm.frames.data, frame_base + ARG_START + 4) as usize;
 
-    let (char_val, bytes_consumed, status) = if let Some(data) = vm.heap.array_read(buf_id, 0, n) {
-        match std::str::from_utf8(&data) {
-            Ok(s) => {
-                if let Some(ch) = s.chars().next() {
-                    (ch as i32, ch.len_utf8() as i32, 0)
-                } else {
-                    (0, 0, -1)
-                }
+    // byte2char(buf, n): convert UTF-8 bytes starting at buf[n] to a Unicode codepoint.
+    // Determine the available bytes from offset n, then read only what exists.
+    let buf_len = vm.heap.array_byte_len(buf_id).unwrap_or(0);
+    let avail = buf_len.saturating_sub(n);
+    let read_len = avail.min(6);
+    let (char_val, bytes_consumed, status) = if read_len == 0 {
+        (0, 0, -1)
+    } else if let Some(data) = vm.heap.array_read(buf_id, n, read_len) {
+        // Determine expected UTF-8 sequence length from first byte
+        let first = data[0];
+        let seq_len = if first < 0x80 {
+            1
+        } else if first < 0xE0 {
+            2
+        } else if first < 0xF0 {
+            3
+        } else {
+            4
+        };
+        if seq_len <= data.len() {
+            match std::str::from_utf8(&data[..seq_len]) {
+                Ok(s) => match s.chars().next() {
+                    Some(ch) => (ch as i32, ch.len_utf8() as i32, 0),
+                    None => (0, 0, -1),
+                },
+                Err(_) => (0xFFFD, 1, 0),
             }
-            Err(e) => {
-                let valid = e.valid_up_to();
-                if valid > 0 {
-                    let s = std::str::from_utf8(&data[..valid]).unwrap_or("");
-                    if let Some(ch) = s.chars().next() {
-                        (ch as i32, ch.len_utf8() as i32, 0)
-                    } else {
-                        (0xFFFD, 1, 0)
-                    }
-                } else {
-                    (0xFFFD, 1, 0) // replacement character
-                }
-            }
+        } else {
+            (0xFFFD, 1, 0)
         }
     } else {
         (0, 0, -1)
@@ -1180,6 +1261,128 @@ fn sys_listen(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// Set file metadata (permissions) for a named file.
+/// wstat(s: string, d: Dir): int
+/// Frame: ARG_START+0 = path string ptr, ARG_START+4 = Dir record ptr
+fn sys_wstat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let dir_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
+    let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+
+    let result = apply_dir_permissions(vm, &path, dir_id);
+    memory::write_word(&mut vm.frames.data, frame_base, result);
+    Ok(())
+}
+
+/// Set file metadata (permissions) for an open fd.
+/// fwstat(fd: ref FD, d: Dir): int
+/// Frame: ARG_START+0 = fd record ptr, ARG_START+4 = Dir record ptr
+fn sys_fwstat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let dir_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
+    let fd_num = get_fd_num(vm, fd_id);
+    let path = vm.files.get_path(fd_num).unwrap_or("").to_string();
+
+    let result = if path.is_empty() {
+        vm.last_error = "unknown file".to_string();
+        -1
+    } else {
+        apply_dir_permissions(vm, &path, dir_id)
+    };
+    memory::write_word(&mut vm.frames.data, frame_base, result);
+    Ok(())
+}
+
+/// Read the mode field from a Dir record (offset 32) and apply it as file permissions.
+fn apply_dir_permissions(vm: &mut VmState<'_>, path: &str, dir_id: HeapId) -> i32 {
+    let mode = if let Some(obj) = vm.heap.get(dir_id) {
+        if let HeapData::Record(data) = &obj.data {
+            if data.len() >= 36 {
+                // mode is at offset 32 in the Dir record (see build_dir_record)
+                memory::read_word(data, 32)
+            } else {
+                return -1;
+            }
+        } else {
+            return -1;
+        }
+    } else {
+        return -1;
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(mode as u32);
+        match std::fs::set_permissions(path, perms) {
+            Ok(()) => 0,
+            Err(e) => {
+                vm.last_error = format!("{e}");
+                -1
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // On non-Unix, we can only set readonly status
+        let readonly = (mode & 0o222) == 0;
+        let mut perms = match std::fs::metadata(path) {
+            Ok(m) => m.permissions(),
+            Err(e) => {
+                vm.last_error = format!("{e}");
+                return -1;
+            }
+        };
+        perms.set_readonly(readonly);
+        match std::fs::set_permissions(path, perms) {
+            Ok(()) => 0,
+            Err(e) => {
+                vm.last_error = format!("{e}");
+                -1
+            }
+        }
+    }
+}
+
+/// Continuously read from src and write to dst until EOF.
+/// stream(src, dst: ref FD, bufsiz: int): int
+fn sys_stream(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    let src_fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let dst_fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
+    let bufsiz = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
+
+    let src_fd = get_fd_num(vm, src_fd_id);
+    let dst_fd = get_fd_num(vm, dst_fd_id);
+    let bufsiz = if bufsiz == 0 { 8192 } else { bufsiz };
+
+    let mut total: i64 = 0;
+    let mut buf = vec![0u8; bufsiz];
+    loop {
+        let n = match vm.files.read(src_fd, &mut buf) {
+            Ok(0) => break, // EOF
+            Ok(n) => n,
+            Err(e) => {
+                vm.last_error = format!("{e}");
+                memory::write_word(&mut vm.frames.data, frame_base, -1);
+                return Ok(());
+            }
+        };
+        match vm.files.write(dst_fd, &buf[..n]) {
+            Ok(w) => total += w as i64,
+            Err(e) => {
+                vm.last_error = format!("{e}");
+                memory::write_word(&mut vm.frames.data, frame_base, -1);
+                return Ok(());
+            }
+        }
+    }
+    memory::write_word(&mut vm.frames.data, frame_base, total as i32);
+    Ok(())
+}
+
 fn get_fd_num(vm: &VmState<'_>, fd_id: HeapId) -> i32 {
     if fd_id == heap::NIL as HeapId {
         return -1;
@@ -1389,5 +1592,93 @@ mod tests {
             memory::write_word(&mut vm.frames.data, off, 0x1a2b);
         });
         assert_eq!(result, "0001a2b");
+    }
+
+    #[test]
+    fn byte2char_decodes_ascii() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let buf_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: vec![0x41, 0x42, 0x43], // "ABC"
+                length: 3,
+            },
+        );
+        let frame_base = vm.frames.current_data_offset();
+        // Use a frame scratch area as return pointer target
+        let ret_off = frame_base + 48;
+        memory::write_word(&mut vm.frames.data, frame_base + 16, ret_off as i32);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, buf_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 4, 0);
+
+        sys_byte2char(&mut vm).expect("byte2char should succeed");
+
+        let char_val = memory::read_word(&vm.frames.data, ret_off);
+        let bytes_consumed = memory::read_word(&vm.frames.data, ret_off + 4);
+        let status = memory::read_word(&vm.frames.data, ret_off + 8);
+        assert_eq!(char_val, 0x41, "should decode 'A'");
+        assert_eq!(bytes_consumed, 1, "ASCII is 1 byte");
+        assert_eq!(status, 0, "status should be success");
+    }
+
+    #[test]
+    fn byte2char_decodes_multibyte_utf8() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        // α = U+03B1, UTF-8: 0xCE 0xB1
+        let buf_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: vec![0xCE, 0xB1, 0x00],
+                length: 3,
+            },
+        );
+        let frame_base = vm.frames.current_data_offset();
+        let ret_off = frame_base + 48;
+        memory::write_word(&mut vm.frames.data, frame_base + 16, ret_off as i32);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, buf_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 4, 0);
+
+        sys_byte2char(&mut vm).expect("byte2char should succeed");
+
+        let char_val = memory::read_word(&vm.frames.data, ret_off);
+        let bytes_consumed = memory::read_word(&vm.frames.data, ret_off + 4);
+        let status = memory::read_word(&vm.frames.data, ret_off + 8);
+        assert_eq!(char_val, 945, "should decode α (U+03B1)");
+        assert_eq!(bytes_consumed, 2, "α is 2 UTF-8 bytes");
+        assert_eq!(status, 0, "status should be success");
+    }
+
+    #[test]
+    fn byte2char_reads_from_offset_n() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        // Put ASCII 'X' at offset 0, then α (0xCE, 0xB1) at offset 1
+        let buf_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: vec![0x58, 0xCE, 0xB1, 0x00],
+                length: 4,
+            },
+        );
+        let frame_base = vm.frames.current_data_offset();
+        let ret_off = frame_base + 48;
+        memory::write_word(&mut vm.frames.data, frame_base + 16, ret_off as i32);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, buf_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 4, 1); // n=1
+
+        sys_byte2char(&mut vm).expect("byte2char should succeed");
+
+        let char_val = memory::read_word(&vm.frames.data, ret_off);
+        let bytes_consumed = memory::read_word(&vm.frames.data, ret_off + 4);
+        assert_eq!(char_val, 945, "should decode α at offset 1");
+        assert_eq!(bytes_consumed, 2, "α is 2 UTF-8 bytes");
     }
 }

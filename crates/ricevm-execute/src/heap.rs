@@ -167,6 +167,18 @@ impl Heap {
         }
     }
 
+    /// Return the byte length of an array or array slice.
+    pub fn array_byte_len(&self, id: HeapId) -> Option<usize> {
+        let obj = self.get(id)?;
+        match &obj.data {
+            HeapData::Array { data, .. } => Some(data.len()),
+            HeapData::ArraySlice {
+                elem_size, length, ..
+            } => Some(length * elem_size),
+            _ => None,
+        }
+    }
+
     /// Read bytes from an array or array slice, resolving slices to their parent.
     pub fn array_read(&self, id: HeapId, offset: usize, len: usize) -> Option<Vec<u8>> {
         let obj = self.get(id)?;

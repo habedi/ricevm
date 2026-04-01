@@ -309,6 +309,8 @@ impl<'m> VmState<'m> {
                         &self.frames,
                         &self.mp,
                         &self.loaded_modules,
+                        &self.thread_queue,
+                        &self.caller_mp_stack,
                     );
                 }
             }

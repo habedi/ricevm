@@ -22,6 +22,8 @@ pub(crate) fn collect(
     frames: &FrameStack,
     mp: &[u8],
     loaded_modules: &[crate::vm::LoadedModule],
+    suspended_threads: &std::collections::VecDeque<crate::vm::SuspendedThread>,
+    caller_mp_stack: &[(usize, Vec<u8>)],
 ) {
     if heap.len() == 0 {
         return;
@@ -29,15 +31,29 @@ pub(crate) fn collect(
 
     let mut marked = HashSet::new();
 
-    // Mark phase: scan frame stack for potential heap references
+    // Mark phase: scan current thread's frame stack
     scan_buffer(&frames.data, heap, &mut marked);
 
-    // Mark phase: scan module data
+    // Mark phase: scan current module data
     scan_buffer(mp, heap, &mut marked);
+
+    // Mark phase: scan current thread's caller MP stack (active during loaded module calls)
+    for (_, caller_mp) in caller_mp_stack {
+        scan_buffer(caller_mp, heap, &mut marked);
+    }
 
     // Mark phase: scan all loaded modules' MPs
     for lm in loaded_modules {
         scan_buffer(&lm.mp, heap, &mut marked);
+    }
+
+    // Mark phase: scan suspended threads' frames, MPs, and caller stacks
+    for thread in suspended_threads {
+        scan_buffer(&thread.frames.data, heap, &mut marked);
+        scan_buffer(&thread.mp, heap, &mut marked);
+        for (_, caller_mp) in &thread.caller_mp_stack {
+            scan_buffer(caller_mp, heap, &mut marked);
+        }
     }
 
     // Sweep phase: remove all unmarked objects
@@ -123,7 +139,14 @@ mod tests {
         assert!(heap.get(id2).is_some());
 
         // Run GC
-        collect(&mut heap, &frames, &[], &[]);
+        collect(
+            &mut heap,
+            &frames,
+            &[],
+            &[],
+            &std::collections::VecDeque::new(),
+            &[],
+        );
 
         // After GC: id2 should be collected (not referenced by any root)
         assert!(heap.get(id2).is_none());
@@ -139,7 +162,14 @@ mod tests {
         let off = frames.current_data_offset();
         memory::write_word(&mut frames.data, off, id1 as i32);
 
-        collect(&mut heap, &frames, &[], &[]);
+        collect(
+            &mut heap,
+            &frames,
+            &[],
+            &[],
+            &std::collections::VecDeque::new(),
+            &[],
+        );
 
         assert!(heap.get(id1).is_some());
         assert_eq!(heap.get_string(id1), Some("hello"));
@@ -158,10 +188,58 @@ mod tests {
         let off = frames.current_data_offset();
         memory::write_word(&mut frames.data, off, list_id as i32);
 
-        collect(&mut heap, &frames, &[], &[]);
+        collect(
+            &mut heap,
+            &frames,
+            &[],
+            &[],
+            &std::collections::VecDeque::new(),
+            &[],
+        );
 
         // Both the list node and the string it references should survive
         assert!(heap.get(list_id).is_some());
         assert!(heap.get(str_id).is_some());
+    }
+
+    #[test]
+    fn gc_preserves_suspended_thread_references() {
+        let mut heap = Heap::new();
+        let id_in_thread = heap.alloc(0, HeapData::Str("thread-owned".to_string()));
+        let id_unreachable = heap.alloc(0, HeapData::Str("orphan".to_string()));
+
+        // Current thread has no references
+        let frames = FrameStack::new();
+
+        // Suspended thread holds id_in_thread in its frame
+        let mut thread_frames = FrameStack::new();
+        thread_frames.push_entry(16, -1);
+        let off = thread_frames.current_data_offset();
+        memory::write_word(&mut thread_frames.data, off, id_in_thread as i32);
+
+        let mut thread_queue = std::collections::VecDeque::new();
+        thread_queue.push_back(crate::vm::SuspendedThread {
+            frames: thread_frames,
+            mp: Vec::new(),
+            pc: 0,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            current_loaded_module: None,
+            caller_mp_stack: Vec::new(),
+            blocked_on: None,
+        });
+
+        collect(&mut heap, &frames, &[], &[], &thread_queue, &[]);
+
+        // Object referenced by the suspended thread must survive
+        assert!(
+            heap.get(id_in_thread).is_some(),
+            "GC must not collect objects referenced by suspended threads"
+        );
+        // Unreachable object should be collected
+        assert!(
+            heap.get(id_unreachable).is_none(),
+            "GC should collect unreachable objects"
+        );
     }
 }

@@ -3,6 +3,7 @@
 //! Takes a loaded [`Module`] and runs it from its entry point.
 
 mod address;
+mod audio;
 mod builtin;
 mod channel;
 mod data;

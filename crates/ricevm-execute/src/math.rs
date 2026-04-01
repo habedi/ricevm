@@ -61,8 +61,8 @@ pub(crate) fn create_math_module() -> BuiltinModule {
             mf("fmin", 48, math_fmin),
             mf("fmod", 48, math_fmod),
             mf("gemm", 96, math_gemm),
-            mf("getFPcontrol", 32, math_stub_int),
-            mf("getFPstatus", 32, math_stub_int),
+            mf("getFPcontrol", 32, math_get_fp_control),
+            mf("getFPstatus", 32, math_get_fp_status),
             mf("hypot", 48, math_hypot),
             mf("iamax", 40, math_iamax),
             mf("ilogb", 40, math_ilogb),
@@ -114,7 +114,68 @@ fn mf(
     }
 }
 
-fn math_stub_int(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+/// Write a real (8-byte) return value to both frame offset 0 and the return
+/// pointer at offset 16. The 4-byte mcall return copy cannot handle 8-byte values.
+fn write_real_return(vm: &mut VmState<'_>, base: usize, val: f64) {
+    memory::write_real(&mut vm.frames.data, base + RET_OFF, val);
+    let ret_ptr = memory::read_word(&vm.frames.data, base + 16);
+    if ret_ptr != 0 {
+        let target = crate::address::decode_virtual_addr(ret_ptr, 0);
+        let mut buf = [0u8; 8];
+        memory::write_real(&mut buf, 0, val);
+        match target {
+            crate::address::AddrTarget::Frame(off) if off + 8 <= vm.frames.data.len() => {
+                vm.frames.data[off..off + 8].copy_from_slice(&buf);
+            }
+            crate::address::AddrTarget::ModuleMp { module_idx, offset } => {
+                if let Some(mp) = vm
+                    .module_mp_mut(module_idx)
+                    .filter(|mp| offset + 8 <= mp.len())
+                {
+                    mp[offset..offset + 8].copy_from_slice(&buf);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Write a big (8-byte) return value to both frame offset 0 and the return pointer.
+fn write_big_return(vm: &mut VmState<'_>, base: usize, val: i64) {
+    memory::write_big(&mut vm.frames.data, base, val);
+    let ret_ptr = memory::read_word(&vm.frames.data, base + 16);
+    if ret_ptr != 0 {
+        let target = crate::address::decode_virtual_addr(ret_ptr, 0);
+        let mut buf = [0u8; 8];
+        memory::write_big(&mut buf, 0, val);
+        match target {
+            crate::address::AddrTarget::Frame(off) if off + 8 <= vm.frames.data.len() => {
+                vm.frames.data[off..off + 8].copy_from_slice(&buf);
+            }
+            crate::address::AddrTarget::ModuleMp { module_idx, offset } => {
+                if let Some(mp) = vm
+                    .module_mp_mut(module_idx)
+                    .filter(|mp| offset + 8 <= mp.len())
+                {
+                    mp[offset..offset + 8].copy_from_slice(&buf);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Return the FP control word. Since we don't have hardware FP control
+/// registers, return 0 which means all exceptions masked, round-to-nearest.
+fn math_get_fp_control(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let base = vm.frames.current_data_offset();
+    memory::write_word(&mut vm.frames.data, base, 0);
+    Ok(())
+}
+
+/// Return the FP status word. Since we don't have hardware FP status
+/// registers, return 0 which means no exceptions raised.
+fn math_get_fp_status(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     memory::write_word(&mut vm.frames.data, base, 0);
     Ok(())
@@ -190,7 +251,7 @@ fn math_tanh(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn unary_real(vm: &mut VmState<'_>, f: fn(f64) -> f64) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, f(x));
+    write_real_return(vm, base, f(x));
     Ok(())
 }
 
@@ -200,7 +261,7 @@ fn math_atan2(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let y = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let x = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, y.atan2(x));
+    write_real_return(vm, base, y.atan2(x));
     Ok(())
 }
 
@@ -208,7 +269,7 @@ fn math_copysign(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let s = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, x.copysign(s));
+    write_real_return(vm, base, x.copysign(s));
     Ok(())
 }
 
@@ -216,7 +277,7 @@ fn math_fmax(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, x.max(y));
+    write_real_return(vm, base, x.max(y));
     Ok(())
 }
 
@@ -224,7 +285,7 @@ fn math_fmin(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, x.min(y));
+    write_real_return(vm, base, x.min(y));
     Ok(())
 }
 
@@ -232,7 +293,7 @@ fn math_fmod(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, x % y);
+    write_real_return(vm, base, x % y);
     Ok(())
 }
 
@@ -240,7 +301,7 @@ fn math_hypot(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, x.hypot(y));
+    write_real_return(vm, base, x.hypot(y));
     Ok(())
 }
 
@@ -248,7 +309,7 @@ fn math_pow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, x.powf(y));
+    write_real_return(vm, base, x.powf(y));
     Ok(())
 }
 
@@ -256,7 +317,7 @@ fn math_remainder(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, x % y);
+    write_real_return(vm, base, x % y);
     Ok(())
 }
 
@@ -264,7 +325,7 @@ fn math_scalbn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let n = memory::read_word(&vm.frames.data, base + ARG2_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, x * (2.0_f64).powi(n));
+    write_real_return(vm, base, x * (2.0_f64).powi(n));
     Ok(())
 }
 
@@ -299,7 +360,7 @@ fn math_isnan(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn math_pow10(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let p = memory::read_word(&vm.frames.data, base + ARG1_OFF);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, 10.0_f64.powi(p));
+    write_real_return(vm, base, 10.0_f64.powi(p));
     Ok(())
 }
 
@@ -309,7 +370,7 @@ fn math_bits32real(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let bits = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u32;
     let val = f32::from_bits(bits) as f64;
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, val);
+    write_real_return(vm, base, val);
     Ok(())
 }
 
@@ -317,7 +378,7 @@ fn math_bits64real(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let bits = memory::read_big(&vm.frames.data, base + ARG1_OFF) as u64;
     let val = f64::from_bits(bits);
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, val);
+    write_real_return(vm, base, val);
     Ok(())
 }
 
@@ -332,8 +393,7 @@ fn math_realbits32(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn math_realbits64(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
-    let bits = x.to_bits() as i64;
-    memory::write_big(&mut vm.frames.data, base, bits);
+    write_big_return(vm, base, x.to_bits() as i64);
     Ok(())
 }
 
@@ -454,7 +514,7 @@ fn math_jn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             if n < 0 && n % 2 != 0 { -jn } else { jn }
         }
     };
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, result);
+    write_real_return(vm, base, result);
     Ok(())
 }
 
@@ -537,7 +597,7 @@ fn math_yn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             yn
         }
     };
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, result);
+    write_real_return(vm, base, result);
     Ok(())
 }
 
@@ -578,7 +638,7 @@ fn math_modf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let int_part = x.trunc();
     let frac_part = x.fract();
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, int_part);
+    write_real_return(vm, base, int_part);
     memory::write_real(&mut vm.frames.data, base + RET_OFF + 8, frac_part);
     Ok(())
 }
@@ -600,7 +660,7 @@ fn math_nextafter(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         };
         f64::from_bits(next)
     };
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, result);
+    write_real_return(vm, base, result);
     Ok(())
 }
 
@@ -619,7 +679,7 @@ fn math_dot(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let x = read_real_array(vm, x_id, n);
     let y = read_real_array(vm, y_id, n);
     let result: f64 = x.iter().zip(y.iter()).map(|(a, b)| a * b).sum();
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, result);
+    write_real_return(vm, base, result);
     Ok(())
 }
 
@@ -629,7 +689,7 @@ fn math_norm1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let n = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as usize;
     let x = read_real_array(vm, x_id, n);
     let result: f64 = x.iter().map(|v| v.abs()).sum();
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, result);
+    write_real_return(vm, base, result);
     Ok(())
 }
 
@@ -639,7 +699,7 @@ fn math_norm2(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let n = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as usize;
     let x = read_real_array(vm, x_id, n);
     let result: f64 = x.iter().map(|v| v * v).sum::<f64>().sqrt();
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, result);
+    write_real_return(vm, base, result);
     Ok(())
 }
 
@@ -682,10 +742,164 @@ fn math_iamax(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// General matrix multiply: C = alpha * op(A) * op(B) + beta * C
+///
+/// Frame layout (96 bytes total):
+///   32: transa (int)   36: transb (int)
+///   40: m (int)        44: n (int)        48: k (int)
+///   52: pad            56: alpha (real)
+///   64: a (ptr)        68: lda (int)
+///   72: b (ptr)        76: ldb (int)
+///   80: beta (real)
+///   88: c (ptr)        92: ldc (int)
 fn math_gemm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    // General matrix multiply C = alpha*A*B + beta*C
-    // Complex frame layout; stub that does nothing.
-    let _ = vm;
+    let base = vm.frames.current_data_offset();
+    let transa = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u8 as char;
+    let transb = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as u8 as char;
+    let m = memory::read_word(&vm.frames.data, base + ARG1_OFF + 8) as usize;
+    let n = memory::read_word(&vm.frames.data, base + ARG1_OFF + 12) as usize;
+    let k = memory::read_word(&vm.frames.data, base + ARG1_OFF + 16) as usize;
+    // alpha at offset 56 (8-byte aligned after 5 ints + 4 bytes padding)
+    let alpha = memory::read_real(&vm.frames.data, base + 56);
+    let a_id = memory::read_word(&vm.frames.data, base + 64) as u32;
+    let lda = memory::read_word(&vm.frames.data, base + 68) as usize;
+    let b_id = memory::read_word(&vm.frames.data, base + 72) as u32;
+    let ldb = memory::read_word(&vm.frames.data, base + 76) as usize;
+    let beta = memory::read_real(&vm.frames.data, base + 80);
+    let c_id = memory::read_word(&vm.frames.data, base + 88) as u32;
+    let ldc = memory::read_word(&vm.frames.data, base + 92) as usize;
+
+    let nota = transa == 'N';
+    let notb = transb == 'N';
+
+    if m == 0 || n == 0 || ((alpha == 0.0 || k == 0) && beta == 1.0) {
+        return Ok(());
+    }
+
+    // Helper: read a real from a heap array at the given element index
+    let read_arr = |vm: &VmState<'_>, id: u32, idx: usize| -> f64 {
+        if let Some(bytes) = vm.heap.array_read(id, idx * 8, 8) {
+            memory::read_real(&bytes, 0)
+        } else {
+            0.0
+        }
+    };
+
+    // Read C into a working buffer
+    let c_size = ldc * (n.max(1) - 1) + m;
+    let mut c_buf: Vec<f64> = (0..c_size).map(|i| read_arr(vm, c_id, i)).collect();
+
+    if alpha == 0.0 {
+        for j in 0..n {
+            let jc = j * ldc;
+            for i in 0..m {
+                if beta == 0.0 {
+                    c_buf[i + jc] = 0.0;
+                } else {
+                    c_buf[i + jc] *= beta;
+                }
+            }
+        }
+    } else if a_id == 0 {
+        // A is nil: C := alpha*op(B) + beta*C
+        for j in 0..n {
+            let jc = j * ldc;
+            for i in 0..m {
+                let b_val = if notb {
+                    read_arr(vm, b_id, i + j * ldb)
+                } else {
+                    read_arr(vm, b_id, j + i * ldb)
+                };
+                c_buf[i + jc] = alpha * b_val + beta * c_buf[i + jc];
+            }
+        }
+    } else if notb {
+        if nota {
+            // C := alpha*A*B + beta*C
+            for j in 0..n {
+                let jc = j * ldc;
+                for i in 0..m {
+                    if beta == 0.0 {
+                        c_buf[i + jc] = 0.0;
+                    } else if beta != 1.0 {
+                        c_buf[i + jc] *= beta;
+                    }
+                }
+                for l in 0..k {
+                    let b_val = read_arr(vm, b_id, l + j * ldb);
+                    if b_val != 0.0 {
+                        let temp = alpha * b_val;
+                        for i in 0..m {
+                            let a_val = read_arr(vm, a_id, i + l * lda);
+                            c_buf[i + jc] += temp * a_val;
+                        }
+                    }
+                }
+            }
+        } else {
+            // C := alpha*A'*B + beta*C
+            for j in 0..n {
+                let jc = j * ldc;
+                for i in 0..m {
+                    let mut temp = 0.0;
+                    for l in 0..k {
+                        temp += read_arr(vm, a_id, l + i * lda) * read_arr(vm, b_id, l + j * ldb);
+                    }
+                    if beta == 0.0 {
+                        c_buf[i + jc] = alpha * temp;
+                    } else {
+                        c_buf[i + jc] = alpha * temp + beta * c_buf[i + jc];
+                    }
+                }
+            }
+        }
+    } else if nota {
+        // C := alpha*A*B' + beta*C
+        for j in 0..n {
+            let jc = j * ldc;
+            for i in 0..m {
+                if beta == 0.0 {
+                    c_buf[i + jc] = 0.0;
+                } else if beta != 1.0 {
+                    c_buf[i + jc] *= beta;
+                }
+            }
+            for l in 0..k {
+                let b_val = read_arr(vm, b_id, j + l * ldb);
+                if b_val != 0.0 {
+                    let temp = alpha * b_val;
+                    for i in 0..m {
+                        let a_val = read_arr(vm, a_id, i + l * lda);
+                        c_buf[i + jc] += temp * a_val;
+                    }
+                }
+            }
+        }
+    } else {
+        // C := alpha*A'*B' + beta*C
+        for j in 0..n {
+            let jc = j * ldc;
+            for i in 0..m {
+                let mut temp = 0.0;
+                for l in 0..k {
+                    temp += read_arr(vm, a_id, l + i * lda) * read_arr(vm, b_id, j + l * ldb);
+                }
+                if beta == 0.0 {
+                    c_buf[i + jc] = alpha * temp;
+                } else {
+                    c_buf[i + jc] = alpha * temp + beta * c_buf[i + jc];
+                }
+            }
+        }
+    }
+
+    // Write C buffer back to heap
+    for (i, &val) in c_buf.iter().enumerate() {
+        let mut buf = [0u8; 8];
+        memory::write_real(&mut buf, 0, val);
+        vm.heap.array_write(c_id, i * 8, &buf);
+    }
+
     Ok(())
 }
 
@@ -707,22 +921,27 @@ fn math_export_int(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn math_export_real(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
-    let val = memory::read_real(&vm.frames.data, base + ARG1_OFF);
-    let buf_id = memory::read_word(&vm.frames.data, base + ARG2_OFF) as u32;
-    if let Some(obj) = vm.heap.get_mut(buf_id)
-        && let crate::heap::HeapData::Array { data, .. } = &mut obj.data
-        && data.len() >= 8
-    {
-        let bytes = val.to_be_bytes();
-        data[..8].copy_from_slice(&bytes);
-    }
+    // Signature: export_real(buf: array of byte, x: real)
+    // The compiler passes x via a 1-element float array at +36.
+    let buf_id = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u32;
+    let val_arr_id = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as u32;
+    // Read the real from the float array
+    let val = if let Some(data) = vm.heap.array_read(val_arr_id, 0, 8) {
+        memory::read_real(&data, 0)
+    } else {
+        // Fallback: try reading as a raw real at +40 (older calling convention)
+        memory::read_real(&vm.frames.data, base + ARG2_OFF)
+    };
+    let bytes = val.to_be_bytes();
+    vm.heap.array_write(buf_id, 0, &bytes);
     Ok(())
 }
 
 fn math_export_real32(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
-    let val = memory::read_real(&vm.frames.data, base + ARG1_OFF) as f32;
-    let buf_id = memory::read_word(&vm.frames.data, base + ARG2_OFF) as u32; // arg1 is real (8 bytes), so arg2 at ARG2_OFF
+    // Signature: export_real32(buf: array of byte, val: real)
+    let buf_id = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u32;
+    let val = memory::read_real(&vm.frames.data, base + ARG2_OFF) as f32;
     if let Some(obj) = vm.heap.get_mut(buf_id)
         && let crate::heap::HeapData::Array { data, .. } = &mut obj.data
         && data.len() >= 4
@@ -771,7 +990,7 @@ fn math_import_real(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         memory::write_real(data, 0, val);
     }
     // Also write at frame offset 0 for the standard return mechanism
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, val);
+    write_real_return(vm, base, val);
     Ok(())
 }
 
@@ -786,6 +1005,6 @@ fn math_import_real32(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     } else {
         0.0
     };
-    memory::write_real(&mut vm.frames.data, base + RET_OFF, val);
+    write_real_return(vm, base, val);
     Ok(())
 }

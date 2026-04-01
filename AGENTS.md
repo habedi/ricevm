@@ -36,8 +36,8 @@ Priorities, in order:
 
 - `crates/ricevm-core/`: Shared types (Module, Opcode, Instruction, TypeDescriptor, and errors). No runtime logic.
 - `crates/ricevm-loader/`: Binary format parser for `.dis` module files. One public function: `load(&[u8]) -> Result<Module, LoadError>`.
-- `crates/ricevm-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, and $Crypt), and file-based
-  module loading.
+- `crates/ricevm-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, $Crypt, and audio), and
+  file-based module loading.
 - `crates/ricevm-cli/`: CLI with `run` and `dis` subcommands.
 - `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
   `libinterp/xec.c` for correctness validation).
@@ -70,10 +70,11 @@ ricevm-cli
 | `data.rs`      | Module data (MP) initialization with type-aware elem sizes and nested arrays           |
 | `filetab.rs`   | Portable file descriptor table with in-memory pipe support                             |
 | `ops/`         | 176 instruction handlers organized by category                                         |
-| `sys.rs`       | Built-in `$Sys` module (43 functions with tuple return support)                        |
+| `sys.rs`       | Built-in `$Sys` module (43 functions with tuple return support, `%b`, `%u`, and `%.*`) |
 | `math.rs`      | Built-in `$Math` module (66 functions including linear algebra)                        |
 | `draw.rs`      | Built-in `$Draw` module (SDL2 backend, optional `gui` feature)                         |
 | `tk.rs`        | Built-in `$Tk` module (widget toolkit stubs)                                           |
+| `audio.rs`     | `/dev/audio` and `/dev/audioctl` support (cpal backend, optional `audio` feature)      |
 | `builtin.rs`   | `ModuleRegistry` for built-in module registration with name and signature lookup       |
 | `scheduler.rs` | Preemptive thread scheduler infrastructure (not yet connected to main loop)            |
 | `channel.rs`   | Channel data structure for inter-thread communication                                  |
@@ -103,12 +104,15 @@ ricevm-cli
   `cvtwc`/`cvtcw` format/parse decimal strings, `cvtfc` uses `%g` format.
 - `expw`/`expl`/`expf` use repeated-squaring with base from mid and integer exponent from src.
 - Cooperative threading: `spawn` creates threads in a queue, the run loop rotates every 2048 instructions,
-  `recv` on empty channels blocks the thread, `send` unblocks waiting threads.
+  `recv` on empty channels blocks the thread, `send` on full channels blocks the thread,
+  both directions unblock on state change. Cloned MP adjusts heap ref counts.
 - Alt table format: `{nsend, nrecv}` header followed by 8-byte `{channel_ptr, data_ptr}` entries.
 - Per-thread error string (`last_error`) implements the `werrstr`/`%r` mechanism.
 - Portable I/O via `FileTable` (no `libc` dependency) with in-memory pipe support.
 - Library modules with `entry_pc = -1` return success immediately (no init function).
 - SDL2 for GUI is behind an optional `gui` feature flag.
+- Audio support (`/dev/audio` and `/dev/audioctl`) is behind an optional `audio` feature flag (cpal backend).
+- `export_real`/`export_real32` use correct argument order (address, then value).
 
 ### Reference Implementation
 

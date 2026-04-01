@@ -13,9 +13,9 @@
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/habedi/ricevm)
 [![Release](https://img.shields.io/github/release/habedi/ricevm.svg?label=release&style=flat&labelColor=282c34&logo=github)](https://github.com/habedi/ricevm/releases/latest)
 
-RiceVM is an implementation of the [Dis virtual machine](https://en.wikipedia.org/wiki/Limbo_(programming_language)#Virtual_machine) in Rust.
+RiceVM is an implementation of the [Dis virtual machine](https://www.inferno-os.org/inferno/papers/dis.pdf) in Rust.
 The Dis virtual machine is a register machine that executes bytecode compiled from
-the [Limbo programming language](https://en.wikipedia.org/wiki/Limbo_(programming_language)).
+the [Limbo programming language](https://inferno-os.org/inferno/papers/limbo.html).
 
 ### Features
 

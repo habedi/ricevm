@@ -66,10 +66,24 @@ pub(crate) fn op_spawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     child_frames.current_base = 0;
     child_frames.current_size = child_frames.data.len();
 
+    // Clone MP for the child and increment ref counts for all heap pointers
+    // contained in the cloned MP to avoid premature GC collection.
+    let cloned_mp = vm.mp.clone();
+    {
+        let mut offset = 0;
+        while offset + 4 <= cloned_mp.len() {
+            let val = crate::memory::read_word(&cloned_mp, offset) as u32;
+            if val >= crate::heap::HEAP_ID_BASE && vm.heap.contains(val) {
+                vm.heap.inc_ref(val);
+            }
+            offset += 4;
+        }
+    }
+
     // Create suspended thread for the child.
     let child = crate::vm::SuspendedThread {
         frames: child_frames,
-        mp: vm.mp.clone(),
+        mp: cloned_mp,
         pc: target_pc,
         heap_refs: Vec::new(),
         last_error: String::new(),
@@ -83,13 +97,77 @@ pub(crate) fn op_spawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// mspawn src, mid, dst:create a thread in a loaded module.
+/// mspawn src, mid, dst: create a thread in a module.
+/// For Main modules, creates a cooperative thread (like spawn).
+/// For Builtin and Loaded modules, runs inline.
 pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_ptr = vm.src_word()? as usize;
     let func_idx = vm.mid_word()? as u32;
     let mod_ref_id = vm.dst_ptr()?;
     let kind = resolve_module_ref(vm, mod_ref_id)?;
 
+    // For Main module: create a cooperative thread (like op_spawn)
+    if let ModuleKind::Main { func_map } = &kind {
+        let export_idx = func_map
+            .get(func_idx as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(func_idx as usize);
+        let entry_pc = if export_idx < vm.module.exports.len() {
+            vm.module.exports[export_idx].pc as usize
+        } else {
+            return Err(ExecError::Other(format!(
+                "export function {func_idx} (mapped to {export_idx}) not found in main module"
+            )));
+        };
+
+        vm.frames.activate_pending(frame_ptr, -1)?;
+        let child_base = vm.frames.current_base;
+        let child_data = vm.frames.data[child_base..].to_vec();
+        vm.frames.data.truncate(child_base);
+
+        let prev_base = crate::memory::read_word(&child_data, 4) as usize;
+        if prev_base < vm.frames.data.len() {
+            vm.frames.current_base = prev_base;
+            vm.frames.current_size = vm.frames.data.len() - prev_base;
+        } else {
+            vm.frames.current_base = 0;
+            vm.frames.current_size = vm.frames.data.len();
+        }
+
+        let mut child_frames = crate::frame::FrameStack::new();
+        child_frames.data = child_data;
+        child_frames.current_base = 0;
+        child_frames.current_size = child_frames.data.len();
+
+        // Clone MP for the child and increment ref counts for all heap pointers.
+        let cloned_mp = vm.mp.clone();
+        {
+            let mut offset = 0;
+            while offset + 4 <= cloned_mp.len() {
+                let val = crate::memory::read_word(&cloned_mp, offset) as u32;
+                if val >= crate::heap::HEAP_ID_BASE && vm.heap.contains(val) {
+                    vm.heap.inc_ref(val);
+                }
+                offset += 4;
+            }
+        }
+
+        let child = crate::vm::SuspendedThread {
+            frames: child_frames,
+            mp: cloned_mp,
+            pc: entry_pc,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            current_loaded_module: vm.current_loaded_module,
+            caller_mp_stack: vm.caller_mp_stack.clone(),
+            blocked_on: None,
+        };
+        vm.thread_queue.push_back(child);
+        return Ok(());
+    }
+
+    // For Builtin and Loaded modules: run inline
     vm.frames.activate_pending(frame_ptr, vm.next_pc as i32)?;
 
     let saved_pc = vm.pc;
@@ -121,46 +199,7 @@ pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 vm.next_pc = prev_pc as usize;
             }
         }
-        ModuleKind::Main { func_map } => {
-            if vm.current_loaded_module.is_some() {
-                return Err(ExecError::Other(
-                    "spawning main-module refs from loaded modules is unsupported".to_string(),
-                ));
-            }
-
-            let export_idx = func_map
-                .get(func_idx as usize)
-                .copied()
-                .flatten()
-                .unwrap_or(func_idx as usize);
-            let entry_pc = if export_idx < vm.module.exports.len() {
-                vm.module.exports[export_idx].pc as usize
-            } else {
-                return Err(ExecError::Other(format!(
-                    "export function {func_idx} (mapped to {export_idx}) not found in main module"
-                )));
-            };
-
-            vm.pc = entry_pc;
-            vm.halted = false;
-
-            while !vm.halted && vm.pc < vm.module.code.len() {
-                let inst = vm.module.code[vm.pc].clone();
-                if vm.trace {
-                    vm.trace_instruction(&inst);
-                }
-                vm.resolve_operands(&inst)?;
-                vm.next_pc = vm.pc + 1;
-                crate::ops::dispatch(vm, &inst)?;
-                vm.pc = vm.next_pc;
-
-                if vm.frames.current_data_offset() < spawn_frame_base {
-                    break;
-                }
-            }
-
-            vm.halted = false;
-        }
+        ModuleKind::Main { .. } => unreachable!(), // handled above
         ModuleKind::Loaded {
             module_idx,
             func_map,
@@ -477,8 +516,11 @@ fn execute_alt(vm: &mut VmState<'_>, select_first_if_none: bool) -> Result<AltOu
 pub(crate) fn op_send(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let chan_id = vm.dst_ptr()?;
     let (elem_size, pending) = channel_ref(vm, chan_id)?;
+
     if pending.is_some() {
-        // Channel already has data:overwrite (simplified; full impl would block sender)
+        // Channel full: signal the run loop to block this thread
+        vm.blocked_channel = Some(chan_id);
+        return Ok(());
     }
 
     let src_data = read_addr_bytes(vm, vm.src, vm.imm_src, elem_size)?;
@@ -502,6 +544,8 @@ pub(crate) fn op_recv(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         with_channel_mut(vm, chan_id, |_, pending| {
             *pending = None;
         })?;
+        // Wake any blocked senders now that the channel is empty
+        vm.unblock_channel(chan_id);
         write_addr_bytes(vm, vm.dst, &data)
     } else {
         // Channel empty:signal the run loop to block this thread
@@ -829,5 +873,211 @@ mod tests {
         );
         let child = &vm.thread_queue[0];
         assert_eq!(child.pc, 1, "child thread should start at target PC");
+    }
+
+    /// Regression: mspawn with a Main module target should create a cooperative
+    /// thread (not run inline), matching spawn behavior.
+    #[test]
+    fn mspawn_main_module_creates_cooperative_thread() {
+        use ricevm_core::module::ExportEntry;
+
+        let module = Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 2,
+                data_size: 0,
+                type_size: 1,
+                export_size: 1,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+            ],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "mspawn_test".to_string(),
+            exports: vec![ExportEntry {
+                pc: 1,
+                frame_type: 0,
+                signature: 0,
+                name: "target".to_string(),
+            }],
+            imports: vec![],
+            handlers: vec![],
+        };
+
+        let mut vm = VmState::new(&module).unwrap_or_else(|e| panic!("vm init: {e}"));
+
+        // Create a MainModule ref with func_map[0] -> export 0
+        let mod_ref = vm.heap.alloc(
+            0,
+            HeapData::MainModule {
+                func_map: vec![Some(0)],
+            },
+        );
+
+        // Allocate pending frame
+        let pending_offset = vm.frames.alloc_pending(64).unwrap_or(0);
+
+        assert!(vm.thread_queue.is_empty());
+
+        // mspawn: src=pending frame, mid=$0 (func index), dst=module ref
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending_offset as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref as i32;
+
+        op_mspawn(&mut vm).unwrap_or_else(|e| panic!("mspawn: {e}"));
+
+        assert_eq!(
+            vm.thread_queue.len(),
+            1,
+            "mspawn Main should create a cooperative thread"
+        );
+        assert_eq!(
+            vm.thread_queue[0].pc, 1,
+            "child should start at export pc=1"
+        );
+    }
+
+    /// Regression: send on a full channel must set blocked_channel instead
+    /// of overwriting the pending data.
+    #[test]
+    fn send_blocks_when_channel_full() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+
+        let channel_id = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: Some(42_i32.to_ne_bytes().to_vec()),
+            },
+        );
+
+        // Try to send on the already-full channel
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 99;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = channel_id as i32;
+
+        assert!(vm.blocked_channel.is_none(), "should start unblocked");
+        op_send(&mut vm).expect("send on full channel should not error");
+        assert_eq!(
+            vm.blocked_channel,
+            Some(channel_id),
+            "send on full channel should set blocked_channel"
+        );
+
+        // The original data should not have been overwritten
+        match vm.heap.get(channel_id).expect("channel should exist").data {
+            HeapData::Channel { ref pending, .. } => {
+                let data = pending.as_ref().expect("channel should still have data");
+                assert_eq!(
+                    i32::from_ne_bytes(data[..4].try_into().unwrap()),
+                    42,
+                    "original data should not be overwritten"
+                );
+            }
+            _ => panic!("expected channel"),
+        }
+    }
+
+    /// Regression: spawn must increment ref counts for heap pointers in the
+    /// cloned MP to prevent premature GC collection.
+    #[test]
+    fn spawn_increments_mp_heap_pointer_ref_counts() {
+        let module = Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 2,
+                data_size: 8,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+            ],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "spawn_refcount_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        };
+
+        let mut vm = VmState::new(&module).expect("vm init");
+
+        // Allocate a heap object and store its ID in the MP
+        let obj_id = vm.heap.alloc(0, HeapData::Record(vec![0u8; 8]));
+        assert_eq!(vm.heap.get(obj_id).unwrap().ref_count, 1);
+
+        // Put the heap pointer into MP at offset 0
+        if vm.mp.len() < 4 {
+            vm.mp.resize(4, 0);
+        }
+        memory::write_word(&mut vm.mp, 0, obj_id as i32);
+
+        // Allocate a pending frame
+        let pending_offset = vm.frames.alloc_pending(64).expect("alloc_pending");
+
+        // Spawn
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending_offset as i32;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = 1;
+
+        op_spawn(&mut vm).expect("spawn should succeed");
+
+        // The heap object's ref count should have been incremented because
+        // both parent and child MP now reference it.
+        assert_eq!(
+            vm.heap.get(obj_id).unwrap().ref_count,
+            2,
+            "spawn should increment ref count for heap pointers in cloned MP"
+        );
     }
 }

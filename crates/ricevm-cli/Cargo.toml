@@ -5,11 +5,12 @@ edition.workspace = true
 authors.workspace = true
 publish = false
 license.workspace = true
-description = "Command line interface for RiceVM"
+description = "The command line interface for RiceVM"
 
 [features]
 default = []
 gui = ["ricevm_execute/gui"]
+audio = ["ricevm_execute/audio"]
 
 [dependencies]
 ricevm_core.workspace = true

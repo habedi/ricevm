@@ -3,6 +3,7 @@
 //! Maps integer fd numbers to Rust I/O objects, replacing raw Unix fd operations.
 //! Pre-populated with stdin(0), stdout(1), stderr(2).
 
+use crate::audio::AudioState;
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -181,6 +182,67 @@ impl FileOps for TcpListenerFile {
     }
 }
 
+/// Write-only handle for /dev/audio. Delegates to shared AudioState.
+struct AudioFile(Arc<Mutex<AudioState>>);
+
+impl FileOps for AudioFile {
+    fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot read /dev/audio",
+        ))
+    }
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(state.write(buf))
+    }
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot seek /dev/audio",
+        ))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
+/// Control handle for /dev/audioctl. Writes configure the audio device,
+/// reads return the current configuration.
+struct AudioCtlFile(Arc<Mutex<AudioState>>);
+
+impl FileOps for AudioCtlFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let status = state.status();
+        let bytes = status.as_bytes();
+        let n = buf.len().min(bytes.len());
+        buf[..n].copy_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let cmd = String::from_utf8_lossy(buf);
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.configure(&cmd);
+        Ok(buf.len())
+    }
+    fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "cannot seek /dev/audioctl",
+        ))
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 /// Shared buffer for in-memory pipes.
 type PipeBuffer = Arc<Mutex<VecDeque<u8>>>;
 
@@ -253,6 +315,8 @@ pub(crate) struct FileTable {
     /// When non-empty, guest paths starting with `/` are resolved as
     /// `{root}/{guest_path}`. Relative paths are used as-is.
     root: String,
+    /// Shared audio state for /dev/audio and /dev/audioctl.
+    audio: Arc<Mutex<AudioState>>,
 }
 
 impl FileTable {
@@ -265,6 +329,7 @@ impl FileTable {
             files: HashMap::new(),
             next_fd: 3,
             root,
+            audio: Arc::new(Mutex::new(AudioState::new())),
         };
         ft.files.insert(
             0,
@@ -302,7 +367,18 @@ impl FileTable {
     }
 
     /// Open a file and return its fd number.
+    ///
+    /// Intercepts `/dev/audio` and `/dev/audioctl` to provide virtual
+    /// audio device files. All other paths are opened on the host filesystem.
     pub fn open(&mut self, path: &str, mode: i32) -> io::Result<i32> {
+        // Virtual audio device files.
+        if path == "/dev/audio" {
+            return self.open_audio_file(path);
+        }
+        if path == "/dev/audioctl" {
+            return self.open_audioctl_file(path);
+        }
+
         let resolved = self.resolve_path(path);
         let file = match mode & 0x3 {
             0 => std::fs::File::open(&resolved)?, // OREAD
@@ -473,6 +549,34 @@ impl FileTable {
 
         self.files.insert(listener_fd, entry);
         result
+    }
+
+    /// Open a virtual /dev/audio file descriptor.
+    fn open_audio_file(&mut self, path: &str) -> io::Result<i32> {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.files.insert(
+            fd,
+            FileEntry {
+                inner: Box::new(AudioFile(Arc::clone(&self.audio))),
+                path: Some(path.to_string()),
+            },
+        );
+        Ok(fd)
+    }
+
+    /// Open a virtual /dev/audioctl file descriptor.
+    fn open_audioctl_file(&mut self, path: &str) -> io::Result<i32> {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        self.files.insert(
+            fd,
+            FileEntry {
+                inner: Box::new(AudioCtlFile(Arc::clone(&self.audio))),
+                path: Some(path.to_string()),
+            },
+        );
+        Ok(fd)
     }
 }
 

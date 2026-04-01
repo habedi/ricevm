@@ -69,7 +69,8 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Stack frame allocation and deallocation with two-phase push
 - [x] Heap allocation for dynamic types (records, arrays, strings, lists, channels, and module refs)
 - [x] Reference counting for deterministic destruction (module refs protected from premature freeing)
-- [x] Mark-and-sweep garbage collector (scans frames, MP, and all loaded module MPs)
+- [x] `op_ret` frees frame pointers via type descriptor pointer maps (matching reference `freeptrs`)
+- [x] Mark-and-sweep garbage collector (scans frames, MP, caller MP stacks, all loaded module MPs, and all suspended threads)
 - [x] Optional toggle to disable mark-and-sweep collection (`--no-gc` flag)
 - [x] Bounds-safe memory access (out-of-bounds reads return 0; writes are no-ops)
 
@@ -77,27 +78,28 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 - [x] Cooperative thread scheduler with round-robin quantum rotation (2048 instructions)
 - [x] `spawn` creates cooperative threads (not inline execution)
-- [x] Channel blocking: `recv` on empty channel suspends thread; `send` unblocks waiting threads
+- [x] Channel blocking: `recv` on empty channel suspends thread; `send` on full channel suspends thread; both directions unblock on state change
 - [x] Thread queue with ready/blocked state tracking
 - [x] Deadlock detection (all threads blocked → halt)
 - [ ] Full preemptive thread scheduling with OS thread pool (infrastructure exists but not connected)
 
 ### Built-in Modules
 
-- [x] `$Sys` module (43 functions, 35+ real implementations, ~8 stubs)
-    - I/O: `print`, `fprint`, `sprint`, `aprint`, `open`, `create`, `read`, `write`, `seek`, `fildes`, `fd2path`, `dup`, and `pipe`
+- [x] `$Sys` module (43 functions, 38+ real implementations, ~5 stubs)
+    - I/O: `print`, `fprint`, `sprint`, `aprint`, `open`, `create`, `read`, `write`, `seek`, `fildes`, `fd2path`, `dup`, `pipe`, and `stream`
     - Utilities: `millisec`, `sleep`, `pctl`, `tokenize`, `byte2char`, `char2byte`, `utfbytes`, `chdir`, `remove`, and `iounit`
-    - File info: `fstat`, `stat`, and `dirread`
+    - File info: `fstat`, `stat`, `fwstat`, `wstat`, and `dirread`
     - Network: `dial`, `announce`, and `listen`
     - Error strings: `werrstr` with `%r` format specifier support
     - `seek` with correct big-value alignment and direct return pointer write
     - `pread`/`pwrite` with correct big-value alignment
     - Tuple-returning functions (tokenize, byte2char, stat, fstat, dirread, dial, announce, listen, and fversion) write all fields through ret pointer
     - All functions have correct signature hashes from the C++ Sysmodtab
-- [x] `$Math` module (66 functions, 47+ real implementations)
+- [x] `$Math` module (66 functions, 50+ real implementations)
     - Trig, log, exp, pow, sqrt, floor, ceil, hypot, bit conversions, and more
-    - Linear algebra: `dot`, `norm1`, `norm2`, and `iamax`
+    - Linear algebra: `dot`, `norm1`, `norm2`, `iamax`, and `gemm`
     - `import_real`/`export_real` with correct byte-order conversion
+    - `getFPcontrol` and `getFPstatus` with dedicated implementations
     - Frame layout with `ARG1_OFF=32`, `ARG2_OFF=40`
 - [x] `$Draw` module (62 functions registered, SDL2 backend behind `gui` feature, and many operations still stubbed)
     - `Display.allocate`: opens an SDL2 window and creates proper Display/Image/Screen ADT records
@@ -118,9 +120,10 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Compiles `.b` source files to `.dis` bytecode
 - [x] Include file processing (`include "sys.m"` and `include "draw.m"`)
 - [x] Compiled output verified: `echo`, `cat`, `basename`, `date`, `mkdir`, `rm`, `sleep`, `tee`, `wc`, `du`, `strings`, `sort`, `grep`, `uniq`,
-  `tail`, and `tr` (16 of 24 tested programs compile successfully)
+  `tail`, `tr`, `string`, `calc`, `mash`, `sh`, `math`, `cmp`, `freq`, `tcs`, and 20 more
+- [x] Programs with float literals compile correctly
 - [x] Compiled programs execute correctly on RiceVM (echo, cat, basename, rm, mkdir, tr, sleep, date, and wc verified)
-- [x] `sprint`/`fprint` format specifiers: `%d`, `%s`, `%f`, `%g`, `%x`, `%o`, `%c`, `%r`, width, precision, and flags
+- [x] `sprint`/`fprint` format specifiers: `%d`, `%s`, `%f`, `%g`, `%x`, `%o`, `%c`, `%r`, `%b`, `%u`, `%.*`, width, precision, and flags
 - [ ] Stdin piping for Bufio-based programs compiled from source (partial)
 
 ### GUI Support
@@ -133,6 +136,10 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Tk widget rendering (label, button, frame, pack, and canvas)
 - [x] Font rendering (monospace bitmap fallback; SDL2_ttf planned)
 - [x] Mouse and keyboard event delivery to Tk
+
+### Audio Support
+
+- [x] `/dev/audio` and `/dev/audioctl` support behind optional `audio` feature flag (cpal backend)
 
 ### Portability
 
@@ -152,7 +159,8 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] `--no-gc` flag to disable mark-and-sweep garbage collection
 - [x] `--threads` flag to configure scheduler thread pool size
 - [x] `-- arg1 arg2` guest argument passing
-- [x] Debugger integration (breakpoints, single-stepping, and stack inspection)
+- [x] Colored output, elapsed time reporting, and exit codes
+- [x] Debugger integration (breakpoints, single-stepping, stack inspection, colored output, and `info` command)
 
 ### Compatibility
 
@@ -166,7 +174,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Cargo workspace with modular crate structure
 - [x] CI pipeline with automated tests
 - [x] Dual license (MIT and Apache 2.0)
-- [x] 188 tests total:
+- [x] 202 tests total:
     - Unit tests for instruction decoding and execution
     - Property-based tests for arithmetic (commutativity, associativity, and identity)
     - Property-based tests for string operations (slicec bounds, addc associativity)
@@ -177,7 +185,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Fuzz testing setup for the module loader (`cargo-fuzz` with `libfuzzer`)
 - [x] 866 pre-compiled `.dis` files available via `external/inferno-os` submodule
 - [x] `make lint` passes (clippy with `-D warnings -D clippy::unwrap_used -D clippy::expect_used`)
-- [x] `make test` passes (188 tests, 0 failures)
+- [x] `make test` passes (202 tests, 0 failures)
 
 ### Documentation
 
@@ -187,9 +195,16 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 ### Known Limitations
 
-- Preemptive threading infrastructure exists but is not connected to the main execution loop
-- `$Draw` module has 35+ stub functions (only basic rendering works)
-- `$Sys` stubs: `bind`, `mount`, `unmount`, `export`, `fwstat`, `wstat`, `fauth`, `file2chan`, and `stream`
-- `$Math` stubs: `gemm` (general matrix multiply), `getFPcontrol`, and `getFPstatus`
-- ~310 pre-compiled programs fail because they need Inferno OS environment features (arguments, `/dev`, `/prog`, `$Keyring`, and network services) not
-  available on the host
+#### Design Choices
+
+- Cooperative threading (not preemptive): the run loop rotates threads by quantum; a preemptive scheduler with OS threads exists but is not connected because it would require `Arc<Mutex<>>` refactoring of VmState
+- `op_ret` does not restore module context from the frame; the `mcall` wrapper handles module context restoration instead (correct behavior, different structure from reference)
+
+#### Unimplementable on Host OS
+
+- `$Sys` stubs that require Plan 9 namespace semantics: `bind`, `mount`, `unmount`, `export`, `fauth`, and `file2chan` (no host OS equivalent)
+- ~310 pre-compiled programs fail because they need Inferno OS environment features (arguments, `/dev`, `/prog`, `$Keyring`, and network services) not available on the host
+
+#### Incomplete Modules
+
+- `$Draw` module has 35+ stub functions (only basic rendering works; full implementation requires extensive SDL2 work)

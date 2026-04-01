@@ -209,6 +209,8 @@ impl<'m> Debugger<'m> {
                     &self.vm.frames,
                     &self.vm.mp,
                     &self.vm.loaded_modules,
+                    &self.vm.thread_queue,
+                    &self.vm.caller_mp_stack,
                 );
             }
         }

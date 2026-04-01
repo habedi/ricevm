@@ -148,7 +148,7 @@ impl Heap {
         let should_free = if let Some(obj) = self.objects.get_mut(&id) {
             obj.ref_count = obj.ref_count.saturating_sub(1);
             if obj.ref_count == 0 {
-                // Don't free module references — they persist for the VM lifetime
+                // Don't free module references; they persist for the VM lifetime
                 // and movmp/movm don't do proper ref counting for embedded pointers.
                 !matches!(
                     obj.data,

@@ -190,7 +190,7 @@ pub(crate) fn op_lsrl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 // Exponentiation
 
 pub(crate) fn op_expw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    // Reference: x = W(m); n = W(s); — base from mid, exponent from src
+    // Reference: x = W(m); n = W(s);:base from mid, exponent from src
     let n = vm.src_word()?;
     let mut x = vm.mid_or_dst_word()?;
     let mut exp = n;
@@ -216,7 +216,7 @@ pub(crate) fn op_expw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 pub(crate) fn op_expl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    // Reference: x = V(m); n = W(s); — base from mid (big), exponent from src (word)
+    // Reference: x = V(m); n = W(s);:base from mid (big), exponent from src (word)
     let n = vm.src_word()?;
     let mut x = vm.mid_or_dst_big()?;
     let mut exp = n;
@@ -242,7 +242,7 @@ pub(crate) fn op_expl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 pub(crate) fn op_expf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    // Reference: x = F(m); n = W(s); — base from mid (real), exponent from src (word/int)
+    // Reference: x = F(m); n = W(s);:base from mid (real), exponent from src (word/int)
     let n = vm.src_word()?;
     let mut x = vm.mid_or_dst_real()?;
     let mut exp = n;
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn expf_uses_integer_exponent() {
-        // Reference: x = F(m), n = W(s) — exponent is a WORD (integer)
+        // Reference: x = F(m), n = W(s):exponent is a WORD (integer)
         let mut x: f64 = 2.0;
         let mut n: i32 = 3;
         let inv = false;

@@ -664,7 +664,7 @@ fn sys_tokenize(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         );
     }
 
-    // Return (count, list) — write through ret pointer into caller's frame
+    // Return (count, list):write through ret pointer into caller's frame
     write_ret_word(vm, frame_base, 0, count);
     write_ret_word(vm, frame_base, 4, list_id as i32);
     Ok(())
@@ -702,7 +702,7 @@ fn sys_byte2char(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         (0, 0, -1)
     };
 
-    // Return (char, bytes_consumed, status) — write through ret pointer
+    // Return (char, bytes_consumed, status):write through ret pointer
     write_ret_word(vm, frame_base, 0, char_val);
     write_ret_word(vm, frame_base, 4, bytes_consumed);
     write_ret_word(vm, frame_base, 8, status);
@@ -928,7 +928,7 @@ fn sys_fstat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             let dir_id = build_dir_record(vm, &meta, name);
-            // Return (0, Dir) — write through ret pointer into caller's frame
+            // Return (0, Dir):write through ret pointer into caller's frame
             write_ret_word(vm, frame_base, 0, 0);
             write_ret_word(vm, frame_base, 4, dir_id as i32);
         }
@@ -952,7 +952,7 @@ fn sys_stat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             let dir_id = build_dir_record(vm, &meta, name);
-            // Return (0, Dir) — write through ret pointer into caller's frame
+            // Return (0, Dir):write through ret pointer into caller's frame
             write_ret_word(vm, frame_base, 0, 0);
             write_ret_word(vm, frame_base, 4, dir_id as i32);
         }
@@ -995,7 +995,7 @@ fn sys_dirread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     length: count,
                 },
             );
-            // Return (count, array of Dir) — write through ret pointer
+            // Return (count, array of Dir):write through ret pointer
             write_ret_word(vm, frame_base, 0, count as i32);
             write_ret_word(vm, frame_base, 4, arr_id as i32);
         }
@@ -1025,7 +1025,7 @@ fn sys_fauth(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_fversion(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    // fversion returns (int, string) — write through ret pointer
+    // fversion returns (int, string):write through ret pointer
     write_ret_word(vm, frame_base, 0, -1);
     write_ret_word(vm, frame_base, 4, 0); // nil string
     Ok(())
@@ -1091,7 +1091,7 @@ fn sys_dial(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     .unwrap_or_default();
                 let fd = vm.files.insert_tcp_stream(stream, Some(peer.clone()));
                 let conn = build_connection(vm, fd, fd, &peer);
-                // Return (0, Connection) — write through ret pointer
+                // Return (0, Connection):write through ret pointer
                 write_ret_word(vm, frame_base, 0, 0);
                 write_ret_word(vm, frame_base, 4, conn as i32);
             }
@@ -1124,7 +1124,7 @@ fn sys_announce(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     .unwrap_or_default();
                 let lfd = vm.files.insert_tcp_listener(listener, Some(local.clone()));
                 let conn = build_connection(vm, -1, lfd, &local);
-                // Return (0, Connection) — write through ret pointer
+                // Return (0, Connection):write through ret pointer
                 write_ret_word(vm, frame_base, 0, 0);
                 write_ret_word(vm, frame_base, 4, conn as i32);
             }
@@ -1167,7 +1167,7 @@ fn sys_listen(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     match vm.files.accept_on(cfd_num) {
         Ok((stream_fd, addr)) => {
             let conn = build_connection(vm, stream_fd, cfd_num, &addr);
-            // Return (0, Connection) — write through ret pointer
+            // Return (0, Connection):write through ret pointer
             write_ret_word(vm, frame_base, 0, 0);
             write_ret_word(vm, frame_base, 4, conn as i32);
         }

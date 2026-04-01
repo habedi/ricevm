@@ -18,7 +18,7 @@ pub(crate) fn parse_header(r: &mut Reader<'_>) -> Result<Header, LoadError> {
     };
 
     let runtime_flags = RuntimeFlags(r.read_operand("header")? as u32);
-    // Accept modules with the deprecated import flag — they use an older
+    // Accept modules with the deprecated import flag; they use an older
     // format but can still be executed.
 
     let stack_extent = r.read_operand("header")?;

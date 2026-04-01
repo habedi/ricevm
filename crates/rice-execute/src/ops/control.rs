@@ -42,7 +42,7 @@ pub(crate) fn op_ret(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// load src, mid, dst — load a module by name
+/// load src, mid, dst:load a module by name
 /// src = string pointer (module path), mid = import table index, dst = result module ref
 pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let path_id = vm.src_ptr()?;
@@ -282,7 +282,7 @@ pub(crate) fn resolve_module_ref(
     }
 }
 
-/// mframe src, mid, dst — create frame for module call
+/// mframe src, mid, dst:create frame for module call
 /// src = module ref pointer, mid = function index, dst = frame pointer (output)
 pub(crate) fn op_mframe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let mod_ref_id = vm.src_ptr()?;
@@ -353,7 +353,7 @@ pub(crate) fn op_mframe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(pending_data_offset as i32)
 }
 
-/// mcall src, mid, dst — call function in loaded module
+/// mcall src, mid, dst:call function in loaded module
 /// src = frame pointer, mid = function index, dst = module ref pointer
 pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_data_offset = vm.src_word()? as usize;
@@ -525,10 +525,10 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// goto src, dst — computed goto: dst holds a pc table pointer, src is the index.
+/// goto src, dst:computed goto: dst holds a pc table pointer, src is the index.
 /// In Dis, `goto` jumps to the PC stored in a case table.
 /// src = pointer to word array of PCs, dst = index.
-/// goto src, dst — computed goto: read index from src, jump to table[index].
+/// goto src, dst:computed goto: read index from src, jump to table[index].
 /// dst points to a flat array of word-sized PCs in frame or MP memory.
 pub(crate) fn op_goto(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let index = vm.src_word()? as usize;
@@ -544,12 +544,12 @@ pub(crate) fn op_goto(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// casew src, dst — word case dispatch.
+/// casew src, dst:word case dispatch.
 /// src = value to match, dst = pointer to case table in frame/MP.
 ///
 /// Case table format (words):
 ///   [0]     = N (number of entries)
-///   [1..3N] = N triples of (lo, hi, target_pc) — matches if lo <= value < hi
+///   [1..3N] = N triples of (lo, hi, target_pc):matches if lo <= value < hi
 ///   [3N+1]  = default_pc
 pub(crate) fn op_casew(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let value = vm.src_word()?;
@@ -601,7 +601,7 @@ pub(crate) fn op_casew(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// casec src, dst — string case dispatch.
+/// casec src, dst:string case dispatch.
 ///
 /// Same table format as casew, but lo/hi are string pointer HeapIds.
 /// Binary search with string comparison matching the reference Dis VM.
@@ -667,7 +667,7 @@ pub(crate) fn op_casec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// casel src, dst — big case dispatch.
+/// casel src, dst:big case dispatch.
 /// Same table format as casew but values are big (i64, 8 bytes each).
 /// Table entries: count(word), then N triples of (lo_big, hi_big, pc_word).
 pub(crate) fn op_casel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
@@ -733,7 +733,7 @@ pub(crate) fn op_casel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// raise src — raise an exception.
+/// raise src:raise an exception.
 /// Searches the handler table for a matching handler at the current PC.
 /// If found, jumps to the handler. If not, returns a ThreadFault.
 pub(crate) fn op_raise(vm: &mut VmState<'_>) -> Result<(), ExecError> {
@@ -784,18 +784,18 @@ pub(crate) fn op_raise(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     )))
 }
 
-/// runt src — runtime check (module type validation). Stub: no-op.
+/// runt src:runtime check (module type validation). Stub: no-op.
 pub(crate) fn op_runt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let _ = vm.src_word()?;
     Ok(())
 }
 
-/// eclr — clear exception state. Stub: no-op.
+/// eclr:clear exception state. Stub: no-op.
 pub(crate) fn op_eclr(_vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// brkpt — breakpoint. For now, just halt.
+/// brkpt:breakpoint. For now, just halt.
 pub(crate) fn op_brkpt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.halted = true;
     Ok(())

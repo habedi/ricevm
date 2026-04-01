@@ -47,7 +47,7 @@ pub(crate) fn decode_virtual_addr(addr: i32, register2: usize) -> AddrTarget {
         return AddrTarget::None;
     }
     if addr & HEAP_REF_FLAG != 0 {
-        // Heap array reference (from indx) — can't decode without heap_refs
+        // Heap array reference (from indx): can't decode without heap_refs
         // This case is handled separately in resolve_operand
         return AddrTarget::None;
     }

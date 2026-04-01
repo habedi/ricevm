@@ -3,7 +3,7 @@ use ricevm_core::ExecError;
 use crate::heap::HeapData;
 use crate::vm::VmState;
 
-/// new src, dst — allocate a record of the type given by src (type index)
+/// new src, dst:allocate a record of the type given by src (type index)
 pub(crate) fn op_new(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let type_idx = vm.src_word()? as usize;
     let size = vm
@@ -15,12 +15,12 @@ pub(crate) fn op_new(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.move_ptr_to_dst(id)
 }
 
-/// newz src, dst — same as new but data is guaranteed zero-initialized (which it already is)
+/// newz src, dst:same as new but data is guaranteed zero-initialized (which it already is)
 pub(crate) fn op_newz(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     op_new(vm)
 }
 
-/// newa src, mid, dst — allocate an array of length src, element type mid
+/// newa src, mid, dst:allocate an array of length src, element type mid
 pub(crate) fn op_newa(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let length = vm.src_word()? as usize;
     let elem_type_idx = vm.mid_word()? as usize;
@@ -40,12 +40,12 @@ pub(crate) fn op_newa(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.move_ptr_to_dst(id)
 }
 
-/// newaz — same as newa (zero-initialized)
+/// newaz:same as newa (zero-initialized)
 pub(crate) fn op_newaz(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     op_newa(vm)
 }
 
-/// mnewz src, mid, dst — allocate and zero a record (same as newz for us)
+/// mnewz src, mid, dst: allocate and zero a record (same as newz for us)
 pub(crate) fn op_mnewz(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     op_new(vm)
 }

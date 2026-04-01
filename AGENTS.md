@@ -17,9 +17,11 @@ Priorities, in order:
 
 - Use English for code, comments, docs, and tests.
 - Keep `unsafe` usage minimal and well-documented; prefer safe Rust wherever possible.
+- Never use `.unwrap()` or `.expect()` in non-test code (enforced by `make lint`). Production code should never panic.
 - Prefer small, focused changes over large refactoring.
 - Add comments only when they clarify non-obvious behavior.
 - Do not add features, error handling, or abstractions beyond what is needed for the current task.
+- Add tests for every bug fix and new feature to prevent regression.
 
 ## Writing Style
 
@@ -32,12 +34,13 @@ Priorities, in order:
 
 ## Repository Layout
 
-- `crates/rice-core/`: Shared types (Module, Opcode, Instruction, TypeDescriptor, errors). No runtime logic.
+- `crates/rice-core/`: Shared types (Module, Opcode, Instruction, TypeDescriptor, and errors). No runtime logic.
 - `crates/rice-loader/`: Binary format parser for `.dis` module files. One public function: `load(&[u8]) -> Result<Module, LoadError>`.
-- `crates/rice-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, $Crypt), and file-based
+- `crates/rice-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, and $Crypt), and file-based
   module loading.
 - `crates/rice-cli/`: CLI with `run` and `dis` subcommands.
-- `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files and Limbo source for testing).
+- `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
+  `libinterp/xec.c` for correctness validation).
 - `Makefile`: GNU Make wrapper around `cargo` commands (`make test`, `make build`, `make lint`, etc.).
 - `rust-toolchain.toml`: Pinned Rust toolchain (1.92.0) with `rustfmt`, `clippy`, and `rust-analyzer`.
 
@@ -49,31 +52,31 @@ Priorities, in order:
 ricevm-cli
 ├── ricevm-core
 ├── ricevm-loader → ricevm-core
-└── ricevm-execute → ricevm-core, ricevm-loader
+└── ricevm-execute → ricevm-core and ricevm-loader
 ```
 
 `ricevm-execute` depends on `ricevm-loader` for runtime module loading (the `load` opcode reads `.dis` files from disk).
 
 ### Key Internal Modules in `ricevm-execute`
 
-| Module         | Purpose                                                                            |
-|----------------|------------------------------------------------------------------------------------|
-| `vm.rs`        | `VmState` struct, execution loop, operand read/write helpers, parent MP stack      |
-| `frame.rs`     | `FrameStack` with two-phase push (`alloc_pending` and `activate_pending`)          |
-| `heap.rs`      | `Heap` with reference counting, copy-on-write strings, `ArraySlice` shared views   |
-| `gc.rs`        | Mark-and-sweep garbage collector (scans frames, MP, and loaded module MPs)         |
-| `address.rs`   | Operand resolution: `Operand` to `AddrTarget` (frame, MP, immediate, heap array)   |
-| `memory.rs`    | Typed read/write on byte buffers with bounds checking                              |
-| `data.rs`      | Module data (MP) initialization from `DataItem` entries with type-aware elem sizes |
-| `filetab.rs`   | Portable file descriptor table with in-memory pipe support                         |
-| `ops/`         | 176 instruction handlers organized by category                                     |
-| `sys.rs`       | Built-in `$Sys` module (43 functions with signature hashes)                        |
-| `math.rs`      | Built-in `$Math` module (66 functions)                                             |
-| `draw.rs`      | Built-in `$Draw` module (SDL2 backend, optional `gui` feature)                     |
-| `tk.rs`        | Built-in `$Tk` module (widget toolkit stubs)                                       |
-| `builtin.rs`   | `ModuleRegistry` for built-in module registration with name and signature lookup   |
-| `scheduler.rs` | Cooperative thread scheduler (infrastructure)                                      |
-| `channel.rs`   | Channel data structure for inter-thread communication                              |
+| Module         | Purpose                                                                                |
+|----------------|----------------------------------------------------------------------------------------|
+| `vm.rs`        | `VmState` struct, execution loop with cooperative threading, and thread suspend/resume |
+| `frame.rs`     | `FrameStack` with two-phase push (`alloc_pending` and `activate_pending`)              |
+| `heap.rs`      | `Heap` with reference counting, copy-on-write strings, and `ArraySlice` shared views   |
+| `gc.rs`        | Mark-and-sweep garbage collector (scans frames, MP, and loaded module MPs)             |
+| `address.rs`   | Operand resolution with `ModuleMp` virtual ranges and `decode_virtual_addr`            |
+| `memory.rs`    | Typed read/write on byte buffers with bounds checking                                  |
+| `data.rs`      | Module data (MP) initialization with type-aware elem sizes and nested arrays           |
+| `filetab.rs`   | Portable file descriptor table with in-memory pipe support                             |
+| `ops/`         | 176 instruction handlers organized by category                                         |
+| `sys.rs`       | Built-in `$Sys` module (43 functions with tuple return support)                        |
+| `math.rs`      | Built-in `$Math` module (66 functions including linear algebra)                        |
+| `draw.rs`      | Built-in `$Draw` module (SDL2 backend, optional `gui` feature)                         |
+| `tk.rs`        | Built-in `$Tk` module (widget toolkit stubs)                                           |
+| `builtin.rs`   | `ModuleRegistry` for built-in module registration with name and signature lookup       |
+| `scheduler.rs` | Preemptive thread scheduler infrastructure (not yet connected to main loop)            |
+| `channel.rs`   | Channel data structure for inter-thread communication                                  |
 
 ### Key Design Decisions
 
@@ -82,39 +85,66 @@ ricevm-cli
   pointers stored as `Word` (i32) in frames.
 - Array element references use a `heap_refs` table with `HEAP_REF_FLAG` sentinel, resolved during double-indirect addressing.
 - `ArraySlice` heap type provides shared-storage views into parent arrays (required for Bufio buffer semantics).
-- `MP_REF_FLAG` (0x4000_0000) tags MP addresses stored by `Lea` so double-indirect resolution returns `AddrTarget::Mp`.
-- `parent_mps` stack in `VmState` enables cross-module MP reads/writes when loaded modules access their caller's MP.
+- Unified virtual address space: frame addresses are low, each module's MP has a unique range starting at
+  `MP_BASE` (0x0080_0000) with `MP_STRIDE` (0x0010_0000) between modules, heap IDs above `HEAP_ID_BASE`.
+  The `decode_virtual_addr()` function decodes addresses back to `AddrTarget`.
+- `caller_mp_stack` in `VmState` tracks caller module MPs during loaded module execution.
 - Branch instructions: `if src OP mid, goto dst` (not `if src OP dst, goto mid`).
-- Case instructions (`casew`, `casec`, `casel`) use binary search matching the reference Dis VM implementation.
+- Case instructions (`casew`, `casec`, and `casel`) use binary search matching the reference Dis VM (`xec.c`).
+- `casel` entries are 24 bytes (not 20) due to LONG alignment padding.
 - Multi-module execution: loaded modules' MPs are swapped (not cloned) to persist state across calls.
 - Built-in function dispatch prefers name matching over signature hash matching (avoids collisions like read/write).
 - `movmp` looks up the type descriptor to determine copy size (mid is a type index, not a byte count).
 - Data initialization (`data.rs`) uses type descriptors for array element sizes and writes to the active buffer context
   (parent array or MP) for correct nested array initialization.
 - Builtin return value copy in `mcall` transfers 4 bytes to the caller's return pointer; big-returning functions
-  (like `seek`) write their 8-byte result directly through the return pointer.
+  (like `seek`) and tuple-returning functions write their results directly through the return pointer.
+- Type conversions match the reference: `cvtfw`/`cvtfl` round (±0.5), `cvtrf`/`cvtfr` convert f32↔f64,
+  `cvtwc`/`cvtcw` format/parse decimal strings, `cvtfc` uses `%g` format.
+- `expw`/`expl`/`expf` use repeated-squaring with base from mid and integer exponent from src.
+- Cooperative threading: `spawn` creates threads in a queue, the run loop rotates every 2048 instructions,
+  `recv` on empty channels blocks the thread, `send` unblocks waiting threads.
+- Alt table format: `{nsend, nrecv}` header followed by 8-byte `{channel_ptr, data_ptr}` entries.
 - Per-thread error string (`last_error`) implements the `werrstr`/`%r` mechanism.
 - Portable I/O via `FileTable` (no `libc` dependency) with in-memory pipe support.
+- Library modules with `entry_pc = -1` return success immediately (no init function).
 - SDL2 for GUI is behind an optional `gui` feature flag.
+
+### Reference Implementation
+
+The original Dis VM source is in `external/inferno-os/libinterp/`:
+
+| File       | Lines | What It Covers                                        |
+|------------|-------|-------------------------------------------------------|
+| `xec.c`    | 1698  | All 176 opcode handlers (the authoritative reference) |
+| `alt.c`    | 294   | Channel alt/nbalt implementation                      |
+| `string.c` | 616   | String operations                                     |
+| `gc.c`     | 383   | Garbage collector                                     |
+| `heap.c`   | 533   | Heap allocation and ref counting                      |
+| `math.c`   | 955   | Math module                                           |
+
+Always compare against these files when fixing instruction correctness issues.
 
 ## Required Validation
 
-Run `make test` for any change. Key targets:
+Run `make lint` and `make test` for any change. Key targets:
 
-| Target   | Command         | What It Runs                                      |
-|----------|-----------------|---------------------------------------------------|
-| Format   | `make format`   | `cargo fmt`                                       |
-| Lint     | `make lint`     | `cargo clippy` with `-D warnings` and strict deny |
-| Test     | `make test`     | All workspace tests with `--nocapture`            |
-| Build    | `make build`    | Release build                                     |
-| Coverage | `make coverage` | `cargo tarpaulin` with XML and HTML output        |
-| Audit    | `make audit`    | `cargo audit` on dependencies                     |
+| Target   | Command         | What It Runs                                                                    |
+|----------|-----------------|---------------------------------------------------------------------------------|
+| Format   | `make format`   | `cargo fmt`                                                                     |
+| Lint     | `make lint`     | `cargo clippy` with `-D warnings -D clippy::unwrap_used -D clippy::expect_used` |
+| Test     | `make test`     | All workspace tests with `--nocapture`                                          |
+| Build    | `make build`    | Release build                                                                   |
+| Coverage | `make coverage` | `cargo tarpaulin` with XML and HTML output                                      |
+| Audit    | `make audit`    | `cargo audit` on dependencies                                                   |
 
 ## Testing Expectations
 
 - Unit tests live in each crate's source files using `#[cfg(test)]` modules.
 - Integration tests for the loader live in `crates/rice-loader/tests/`.
 - Pipeline tests (loader to executor) live in `crates/rice-cli/tests/`, including tests with real Inferno `.dis` files.
+- Property-based tests cover arithmetic commutativity/associativity, string slice bounds, and conversion roundtrips.
+- Regression tests exist for every major bug fix (movmp, casew, slicea, channel blocking, spawn, etc.).
 - Fuzz testing for the loader is set up in `crates/rice-loader/fuzz/`.
 - No public API change is complete without a corresponding test.
 - The Limbo compiler (`external/inferno-os/dis/limbo.dis`) can compile and run programs as an end-to-end validation:

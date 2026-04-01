@@ -45,7 +45,7 @@ fn rounding_mask(scale: i32) -> i64 {
     }
 }
 
-/// mulx src, mid, dst — fixed-point multiply: dst = (src * mid) scaled by fpr2
+/// mulx src, mid, dst:fixed-point multiply: dst = (src * mid) scaled by fpr2
 pub(crate) fn op_mulx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let y = vm.src_word()? as i64;
     let x = vm.mid_word()? as i64;
@@ -54,7 +54,7 @@ pub(crate) fn op_mulx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(z as Word)
 }
 
-/// mulx0 src, mid, dst — fixed-point multiply with residual: dst = ((src * mid) scaled) / fpr1
+/// mulx0 src, mid, dst:fixed-point multiply with residual: dst = ((src * mid) scaled) / fpr1
 pub(crate) fn op_mulx0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let y = vm.src_word()? as i64;
     let x = vm.mid_word()? as i64;
@@ -70,7 +70,7 @@ pub(crate) fn op_mulx0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(z as Word)
 }
 
-/// mulx1 — fixed-point multiply with rounding flags encoded in DTemp.
+/// mulx1:fixed-point multiply with rounding flags encoded in DTemp.
 pub(crate) fn op_mulx1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let y = vm.src_word()? as i64;
     let x = vm.mid_word()? as i64;
@@ -110,7 +110,7 @@ pub(crate) fn op_mulx1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(r as Word)
 }
 
-/// divx src, mid, dst — fixed-point divide: dst = (mid scaled by fpr2) / src
+/// divx src, mid, dst:fixed-point divide: dst = (mid scaled by fpr2) / src
 pub(crate) fn op_divx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let y = vm.src_word()? as i64;
     if y == 0 {
@@ -124,7 +124,7 @@ pub(crate) fn op_divx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word((scaled_x / y) as Word)
 }
 
-/// divx0 src, mid, dst — fixed-point divide with residual
+/// divx0 src, mid, dst:fixed-point divide with residual
 pub(crate) fn op_divx0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let y = vm.src_word()? as i64;
     if y == 0 {
@@ -147,7 +147,7 @@ pub(crate) fn op_divx0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word((scaled / y) as Word)
 }
 
-/// divx1 — fixed-point divide with rounding flags encoded in DTemp.
+/// divx1:fixed-point divide with rounding flags encoded in DTemp.
 pub(crate) fn op_divx1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let y = vm.src_word()? as i64;
     if y == 0 {
@@ -186,14 +186,14 @@ pub(crate) fn op_divx1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word((s + v) as Word)
 }
 
-/// cvtxx src, dst — fixed-point scaling: dst = src scaled by the middle operand.
+/// cvtxx src, dst:fixed-point scaling: dst = src scaled by the middle operand.
 pub(crate) fn op_cvtxx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let x = vm.src_word()? as i64;
     let scale = vm.mid_word()?;
     vm.set_dst_word(apply_scale(x, scale) as Word)
 }
 
-/// cvtxx0 src, dst — fixed-point scaling with residual from STemp.
+/// cvtxx0 src, dst:fixed-point scaling with residual from STemp.
 pub(crate) fn op_cvtxx0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let x = vm.src_word()? as i64;
     if x == 0 {
@@ -210,7 +210,7 @@ pub(crate) fn op_cvtxx0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(z as Word)
 }
 
-/// cvtxx1 — fixed-point scaling with rounding flags in the middle operand.
+/// cvtxx1:fixed-point scaling with rounding flags in the middle operand.
 pub(crate) fn op_cvtxx1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let x = vm.src_word()? as i64;
     let p = vm.mid_word()?;
@@ -246,7 +246,7 @@ pub(crate) fn op_cvtxx1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(r as Word)
 }
 
-/// cvtfx src, mid, dst — float to fixed-point: dst = round(src * mid)
+/// cvtfx src, mid, dst:float to fixed-point: dst = round(src * mid)
 pub(crate) fn op_cvtfx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let f = vm.src_real()?;
     let scale = vm.mid_real()?;
@@ -259,7 +259,7 @@ pub(crate) fn op_cvtfx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(rounded)
 }
 
-/// cvtxf src, mid, dst — fixed-point to float: dst = src * mid
+/// cvtxf src, mid, dst:fixed-point to float: dst = src * mid
 pub(crate) fn op_cvtxf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let x = vm.src_word()? as f64;
     let scale = vm.mid_real()?;

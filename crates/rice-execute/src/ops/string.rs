@@ -3,7 +3,7 @@ use ricevm_core::ExecError;
 use crate::heap::{self, HeapData};
 use crate::vm::VmState;
 
-/// lenc src, dst — string length in characters
+/// lenc src, dst:string length in characters
 pub(crate) fn op_lenc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let str_id = vm.src_ptr()?;
     let len = match vm.heap.get_string(str_id) {
@@ -13,7 +13,7 @@ pub(crate) fn op_lenc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(len)
 }
 
-/// indc src, mid, dst — get character at index: dst = src[mid]
+/// indc src, mid, dst:get character at index: dst = src[mid]
 pub(crate) fn op_indc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let str_id = vm.src_ptr()?;
     let index = vm.mid_word()? as usize;
@@ -28,7 +28,7 @@ pub(crate) fn op_indc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(ch as i32)
 }
 
-/// insc src, mid, dst — insert character: dst[mid] = src (rune)
+/// insc src, mid, dst:insert character: dst[mid] = src (rune)
 pub(crate) fn op_insc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let rune_val = vm.src_word()? as u32;
     let index = vm.mid_word()? as usize;
@@ -77,8 +77,8 @@ pub(crate) fn op_insc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// addc src, mid, dst — string concatenation: dst = mid + src
-/// Two-operand form: addc src, dst — dst = dst + src
+/// addc src, mid, dst:string concatenation: dst = mid + src
+/// Two-operand form: addc src, dst:dst = dst + src
 /// Reference: addstring(S(m), S(s), R.m == R.d)
 ///   - nil + nil = nil (H)
 ///   - nil + s2 = dup(s2)
@@ -120,7 +120,7 @@ pub(crate) fn op_addc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// slicec src, mid, dst — string slice: dst = dst[src..mid]
+/// slicec src, mid, dst:string slice: dst = dst[src..mid]
 pub(crate) fn op_slicec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let start = vm.src_word()? as usize;
     let end = vm.mid_word()? as usize;
@@ -160,7 +160,7 @@ pub(crate) fn op_slicec(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// cvtca src, dst — convert string to byte array
+/// cvtca src, dst:convert string to byte array
 pub(crate) fn op_cvtca(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let str_id = vm.src_ptr()?;
     let bytes = match vm.heap.get_string(str_id) {
@@ -180,7 +180,7 @@ pub(crate) fn op_cvtca(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.move_ptr_to_dst(id)
 }
 
-/// cvtac src, dst — convert byte array to string
+/// cvtac src, dst:convert byte array to string
 /// Reference: if a == H, ds = H; else ds = c2string(a->data, a->len)
 pub(crate) fn op_cvtac(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let arr_id = vm.src_ptr()?;
@@ -200,7 +200,7 @@ pub(crate) fn op_cvtac(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 }
 
-/// lenl src, dst — list length
+/// lenl src, dst:list length
 pub(crate) fn op_lenl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let mut list_id = vm.src_ptr()?;
     let mut len = 0;

@@ -81,20 +81,20 @@ fn load_and_execute_arithmetic_module() {
     bytes.extend(encode_operand(0)); // entry_type
 
     // Code section: 4 instructions
-    // 0: movw $10, 0(fp) — src=immediate(10), dst=fp(0)
+    // 0: movw $10, 0(fp): src=immediate(10), dst=fp(0)
     // addr_code: mid=0(00), src=2(010=imm), dst=1(001=fp) → 0b00_010_001 = 0x11
     bytes.push(0x2D); // opcode = Movw (0x2D)
     bytes.push(0x11); // addr_code
     bytes.extend(encode_operand(10)); // src: immediate value 10
     bytes.extend(encode_operand(0)); // dst: fp offset 0
 
-    // 1: movw $20, 4(fp) — src=immediate(20), dst=fp(4)
+    // 1: movw $20, 4(fp): src=immediate(20), dst=fp(4)
     bytes.push(0x2D); // Movw
     bytes.push(0x11); // same addressing
     bytes.extend(encode_operand(20));
     bytes.extend(encode_operand(4));
 
-    // 2: addw 0(fp), 4(fp), 8(fp) — src=fp(0), mid=fp(4), dst=fp(8)
+    // 2: addw 0(fp), 4(fp), 8(fp): src=fp(0), mid=fp(4), dst=fp(8)
     // addr_code: mid=2(10=small_fp), src=1(001=fp), dst=1(001=fp) → 0b10_001_001 = 0x89
     bytes.push(0x3A); // Addw (0x3A)
     bytes.push(0x89); // addr_code
@@ -150,11 +150,11 @@ fn load_and_execute_real_echo_dis() {
     assert_eq!(module.name, "Echo");
     assert_eq!(module.code.len(), 56);
     assert_eq!(module.imports.len(), 1);
-    // Execute — echo with no args should print a newline and exit cleanly
+    // Execute: echo with no args should print a newline and exit cleanly
     ricevm_execute::execute(&module).expect("echo.dis should execute cleanly");
 }
 
-/// Test with cat.dis — with no args, cat reads stdin (which is empty), exits cleanly.
+/// Test with cat.dis: with no args, cat reads stdin (which is empty), exits cleanly.
 #[test]
 fn load_and_execute_real_cat_dis() {
     let paths = [

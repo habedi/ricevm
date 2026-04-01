@@ -3,13 +3,13 @@ use ricevm_core::ExecError;
 use crate::heap;
 use crate::vm::VmState;
 
-/// movp src, dst — move pointer with reference counting
+/// movp src, dst:move pointer with reference counting
 pub(crate) fn op_movp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let new_id = vm.src_ptr()?;
     vm.move_ptr_to_dst(new_id)
 }
 
-/// lea src, dst — load effective address: stores the address from src into dst as a pointer
+/// lea src, dst:load effective address: stores the address from src into dst as a pointer
 /// In our model, lea is used to get a "pointer" to a frame/mp location.
 /// lea src, dst: store the absolute address of src into dst.
 /// In the C++ VM this stores a raw pointer. In our model, we store
@@ -41,7 +41,7 @@ pub(crate) fn op_lea(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(addr)
 }
 
-/// indx src, mid, dst — array index: mid = &src[dst]
+/// indx src, mid, dst:array index: mid = &src[dst]
 /// src = array pointer, dst = index, mid = result (address of element)
 ///
 /// Stores a heap array reference in the frame slot pointed to by mid.
@@ -121,7 +121,7 @@ pub(crate) fn op_indl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     op_indx(vm)
 }
 
-/// lena src, dst — array length
+/// lena src, dst:array length
 pub(crate) fn op_lena(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let arr_id = vm.src_ptr()?;
     let len = if arr_id == heap::NIL {
@@ -139,7 +139,7 @@ pub(crate) fn op_lena(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(len)
 }
 
-/// slicea src, mid, dst — slice an array: dst = dst[src..mid]
+/// slicea src, mid, dst:slice an array: dst = dst[src..mid]
 pub(crate) fn op_slicea(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let raw_start = vm.src_word()?;
     let raw_end = vm.mid_word()?;
@@ -216,7 +216,7 @@ pub(crate) fn op_slicea(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// slicela src, mid, dst — array append/extend.
+/// slicela src, mid, dst:array append/extend.
 /// Copies elements from src into dst starting at index mid.
 /// dst = dst[0..mid] ++ src[0..len(src)]
 /// The dst array must be large enough to hold mid + len(src) elements.

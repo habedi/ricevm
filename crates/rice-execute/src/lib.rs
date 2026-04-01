@@ -37,7 +37,7 @@ pub fn execute(module: &Module) -> Result<(), ExecError> {
 /// The module name is automatically prepended as argv[0].
 pub fn execute_with_args(module: &Module, args: Vec<String>) -> Result<(), ExecError> {
     let entry_pc = module.header.entry_pc;
-    // Library modules with entry_pc = -1 have no init function — return success.
+    // Library modules with entry_pc = -1 have no init function; return success.
     if entry_pc < 0 {
         return Ok(());
     }
@@ -815,7 +815,7 @@ mod tests {
                 make_inst(Opcode::Newa, imm(3), mid_imm(1), fp(0)),
                 // indx: src=0(fp) (array), mid=4(fp) (result), dst=$1 (index)
                 make_inst(Opcode::Indx, fp(0), mid_fp(4), imm(1)),
-                // movw $42 to 0(4(fp)) — double indirect through heap ref
+                // movw $42 to 0(4(fp)): double indirect through heap ref
                 make_inst(Opcode::Movw, imm(42), mid_none(), double_fp(4, 0)),
                 // indx again to read
                 make_inst(Opcode::Indx, fp(0), mid_fp(8), imm(1)),
@@ -898,7 +898,7 @@ mod tests {
             code: vec![
                 // 0: value = 99
                 make_inst(Opcode::Movw, imm(99), mid_none(), fp(0)),
-                // 1: casew — should go to default (pc 3)
+                // 1: casew, should go to default (pc 3)
                 make_inst(Opcode::Casew, fp(0), mid_none(), mp(0)),
                 // 2: should not be reached
                 make_inst(Opcode::Movw, imm(1), mid_none(), fp(4)),

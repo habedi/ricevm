@@ -30,7 +30,7 @@ enum AltOutcome {
     NoneReady,
 }
 
-/// spawn src, dst — create a new thread in the current module.
+/// spawn src, dst:create a new thread in the current module.
 /// src = frame pointer (pre-allocated via `frame`), dst = target PC.
 ///
 /// Cooperative implementation: activates the pending frame and runs the
@@ -83,7 +83,7 @@ pub(crate) fn op_spawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// mspawn src, mid, dst — create a thread in a loaded module.
+/// mspawn src, mid, dst:create a thread in a loaded module.
 pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_ptr = vm.src_word()? as usize;
     let func_idx = vm.mid_word()? as u32;
@@ -472,13 +472,13 @@ fn execute_alt(vm: &mut VmState<'_>, select_first_if_none: bool) -> Result<AltOu
     }
 }
 
-/// send src, dst — send data through a channel.
+/// send src, dst:send data through a channel.
 /// src = data to send, dst = channel pointer.
 pub(crate) fn op_send(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let chan_id = vm.dst_ptr()?;
     let (elem_size, pending) = channel_ref(vm, chan_id)?;
     if pending.is_some() {
-        // Channel already has data — overwrite (simplified; full impl would block sender)
+        // Channel already has data:overwrite (simplified; full impl would block sender)
     }
 
     let src_data = read_addr_bytes(vm, vm.src, vm.imm_src, elem_size)?;
@@ -491,26 +491,26 @@ pub(crate) fn op_send(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// recv src, dst — receive data from a channel.
+/// recv src, dst:receive data from a channel.
 /// src = channel pointer, dst = destination for received data.
 pub(crate) fn op_recv(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let chan_id = vm.src_ptr()?;
     let (_elem_size, pending) = channel_ref(vm, chan_id)?;
 
     if let Some(data) = pending {
-        // Channel has data — consume it
+        // Channel has data:consume it
         with_channel_mut(vm, chan_id, |_, pending| {
             *pending = None;
         })?;
         write_addr_bytes(vm, vm.dst, &data)
     } else {
-        // Channel empty — signal the run loop to block this thread
+        // Channel empty:signal the run loop to block this thread
         vm.blocked_channel = Some(chan_id);
         Ok(())
     }
 }
 
-/// alt src, dst — simplified blocking channel select.
+/// alt src, dst:simplified blocking channel select.
 /// The table layout is:
 ///   [0] = entry count
 ///   [1..] = triples of (channel pointer, send flag, data offset)
@@ -525,7 +525,7 @@ pub(crate) fn op_alt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 }
 
-/// nbalt src, dst — simplified non-blocking channel select.
+/// nbalt src, dst:simplified non-blocking channel select.
 /// Returns the chosen index, or `nsend + nrecv` when no entries are ready.
 pub(crate) fn op_nbalt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let count = match parse_alt_table(vm) {

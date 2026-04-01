@@ -243,7 +243,7 @@ impl<'m> VmState<'m> {
 
         loop {
             if self.halted {
-                // Current thread halted — check for other threads
+                // Current thread halted: check for other threads
                 if self.thread_queue.is_empty() {
                     return Ok(());
                 }
@@ -258,7 +258,7 @@ impl<'m> VmState<'m> {
             };
             if self.pc >= code_len {
                 if self.current_loaded_module.is_some() {
-                    // Loaded module finished — shouldn't happen normally
+                    // Loaded module finished; shouldn't happen normally
                     self.halted = true;
                     continue;
                 }
@@ -279,9 +279,9 @@ impl<'m> VmState<'m> {
 
             // Check if the instruction blocked on a channel (recv/alt with no data)
             if let Some(chan_id) = self.blocked_channel.take() {
-                // Don't advance PC — will re-execute the recv/alt when unblocked
+                // Don't advance PC; will re-execute the recv/alt when unblocked
                 if self.thread_queue.is_empty() {
-                    // No other threads — can't block, just continue (return zeros)
+                    // No other threads; can't block, just continue (return zeros)
                     self.pc = self.next_pc;
                 } else {
                     self.suspend_as_blocked(chan_id);
@@ -292,7 +292,7 @@ impl<'m> VmState<'m> {
 
             self.pc = self.next_pc;
 
-            // Thread quantum — switch if other threads are waiting
+            // Thread quantum: switch if other threads are waiting
             quantum_counter += 1;
             if quantum_counter >= THREAD_QUANTUM && !self.thread_queue.is_empty() {
                 quantum_counter = 0;
@@ -336,7 +336,7 @@ impl<'m> VmState<'m> {
         let suspended = SuspendedThread {
             frames: std::mem::replace(&mut self.frames, FrameStack::new()),
             mp: std::mem::take(&mut self.mp),
-            pc: self.pc, // DON'T advance — will re-execute recv/alt when unblocked
+            pc: self.pc, // DON'T advance; will re-execute recv/alt when unblocked
             heap_refs: std::mem::take(&mut self.heap_refs),
             last_error: std::mem::take(&mut self.last_error),
             current_loaded_module: self.current_loaded_module.take(),
@@ -364,15 +364,15 @@ impl<'m> VmState<'m> {
         for _ in 0..len {
             if let Some(thread) = self.thread_queue.pop_front() {
                 if thread.blocked_on.is_none() {
-                    // Ready — resume it
+                    // Ready: resume it
                     self.load_thread(thread);
                     return;
                 }
-                // Still blocked — put back
+                // Still blocked; put back
                 self.thread_queue.push_back(thread);
             }
         }
-        // No ready threads — deadlock or all blocked
+        // No ready threads: deadlock or all blocked
         self.halted = true;
     }
 

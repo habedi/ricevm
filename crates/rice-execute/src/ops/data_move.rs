@@ -23,7 +23,7 @@ pub(crate) fn op_movl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_big(val)
 }
 
-/// movm src, mid, dst — copy a block of `mid` bytes from src to dst
+/// movm src, mid, dst:copy a block of `mid` bytes from src to dst
 pub(crate) fn op_movm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let size = vm.mid_word()? as usize;
     if size == 0 {
@@ -35,7 +35,7 @@ pub(crate) fn op_movm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// movmp src, mid, dst — copy a typed record block.
+/// movmp src, mid, dst:copy a typed record block.
 /// Unlike movm where mid is a byte count, mid is a type descriptor index.
 /// The actual size to copy comes from types[mid].size.
 pub(crate) fn op_movmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
@@ -50,13 +50,13 @@ pub(crate) fn op_movmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
-/// movpc src, dst — move program counter (word) to dst
+/// movpc src, dst:move program counter (word) to dst
 pub(crate) fn op_movpc(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let val = vm.src_word()?;
     vm.set_dst_word(val)
 }
 
-/// tcmp src, dst — type compare for two pointers.
+/// tcmp src, dst:type compare for two pointers.
 pub(crate) fn op_tcmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let src_id = vm.src_ptr()?;
     let dst_id = vm.dst_ptr()?;
@@ -86,7 +86,7 @@ pub(crate) fn op_tcmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 }
 
-/// self dst — store the current module pointer into dst
+/// self dst:store the current module pointer into dst
 pub(crate) fn op_self_(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let module_ref = if let Some(module_idx) = vm.current_loaded_module {
         vm.heap.alloc(

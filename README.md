@@ -14,19 +14,20 @@
 [![Release](https://img.shields.io/github/release/habedi/ricevm.svg?label=release&style=flat&labelColor=282c34&logo=github)](https://github.com/habedi/ricevm/releases/latest)
 
 RiceVM is an implementation of the [Dis virtual machine](https://en.wikipedia.org/wiki/Limbo_(programming_language)#Virtual_machine) in Rust.
-The Dis virtual machine is a register machine that can execute programs written in
+The Dis virtual machine is a register machine that executes bytecode compiled from
 the [Limbo programming language](https://en.wikipedia.org/wiki/Limbo_(programming_language)).
 
 ### Features
 
-- **Full instruction set**: All 176 Dis VM opcodes implemented (arithmetic, branching, control flow, string, list,
-  pointer, heap allocation, type conversions, fixed-point math, and module operations)
-- **Binary loader**: Parses `.dis` module files (header, code, type descriptors, data, exports, imports, and handlers)
-- **Heap with reference counting**: Typed records, strings, arrays, lists, and module references with automatic
-  memory management
-- **Built-in Sys module**: `print`/`fprint`/`sprint` with printf-style formatting, file I/O (`open`, `read`, `write`,
-  `create`), `tokenize`, `millisec`, `sleep`, `byte2char`, `utfbytes`, and more
-- **Exception handling**: Handler table lookup with named and wildcard exception matching
+- **176 Dis VM opcodes**: Arithmetic, branching, control flow, string, list, pointer, heap allocation,
+  type conversions, fixed-point math, and module operations
+- **Limbo compiler support**: Runs the Inferno `limbo.dis` compiler to compile `.b` source files to `.dis` bytecode,
+  then executes the output (62% compatibility with 844 pre-compiled Inferno programs)
+- **Built-in modules**: `$Sys` (I/O, formatting, networking), `$Math` (trig, linear algebra),
+  `$Draw` (SDL2 rendering), `$Tk` (widget toolkit), and `$Crypt` (MD5)
+- **Cooperative threading**: `spawn` creates threads with quantum-based rotation and channel blocking/unblocking
+- **Heap with GC**: Reference counting with mark-and-sweep garbage collection, shared-storage array slices
+- **188 tests**: Unit, property-based, regression, and integration tests; `make lint` enforces strict clippy rules
 - **Disassembler**: `ricevm dis` prints human-readable module contents
 - **Instruction tracing**: Set `RICEVM_TRACE=1` for step-by-step execution output
 
@@ -38,11 +39,17 @@ the [Limbo programming language](https://en.wikipedia.org/wiki/Limbo_(programmin
 # Build
 cargo build --release
 
-# Run a .dis module
-cargo run -p ricevm-cli -- run program.dis
+# Run a pre-compiled .dis module
+cargo run -p ricevm-cli -- run program.dis --probe external/inferno-os/dis
 
 # Disassemble a .dis module
 cargo run -p ricevm-cli -- dis program.dis
+
+# Compile a Limbo source file and run the output
+cargo run -p ricevm-cli -- run external/inferno-os/dis/limbo.dis \
+    --probe external/inferno-os/dis --probe external/inferno-os/dis/lib \
+    -- -I external/inferno-os/module hello.b
+cargo run -p ricevm-cli -- run hello.dis --probe external/inferno-os/dis
 
 # Run with instruction tracing
 RICEVM_TRACE=1 cargo run -p ricevm-cli -- run program.dis
@@ -54,15 +61,16 @@ RICEVM_TRACE=1 cargo run -p ricevm-cli -- run program.dis
 
 RiceVM is organized as a Cargo workspace with four crates:
 
-| Crate | Purpose |
-|---|---|
-| `ricevm-core` | Shared types: `Module`, `Opcode`, `Instruction`, `TypeDescriptor`, error types |
-| `ricevm-loader` | `.dis` binary format parser: `load(&[u8]) -> Result<Module, LoadError>` |
-| `ricevm-execute` | Execution engine: `execute(&Module) -> Result<(), ExecError>` |
-| `ricevm-cli` | CLI with `run` and `dis` subcommands |
+| Crate            | Purpose                                                                              |
+|------------------|--------------------------------------------------------------------------------------|
+| `ricevm-core`    | Shared types: `Module`, `Opcode`, `Instruction`, `TypeDescriptor`, and error types   |
+| `ricevm-loader`  | `.dis` binary format parser: `load(&[u8]) -> Result<Module, LoadError>`              |
+| `ricevm-execute` | Execution engine: `execute_with_args(&Module, Vec<String>) -> Result<(), ExecError>` |
+| `ricevm-cli`     | CLI with `run` and `dis` subcommands                                                 |
 
 Data flows through the `Module` struct defined in `ricevm-core`. The loader produces it from bytes;
-the executor consumes it. Neither depends on the other.
+the executor consumes it. `ricevm-execute` depends on `ricevm-loader` for runtime module loading
+(the `load` opcode reads `.dis` files from disk).
 
 ---
 

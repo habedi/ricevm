@@ -19,23 +19,30 @@ the [Limbo programming language](https://en.wikipedia.org/wiki/Limbo_(programmin
 
 ### Features
 
-- **176 Dis VM opcodes**: Arithmetic, branching, control flow, string, list, pointer, heap allocation,
+- **All Dis VM opcodes**: Arithmetic, branching, control flow, string, list, pointer, heap allocation,
   type conversions, fixed-point math, and module operations
 - **Limbo compiler support**: Runs the Inferno `limbo.dis` compiler to compile `.b` source files to `.dis` bytecode,
-  then executes the output (62% compatibility with 844 pre-compiled Inferno programs)
+  then executes the output
 - **Built-in modules**: `$Sys` (I/O, formatting, networking), `$Math` (trig, linear algebra),
   `$Draw` (SDL2 rendering), `$Tk` (widget toolkit), and `$Crypt` (MD5)
-- **Cooperative threading**: `spawn` creates threads with quantum-based rotation and channel blocking/unblocking
-- **Heap with GC**: Reference counting with mark-and-sweep garbage collection, shared-storage array slices
-- **188 tests**: Unit, property-based, regression, and integration tests; `make lint` enforces strict clippy rules
-- **Disassembler**: `ricevm dis` prints human-readable module contents
+- **Built-in disassembler**: `ricevm dis` prints human-readable module contents
 - **Instruction tracing**: Set `RICEVM_TRACE=1` for step-by-step execution output
+
+See [ROADMAP.md](ROADMAP.md) for the list of implemented and planned features.
+
+> [!IMPORTANT]
+> RiceVM is still in early development, so bugs and breaking changes are expected.
+> Please use the [issues page](https://github.com/habedi/ricevm/issues) to report bugs or request features.
 
 ---
 
 ### Quickstart
 
 ```bash
+# Clone the repository
+git clone --recursive --depth=1 https://github.com/habedi/ricevm.git
+cd ricevm
+
 # Build
 cargo build --release
 
@@ -51,7 +58,7 @@ cargo run -p ricevm-cli -- run external/inferno-os/dis/limbo.dis \
     -- -I external/inferno-os/module hello.b
 cargo run -p ricevm-cli -- run hello.dis --probe external/inferno-os/dis
 
-# Run with instruction tracing
+# Run with instruction tracing (for debugging)
 RICEVM_TRACE=1 cargo run -p ricevm-cli -- run program.dis
 ```
 
@@ -59,18 +66,14 @@ RICEVM_TRACE=1 cargo run -p ricevm-cli -- run program.dis
 
 ### Architecture
 
-RiceVM is organized as a Cargo workspace with four crates:
+RiceVM is consists of the following main components:
 
-| Crate            | Purpose                                                                              |
-|------------------|--------------------------------------------------------------------------------------|
-| `ricevm-core`    | Shared types: `Module`, `Opcode`, `Instruction`, `TypeDescriptor`, and error types   |
-| `ricevm-loader`  | `.dis` binary format parser: `load(&[u8]) -> Result<Module, LoadError>`              |
-| `ricevm-execute` | Execution engine: `execute_with_args(&Module, Vec<String>) -> Result<(), ExecError>` |
-| `ricevm-cli`     | CLI with `run` and `dis` subcommands                                                 |
-
-Data flows through the `Module` struct defined in `ricevm-core`. The loader produces it from bytes;
-the executor consumes it. `ricevm-execute` depends on `ricevm-loader` for runtime module loading
-(the `load` opcode reads `.dis` files from disk).
+| Crate                                   | Purpose                                                                                      |
+|-----------------------------------------|----------------------------------------------------------------------------------------------|
+| [ricevm-core](crates/ricevm-core)       | Core shared types, including `Module`, `Opcode`, `Instruction`, `TypeDescriptor`, and errors |
+| [ricevm-loader](crates/ricevm-loader)   | `.dis` binary format parser                                                                  |
+| [ricevm-execute](crates/ricevm-execute) | Bytecode loader, runner, and runtime                                                         |
+| [ricevm-cli](crates/ricevm-cli)         | CLI frontend to run `.dis` files                                                             |
 
 ---
 

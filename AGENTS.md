@@ -34,11 +34,11 @@ Priorities, in order:
 
 ## Repository Layout
 
-- `crates/rice-core/`: Shared types (Module, Opcode, Instruction, TypeDescriptor, and errors). No runtime logic.
-- `crates/rice-loader/`: Binary format parser for `.dis` module files. One public function: `load(&[u8]) -> Result<Module, LoadError>`.
-- `crates/rice-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, and $Crypt), and file-based
+- `crates/ricevm-core/`: Shared types (Module, Opcode, Instruction, TypeDescriptor, and errors). No runtime logic.
+- `crates/ricevm-loader/`: Binary format parser for `.dis` module files. One public function: `load(&[u8]) -> Result<Module, LoadError>`.
+- `crates/ricevm-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, and $Crypt), and file-based
   module loading.
-- `crates/rice-cli/`: CLI with `run` and `dis` subcommands.
+- `crates/ricevm-cli/`: CLI with `run` and `dis` subcommands.
 - `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
   `libinterp/xec.c` for correctness validation).
 - `Makefile`: GNU Make wrapper around `cargo` commands (`make test`, `make build`, `make lint`, etc.).
@@ -141,11 +141,11 @@ Run `make lint` and `make test` for any change. Key targets:
 ## Testing Expectations
 
 - Unit tests live in each crate's source files using `#[cfg(test)]` modules.
-- Integration tests for the loader live in `crates/rice-loader/tests/`.
-- Pipeline tests (loader to executor) live in `crates/rice-cli/tests/`, including tests with real Inferno `.dis` files.
+- Integration tests for the loader live in `crates/ricevm-loader/tests/`.
+- Pipeline tests (loader to executor) live in `crates/ricevm-cli/tests/`, including tests with real Inferno `.dis` files.
 - Property-based tests cover arithmetic commutativity/associativity, string slice bounds, and conversion roundtrips.
 - Regression tests exist for every major bug fix (movmp, casew, slicea, channel blocking, spawn, etc.).
-- Fuzz testing for the loader is set up in `crates/rice-loader/fuzz/`.
+- Fuzz testing for the loader is set up in `crates/ricevm-loader/fuzz/`.
 - No public API change is complete without a corresponding test.
 - The Limbo compiler (`external/inferno-os/dis/limbo.dis`) can compile and run programs as an end-to-end validation:
   ```

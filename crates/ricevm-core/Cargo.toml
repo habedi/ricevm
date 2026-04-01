@@ -1,0 +1,12 @@
+[package]
+name = "ricevm-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+publish = false
+license.workspace = true
+description = "The core shared RiceVM types and utilities"
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true

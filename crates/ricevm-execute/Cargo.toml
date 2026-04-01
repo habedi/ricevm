@@ -1,13 +1,20 @@
 [package]
-name = "ricevm-loader"
+name = "ricevm-execute"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+publish = false
 license.workspace = true
-description = "Binary format parser for RiceVM bytecode"
+description = "The execution engine and runtime for the RiceVM bytecode"
+
+[features]
+default = []
+gui = ["sdl2"]
 
 [dependencies]
 ricevm_core.workspace = true
+ricevm_loader.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+sdl2 = { version = "0.38.0", optional = true }

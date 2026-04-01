@@ -1,19 +1,21 @@
 [package]
-name = "ricevm-execute"
+name = "ricevm-cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+publish = false
 license.workspace = true
-description = "Execution engine for RiceVM bytecode"
+description = "Command line interface for RiceVM"
 
 [features]
 default = []
-gui = ["sdl2"]
+gui = ["ricevm_execute/gui"]
 
 [dependencies]
 ricevm_core.workspace = true
 ricevm_loader.workspace = true
+ricevm_execute.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
+clap.workspace = true
 tracing.workspace = true
-sdl2 = { version = "0.37", optional = true }
+tracing-subscriber.workspace = true

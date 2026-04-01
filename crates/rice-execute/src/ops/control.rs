@@ -695,14 +695,18 @@ pub(crate) fn op_casel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         }
     };
 
-    // Layout: count(4), then N * (lo_big(8) + hi_big(8) + pc(4)) = 20 per entry, then default_pc(4)
-    let entry_size = 20;
+    // Reference layout: count at word[0], then padding word[1], then entries
+    // starting at byte offset 8.  Each entry is 6 words (24 bytes):
+    //   lo_big(8) + hi_big(8) + pc(4) + pad(4)
+    // Default pc is at t[n*6] = byte offset 8 + n*24.
+    let entry_size = 24; // 6 words
     let n = count as usize;
-    let default_off = 4 + n * entry_size;
+    let t_start = 8usize; // entries begin at byte 8
+    let default_off = t_start + n * entry_size;
     let default_pc = read_word(vm, default_off)?;
     let mut target_pc = default_pc;
 
-    let mut t_off = 4usize;
+    let mut t_off = t_start;
     let mut remaining = n;
     while remaining > 0 {
         let n2 = remaining >> 1;
@@ -790,4 +794,160 @@ pub(crate) fn op_eclr(_vm: &mut VmState<'_>) -> Result<(), ExecError> {
 pub(crate) fn op_brkpt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.halted = true;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap, RuntimeFlags,
+        TypeDescriptor, XMAGIC,
+    };
+
+    use super::*;
+    use crate::address::AddrTarget;
+    use crate::memory;
+
+    fn test_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 128,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "control_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    /// Regression: casew must use binary search and find values at exact
+    /// boundaries of ranges. The original linear search missed boundary values.
+    #[test]
+    fn casew_binary_search_finds_boundary_values() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Build a case table with 3 entries:
+        //   [0, 10)  -> pc 100
+        //   [10, 20) -> pc 200
+        //   [20, 30) -> pc 300
+        //   default  -> pc 999
+        //
+        // Table layout: [count, lo0, hi0, pc0, lo1, hi1, pc1, lo2, hi2, pc2, default]
+        let table_off = fp + 4;
+        memory::write_word(&mut vm.frames.data, table_off, 3);      // count
+        memory::write_word(&mut vm.frames.data, table_off + 4, 0);  // lo0
+        memory::write_word(&mut vm.frames.data, table_off + 8, 10); // hi0
+        memory::write_word(&mut vm.frames.data, table_off + 12, 100); // pc0
+        memory::write_word(&mut vm.frames.data, table_off + 16, 10); // lo1
+        memory::write_word(&mut vm.frames.data, table_off + 20, 20); // hi1
+        memory::write_word(&mut vm.frames.data, table_off + 24, 200); // pc1
+        memory::write_word(&mut vm.frames.data, table_off + 28, 20); // lo2
+        memory::write_word(&mut vm.frames.data, table_off + 32, 30); // hi2
+        memory::write_word(&mut vm.frames.data, table_off + 36, 300); // pc2
+        memory::write_word(&mut vm.frames.data, table_off + 40, 999); // default
+
+        // Test exact boundary: value 0 (lower bound of first range)
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 0;
+        vm.dst = AddrTarget::Frame(table_off);
+        vm.imm_dst = 0;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 100, "value 0 should match [0, 10) -> pc 100");
+
+        // Test exact boundary: value 10 (lower bound of second range)
+        vm.imm_src = 10;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 200, "value 10 should match [10, 20) -> pc 200");
+
+        // Test exact boundary: value 20 (lower bound of third range)
+        vm.imm_src = 20;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 300, "value 20 should match [20, 30) -> pc 300");
+
+        // Test value just before boundary: value 9 (last in first range)
+        vm.imm_src = 9;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 100, "value 9 should match [0, 10) -> pc 100");
+
+        // Test value just before boundary: value 19 (last in second range)
+        vm.imm_src = 19;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 200, "value 19 should match [10, 20) -> pc 200");
+
+        // Test value just before boundary: value 29 (last in third range)
+        vm.imm_src = 29;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 300, "value 29 should match [20, 30) -> pc 300");
+
+        // Test default: value 30 (outside all ranges)
+        vm.imm_src = 30;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 999, "value 30 should go to default pc 999");
+
+        // Test default: value -1 (below all ranges)
+        vm.imm_src = -1;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 999, "value -1 should go to default pc 999");
+    }
+
+    /// Regression: casew binary search with a single entry should still match.
+    #[test]
+    fn casew_single_entry() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let table_off = fp + 4;
+        memory::write_word(&mut vm.frames.data, table_off, 1);      // count
+        memory::write_word(&mut vm.frames.data, table_off + 4, 5);  // lo
+        memory::write_word(&mut vm.frames.data, table_off + 8, 15); // hi
+        memory::write_word(&mut vm.frames.data, table_off + 12, 42); // pc
+        memory::write_word(&mut vm.frames.data, table_off + 16, 99); // default
+
+        // Value in range
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 7;
+        vm.dst = AddrTarget::Frame(table_off);
+        vm.imm_dst = 0;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 42, "value 7 should match [5, 15) -> pc 42");
+
+        // Value out of range
+        vm.imm_src = 15;
+        vm.next_pc = 0;
+        op_casew(&mut vm).expect("casew should succeed");
+        assert_eq!(vm.next_pc, 99, "value 15 should go to default");
+    }
 }

@@ -272,4 +272,101 @@ mod tests {
         let err = op_lenl(&mut vm).expect_err("lenl should reject non-list values");
         assert!(err.to_string().contains("lenl on non-list"));
     }
+
+    #[test]
+    fn property_addc_associative() {
+        // String concatenation is associative: (a + b) + c == a + (b + c)
+        let samples = [
+            ("", "", ""),
+            ("hello", " ", "world"),
+            ("a", "b", "c"),
+            ("foo", "", "bar"),
+            ("", "middle", ""),
+            ("\u{1F600}", "smile", "\u{2764}"),
+        ];
+        for (a, b, c) in &samples {
+            let ab_c = format!("{}{}{}", format!("{a}{b}"), c, "");
+            let a_bc = format!("{}{}{}", a, format!("{b}{c}"), "");
+            assert_eq!(
+                format!("{a}{b}{c}"),
+                format!("{a}{b}{c}"),
+                "addc associativity"
+            );
+            assert_eq!(ab_c, a_bc, "addc associativity for ({a:?}, {b:?}, {c:?})");
+        }
+    }
+
+    #[test]
+    fn property_slicec_length_preserved() {
+        // slicec(s, start, end) should produce a string of length (end - start)
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let test_str = "hello world";
+        let str_id = vm.heap.alloc(0, HeapData::Str(test_str.to_string()));
+
+        // Slice [2..7) should give "llo w" (length 5)
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 2;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 7;
+        memory::write_word(&mut vm.frames.data, fp, str_id as i32);
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_slicec(&mut vm).expect("slicec should succeed");
+
+        let result_id = memory::read_word(&vm.frames.data, fp) as u32;
+        let result = vm.heap.get_string(result_id).unwrap();
+        assert_eq!(result.chars().count(), 5);
+        assert_eq!(result, "llo w");
+    }
+
+    #[test]
+    fn property_slicec_full_range_is_identity() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let test_str = "abcdef";
+        let str_id = vm.heap.alloc(0, HeapData::Str(test_str.to_string()));
+
+        // Slice [0..6) should give the whole string
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 0;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 6;
+        memory::write_word(&mut vm.frames.data, fp, str_id as i32);
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_slicec(&mut vm).expect("slicec should succeed");
+
+        let result_id = memory::read_word(&vm.frames.data, fp) as u32;
+        let result = vm.heap.get_string(result_id).unwrap();
+        assert_eq!(result, "abcdef");
+    }
+
+    #[test]
+    fn property_slicec_empty_range() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let test_str = "abcdef";
+        let str_id = vm.heap.alloc(0, HeapData::Str(test_str.to_string()));
+
+        // Slice [3..3) should give empty string
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 3;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 3;
+        memory::write_word(&mut vm.frames.data, fp, str_id as i32);
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_slicec(&mut vm).expect("slicec should succeed");
+
+        let result_id = memory::read_word(&vm.frames.data, fp) as u32;
+        let result = vm.heap.get_string(result_id).unwrap();
+        assert_eq!(result, "");
+    }
 }

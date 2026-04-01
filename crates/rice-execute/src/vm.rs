@@ -57,6 +57,27 @@ pub(crate) struct VmState<'m> {
 
     // Heap array reference table for indx results.
     pub heap_refs: Vec<(heap::HeapId, usize)>,
+
+    /// Set by recv/alt when channel has no data; the run loop suspends the thread.
+    pub(crate) blocked_channel: Option<heap::HeapId>,
+
+    /// Queue of suspended threads for cooperative scheduling.
+    pub(crate) thread_queue: std::collections::VecDeque<SuspendedThread>,
+}
+
+/// Per-thread state saved when a thread is suspended.
+#[derive(Debug)]
+pub(crate) struct SuspendedThread {
+    pub frames: FrameStack,
+    pub mp: Vec<u8>,
+    pub pc: usize,
+    pub heap_refs: Vec<(heap::HeapId, usize)>,
+    pub last_error: String,
+    pub current_loaded_module: Option<usize>,
+    pub caller_mp_stack: Vec<(usize, Vec<u8>)>,
+    /// None = ready to run, Some(chan_id) = blocked waiting for data on channel.
+    /// Some(0) = blocked on alt (any channel send unblocks).
+    pub blocked_on: Option<heap::HeapId>,
 }
 
 impl<'m> VmState<'m> {
@@ -192,6 +213,8 @@ impl<'m> VmState<'m> {
             imm_mid: 0,
             imm_dst: 0,
             caller_mp_stack: Vec::new(),
+            blocked_channel: None,
+            thread_queue: std::collections::VecDeque::new(),
             heap_refs: Vec::new(),
         })
     }
@@ -210,19 +233,66 @@ impl<'m> VmState<'m> {
 
     pub fn run(&mut self) -> Result<(), ExecError> {
         const GC_INTERVAL: usize = 10_000;
+        const THREAD_QUANTUM: usize = 2048;
+        let mut quantum_counter = 0usize;
 
-        while !self.halted {
-            if self.pc >= self.module.code.len() {
+        loop {
+            if self.halted {
+                // Current thread halted — check for other threads
+                if self.thread_queue.is_empty() {
+                    return Ok(());
+                }
+                self.resume_next_thread();
+                continue;
+            }
+
+            let code_len = if let Some(lm_idx) = self.current_loaded_module {
+                self.loaded_modules[lm_idx].module.code.len()
+            } else {
+                self.module.code.len()
+            };
+            if self.pc >= code_len {
+                if self.current_loaded_module.is_some() {
+                    // Loaded module finished — shouldn't happen normally
+                    self.halted = true;
+                    continue;
+                }
                 return Err(ExecError::InvalidPc(self.pc as Pc));
             }
-            let inst = self.module.code[self.pc].clone();
+
+            let inst = if let Some(lm_idx) = self.current_loaded_module {
+                self.loaded_modules[lm_idx].module.code[self.pc].clone()
+            } else {
+                self.module.code[self.pc].clone()
+            };
             if self.trace {
                 self.trace_instruction(&inst);
             }
             self.resolve_operands(&inst)?;
             self.next_pc = self.pc + 1;
             ops::dispatch(self, &inst)?;
+
+            // Check if the instruction blocked on a channel (recv/alt with no data)
+            if let Some(chan_id) = self.blocked_channel.take() {
+                // Don't advance PC — will re-execute the recv/alt when unblocked
+                if self.thread_queue.is_empty() {
+                    // No other threads — can't block, just continue (return zeros)
+                    self.pc = self.next_pc;
+                } else {
+                    self.suspend_as_blocked(chan_id);
+                    self.resume_next_ready_thread();
+                }
+                continue;
+            }
+
             self.pc = self.next_pc;
+
+            // Thread quantum — switch if other threads are waiting
+            quantum_counter += 1;
+            if quantum_counter >= THREAD_QUANTUM && !self.thread_queue.is_empty() {
+                quantum_counter = 0;
+                self.suspend_and_rotate();
+            }
 
             // Periodic GC
             if self.gc_enabled {
@@ -238,7 +308,85 @@ impl<'m> VmState<'m> {
                 }
             }
         }
-        Ok(())
+    }
+
+    /// Suspend the current thread and move to the next one in the queue.
+    fn suspend_and_rotate(&mut self) {
+        let suspended = SuspendedThread {
+            frames: std::mem::replace(&mut self.frames, FrameStack::new()),
+            mp: std::mem::take(&mut self.mp),
+            pc: self.pc,
+            heap_refs: std::mem::take(&mut self.heap_refs),
+            last_error: std::mem::take(&mut self.last_error),
+            current_loaded_module: self.current_loaded_module.take(),
+            caller_mp_stack: std::mem::take(&mut self.caller_mp_stack),
+            blocked_on: None,
+        };
+        self.thread_queue.push_back(suspended);
+        self.resume_next_ready_thread();
+    }
+
+    /// Suspend the current thread as blocked on a channel.
+    fn suspend_as_blocked(&mut self, chan_id: heap::HeapId) {
+        let suspended = SuspendedThread {
+            frames: std::mem::replace(&mut self.frames, FrameStack::new()),
+            mp: std::mem::take(&mut self.mp),
+            pc: self.pc, // DON'T advance — will re-execute recv/alt when unblocked
+            heap_refs: std::mem::take(&mut self.heap_refs),
+            last_error: std::mem::take(&mut self.last_error),
+            current_loaded_module: self.current_loaded_module.take(),
+            caller_mp_stack: std::mem::take(&mut self.caller_mp_stack),
+            blocked_on: Some(chan_id),
+        };
+        self.thread_queue.push_back(suspended);
+    }
+
+    /// Unblock threads waiting on a specific channel (called after send).
+    pub(crate) fn unblock_channel(&mut self, chan_id: heap::HeapId) {
+        for thread in self.thread_queue.iter_mut() {
+            if let Some(blocked_id) = thread.blocked_on {
+                // Unblock if waiting on this channel OR waiting on any channel (alt with id=0)
+                if blocked_id == chan_id || blocked_id == 0 {
+                    thread.blocked_on = None;
+                }
+            }
+        }
+    }
+
+    /// Resume the next READY (non-blocked) thread from the queue.
+    fn resume_next_ready_thread(&mut self) {
+        let len = self.thread_queue.len();
+        for _ in 0..len {
+            if let Some(thread) = self.thread_queue.pop_front() {
+                if thread.blocked_on.is_none() {
+                    // Ready — resume it
+                    self.load_thread(thread);
+                    return;
+                }
+                // Still blocked — put back
+                self.thread_queue.push_back(thread);
+            }
+        }
+        // No ready threads — deadlock or all blocked
+        self.halted = true;
+    }
+
+    /// Resume the next thread from the queue (any state).
+    fn resume_next_thread(&mut self) {
+        if let Some(thread) = self.thread_queue.pop_front() {
+            self.load_thread(thread);
+        }
+    }
+
+    fn load_thread(&mut self, thread: SuspendedThread) {
+        self.frames = thread.frames;
+        self.mp = thread.mp;
+        self.pc = thread.pc;
+        self.heap_refs = thread.heap_refs;
+        self.last_error = thread.last_error;
+        self.current_loaded_module = thread.current_loaded_module;
+        self.caller_mp_stack = thread.caller_mp_stack;
+        self.halted = false;
     }
 
     pub(crate) fn trace_instruction(&self, inst: &Instruction) {

@@ -337,4 +337,52 @@ mod tests {
             &[0, 0, 0, 0, 0, 0, 0, 0]
         );
     }
+
+    /// Regression: movmp with type_idx > type.size must not copy more bytes
+    /// than the type descriptor specifies. The old code fell back to using the
+    /// raw type_idx as byte count when the type was not found, which could
+    /// overcopy and corrupt adjacent frame data.
+    #[test]
+    fn movmp_does_not_overcopy() {
+        // Create a module with type 0 (size=64) and type 1 (size=8)
+        let mut module = test_module();
+        module.types.push(TypeDescriptor {
+            id: 1,
+            size: 8,
+            pointer_map: PointerMap { bytes: vec![] },
+            pointer_count: 0,
+        });
+
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp_base = vm.frames.current_data_offset();
+
+        // Source: 16 bytes of recognizable data
+        vm.frames.data[fp_base..fp_base + 16]
+            .copy_from_slice(&[0xAA; 16]);
+
+        // Place a sentinel pattern after the destination area
+        let dst_off = fp_base + 32;
+        vm.frames.data[dst_off + 8..dst_off + 16]
+            .copy_from_slice(&[0xBB; 8]);
+
+        vm.src = AddrTarget::Frame(fp_base);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 1; // type_idx=1, size=8
+        vm.dst = AddrTarget::Frame(dst_off);
+
+        op_movmp(&mut vm).expect("movmp should succeed");
+
+        // Only 8 bytes should be copied
+        assert_eq!(
+            &vm.frames.data[dst_off..dst_off + 8],
+            &[0xAA; 8],
+            "movmp should copy exactly type.size bytes"
+        );
+        // The sentinel after should be untouched
+        assert_eq!(
+            &vm.frames.data[dst_off + 8..dst_off + 16],
+            &[0xBB; 8],
+            "movmp should not overcopy into adjacent data"
+        );
+    }
 }

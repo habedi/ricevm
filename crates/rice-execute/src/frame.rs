@@ -11,13 +11,14 @@ use crate::memory;
 /// Size of the frame header in bytes: prev_pc (4) + prev_base (4) + reserved (8) = 16.
 pub(crate) const FRAME_HEADER_SIZE: usize = 16;
 
+#[derive(Debug)]
 pub(crate) struct FrameStack {
     /// Flat byte buffer holding all frames contiguously.
     pub data: Vec<u8>,
     /// Byte offset where the current (top) frame starts.
-    current_base: usize,
+    pub(crate) current_base: usize,
     /// Total size of the current frame (header + data area).
-    current_size: usize,
+    pub(crate) current_size: usize,
 }
 
 impl FrameStack {

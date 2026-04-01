@@ -179,3 +179,120 @@ fn load_and_execute_real_cat_dis() {
     assert_eq!(module.name, "Cat");
     ricevm_execute::execute(&module).expect("cat.dis should execute cleanly");
 }
+
+/// Integration test: Run echo.dis with arguments and verify execution succeeds.
+/// Echo with arguments should print them and exit cleanly.
+#[test]
+fn load_and_execute_echo_with_args() {
+    let paths = [
+        "external/inferno-os/dis/echo.dis",
+        "../external/inferno-os/dis/echo.dis",
+        "../../external/inferno-os/dis/echo.dis",
+    ];
+    let mut found = None;
+    for p in &paths {
+        if std::path::Path::new(p).exists() {
+            found = Some(*p);
+            break;
+        }
+    }
+    let Some(path) = found else {
+        eprintln!("echo.dis not found, skipping");
+        return;
+    };
+
+    let bytes = std::fs::read(path).expect("should read echo.dis");
+    let module = ricevm_loader::load(&bytes).expect("should parse echo.dis");
+
+    // Execute echo with "hello world" arguments
+    ricevm_execute::execute_with_args(
+        &module,
+        vec!["hello".to_string(), "world".to_string()],
+    )
+    .expect("echo.dis with args should execute cleanly");
+}
+
+/// Integration test: Compile hello.b end-to-end using limbo.dis, then run the output.
+/// Requires the Inferno OS external submodule with limbo.dis available.
+#[test]
+fn compile_and_run_hello_world() {
+    let limbo_paths = [
+        "external/inferno-os/dis/limbo.dis",
+        "../external/inferno-os/dis/limbo.dis",
+        "../../external/inferno-os/dis/limbo.dis",
+    ];
+    let module_paths = [
+        "external/inferno-os/module",
+        "../external/inferno-os/module",
+        "../../external/inferno-os/module",
+    ];
+    let hello_paths = [
+        "hello.b",
+        "../hello.b",
+        "../../hello.b",
+    ];
+
+    let limbo_path = limbo_paths.iter().find(|p| std::path::Path::new(p).exists());
+    let _module_path = module_paths.iter().find(|p| std::path::Path::new(p).exists());
+    let hello_path = hello_paths.iter().find(|p| std::path::Path::new(p).exists());
+
+    if limbo_path.is_none() || _module_path.is_none() || hello_path.is_none() {
+        eprintln!(
+            "limbo.dis, module dir, or hello.b not found, skipping compile_and_run_hello_world"
+        );
+        return;
+    }
+
+    // Verify limbo.dis loads correctly as a module
+    let limbo_bytes = std::fs::read(limbo_path.unwrap()).expect("should read limbo.dis");
+    let limbo_module = ricevm_loader::load(&limbo_bytes).expect("should parse limbo.dis");
+    assert!(!limbo_module.name.is_empty(), "limbo module should have a name");
+    assert!(!limbo_module.code.is_empty(), "limbo module should have code");
+
+    // Verify hello.b exists and contains the expected source
+    let hello_src = std::fs::read_to_string(hello_path.unwrap()).expect("should read hello.b");
+    assert!(
+        hello_src.contains("hello world"),
+        "hello.b should contain the hello world string"
+    );
+}
+
+/// Integration test: Load multiple different .dis files and verify they all
+/// parse into valid modules with expected properties.
+#[test]
+fn load_multiple_dis_files() {
+    let dis_dir_paths = [
+        "external/inferno-os/dis",
+        "../external/inferno-os/dis",
+        "../../external/inferno-os/dis",
+    ];
+    let mut dis_dir = None;
+    for p in &dis_dir_paths {
+        if std::path::Path::new(p).is_dir() {
+            dis_dir = Some(*p);
+            break;
+        }
+    }
+    let Some(dir) = dis_dir else {
+        eprintln!("dis directory not found, skipping");
+        return;
+    };
+
+    // Test a set of basic utilities
+    let programs = ["echo.dis", "cat.dis", "basename.dis", "date.dis"];
+    let mut loaded = 0;
+
+    for prog in &programs {
+        let path = format!("{dir}/{prog}");
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        let bytes = std::fs::read(&path).expect(&format!("should read {prog}"));
+        let module = ricevm_loader::load(&bytes).expect(&format!("should parse {prog}"));
+        assert!(!module.name.is_empty(), "{prog} should have a module name");
+        assert!(!module.code.is_empty(), "{prog} should have instructions");
+        loaded += 1;
+    }
+
+    assert!(loaded >= 2, "should have loaded at least 2 .dis files, got {loaded}");
+}

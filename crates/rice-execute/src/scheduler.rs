@@ -403,6 +403,8 @@ fn run_thread_quanta_shared(
             imm_dst: thread.imm_dst,
             last_error: std::mem::take(&mut thread.last_error),
             caller_mp_stack: Vec::new(),
+            blocked_channel: None,
+            thread_queue: std::collections::VecDeque::new(),
             heap_refs: std::mem::take(&mut thread.heap_refs),
         };
 
@@ -466,6 +468,8 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
         imm_dst: thread.imm_dst,
         last_error: std::mem::take(&mut thread.last_error),
         caller_mp_stack: Vec::new(),
+        blocked_channel: None,
+        thread_queue: std::collections::VecDeque::new(),
         heap_refs: std::mem::take(&mut thread.heap_refs),
     };
 

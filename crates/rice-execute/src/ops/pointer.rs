@@ -519,4 +519,153 @@ mod tests {
         let len = memory::read_word(&vm.frames.data, fp + 4);
         assert_eq!(len, 3); // slice length, not parent length (10)
     }
+
+    /// Regression: slicea must produce a view that shares storage with the parent.
+    /// Writes through the slice must be visible from the parent array.
+    #[test]
+    fn slicea_shared_storage_write_through() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Parent array: [10, 20, 30, 40, 50]
+        let mut data = vec![0u8; 20];
+        for i in 0..5i32 {
+            memory::write_word(&mut data, i as usize * 4, (i + 1) * 10);
+        }
+        let arr_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data,
+                length: 5,
+            },
+        );
+
+        // Slice [1..4) => elements 20, 30, 40
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 1;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 4;
+        memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_slicea(&mut vm).expect("slicea should succeed");
+        let slice_id = memory::read_word(&vm.frames.data, fp) as u32;
+
+        // Write 999 to slice[0] (= parent[1])
+        vm.heap.array_write(slice_id, 0, &999i32.to_le_bytes());
+
+        // Read parent[1] and verify the write is visible
+        let parent_bytes = vm.heap.array_read(arr_id, 4, 4).unwrap();
+        let val = i32::from_le_bytes(parent_bytes.try_into().unwrap());
+        assert_eq!(val, 999, "write through slice should be visible in parent");
+
+        // Read parent[0] to verify we did not corrupt adjacent data
+        let parent_bytes0 = vm.heap.array_read(arr_id, 0, 4).unwrap();
+        let val0 = i32::from_le_bytes(parent_bytes0.try_into().unwrap());
+        assert_eq!(val0, 10, "adjacent parent element should be untouched");
+    }
+
+    /// Property: slicea preserves the expected length.
+    #[test]
+    fn property_slicea_preserves_length() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let arr_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0u8; 40],
+                length: 10,
+            },
+        );
+
+        // Test various slice ranges
+        let ranges: &[(i32, i32, usize)] = &[
+            (0, 10, 10),
+            (0, 5, 5),
+            (3, 7, 4),
+            (0, 0, 0),
+            (5, 5, 0),
+            (9, 10, 1),
+        ];
+
+        for &(start, end, expected_len) in ranges {
+            vm.src = AddrTarget::Immediate;
+            vm.imm_src = start;
+            vm.mid = AddrTarget::Immediate;
+            vm.imm_mid = end;
+            memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+            // Inc ref so the slice can decrement it
+            vm.heap.inc_ref(arr_id);
+            vm.dst = AddrTarget::Frame(fp);
+
+            op_slicea(&mut vm).expect("slicea should succeed");
+
+            let slice_id = memory::read_word(&vm.frames.data, fp) as u32;
+            if expected_len == 0 && slice_id == arr_id {
+                // Empty slices may still point to parent
+                continue;
+            }
+            let obj = vm.heap.get(slice_id).unwrap();
+            match &obj.data {
+                HeapData::ArraySlice { length, .. } => {
+                    assert_eq!(
+                        *length, expected_len,
+                        "slice [{start}..{end}) should have length {expected_len}"
+                    );
+                }
+                _ => panic!("expected ArraySlice for range [{start}..{end})"),
+            }
+        }
+    }
+
+    /// Property: indx rejects out-of-bounds indices.
+    #[test]
+    fn property_indx_rejects_out_of_bounds() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let arr_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0u8; 20],
+                length: 5,
+            },
+        );
+
+        // Index 5 should fail (length is 5, valid indices are 0..4)
+        memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp + 8, 5);
+        vm.dst = AddrTarget::Frame(fp + 8);
+        vm.mid = AddrTarget::Frame(fp + 4);
+
+        let err = op_indx(&mut vm).expect_err("index 5 on array of length 5 should fail");
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "error should mention out of bounds: {err}"
+        );
+
+        // Negative index should also fail
+        memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp + 8, -1);
+        vm.dst = AddrTarget::Frame(fp + 8);
+        vm.mid = AddrTarget::Frame(fp + 4);
+
+        let err = op_indx(&mut vm).expect_err("negative index should fail");
+        assert!(
+            err.to_string().contains("negative"),
+            "error should mention negative: {err}"
+        );
+    }
 }

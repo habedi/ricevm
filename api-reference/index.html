@@ -798,83 +798,152 @@
 <h1 id="api-reference">API Reference<a class="headerlink" href="#api-reference" title="Permanent link">&para;</a></h1>
 <h2 id="built-in-modules">Built-in Modules<a class="headerlink" href="#built-in-modules" title="Permanent link">&para;</a></h2>
 <h3 id="sys"><code>$Sys</code><a class="headerlink" href="#sys" title="Permanent link">&para;</a></h3>
-<p>43 functions for system I/O, process control, and string formatting.</p>
+<p>This module includes functions for system I/O, process control, and string formatting.</p>
 <table>
 <thead>
 <tr>
-<th>Function</th>
+<th>Category</th>
+<th>Functions</th>
 <th>Description</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>print(fmt: string, ...)</code></td>
-<td>Print formatted string to stdout</td>
+<td>Formatting and errors</td>
+<td><code>aprint</code>, <code>fprint</code>, <code>print</code>, <code>sprint</code>, <code>werrstr</code></td>
+<td>Formatted output helpers plus per-thread error-string support.</td>
 </tr>
 <tr>
-<td><code>fprint(fd: ref FD, fmt: string, ...)</code></td>
-<td>Print formatted string to a file descriptor</td>
+<td>File and stream I/O</td>
+<td><code>create</code>, <code>dup</code>, <code>fd2path</code>, <code>fildes</code>, <code>iounit</code>, <code>open</code>, <code>pipe</code>, <code>pread</code>, <code>pwrite</code>, <code>read</code>, <code>readn</code>, <code>seek</code>, <code>stream</code>, <code>write</code></td>
+<td>File-descriptor creation, conversion, random access, pipes, and streaming operations.</td>
 </tr>
 <tr>
-<td><code>sprint(fmt: string, ...): string</code></td>
-<td>Format a string and return it</td>
+<td>File metadata and filesystem changes</td>
+<td><code>chdir</code>, <code>dirread</code>, <code>fstat</code>, <code>fwstat</code>, <code>remove</code>, <code>stat</code>, <code>wstat</code></td>
+<td>Directory traversal, stat/wstat operations, and filesystem mutation helpers.</td>
 </tr>
 <tr>
-<td><code>open(path: string, mode: int): ref FD</code></td>
-<td>Open a file</td>
+<td>Networking</td>
+<td><code>announce</code>, <code>dial</code>, <code>listen</code></td>
+<td>Host-network connection setup and listener support.</td>
 </tr>
 <tr>
-<td><code>create(path: string, mode: int, perm: int): ref FD</code></td>
-<td>Create a file</td>
+<td>Namespace and host-dependent operations</td>
+<td><code>bind</code>, <code>export</code>, <code>fauth</code>, <code>file2chan</code>, <code>mount</code>, <code>unmount</code></td>
+<td>Plan 9 namespace and authentication entry points. Some remain host-limited or stubbed.</td>
 </tr>
 <tr>
-<td><code>read(fd: ref FD, buf: array of byte, n: int): int</code></td>
-<td>Read from a file descriptor</td>
+<td>Text and Unicode helpers</td>
+<td><code>byte2char</code>, <code>char2byte</code>, <code>tokenize</code>, <code>utfbytes</code></td>
+<td>UTF decoding, UTF encoding, tokenization, and byte-length helpers.</td>
 </tr>
 <tr>
-<td><code>write(fd: ref FD, buf: array of byte, n: int): int</code></td>
-<td>Write to a file descriptor</td>
-</tr>
-<tr>
-<td><code>seek(fd: ref FD, off: big, whence: int): big</code></td>
-<td>Seek in a file</td>
-</tr>
-<tr>
-<td><code>fildes(fd: int): ref FD</code></td>
-<td>Convert integer to file descriptor</td>
-</tr>
-<tr>
-<td><code>tokenize(s: string, delim: string): (int, list of string)</code></td>
-<td>Split a string by delimiters</td>
-</tr>
-<tr>
-<td><code>millisec(): int</code></td>
-<td>Current time in milliseconds</td>
-</tr>
-<tr>
-<td><code>sleep(ms: int)</code></td>
-<td>Sleep for milliseconds</td>
-</tr>
-<tr>
-<td><code>byte2char(buf: array of byte, n: int): (int, int, int)</code></td>
-<td>Decode a UTF-8 character</td>
-</tr>
-<tr>
-<td><code>dial(addr: string, local: string): (int, Sys-&gt;Connection)</code></td>
-<td>Connect to a network address</td>
+<td>Time and process control</td>
+<td><code>fversion</code>, <code>millisec</code>, <code>pctl</code>, <code>sleep</code></td>
+<td>Version negotiation, wall-clock time, process control, and sleeping.</td>
 </tr>
 </tbody>
 </table>
 <h3 id="math"><code>$Math</code><a class="headerlink" href="#math" title="Permanent link">&para;</a></h3>
-<p>66 functions for mathematical operations, including trigonometry, linear algebra, and bit conversions.</p>
+<p>This module includes functions for mathematical operations, including trigonometry, linear algebra, and bit conversions.</p>
+<table>
+<thead>
+<tr>
+<th>Category</th>
+<th>Functions</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Trigonometric and hyperbolic</td>
+<td><code>acos</code>, <code>acosh</code>, <code>asin</code>, <code>asinh</code>, <code>atan</code>, <code>atan2</code>, <code>atanh</code>, <code>cos</code>, <code>cosh</code>, <code>sin</code>, <code>sinh</code>, <code>tan</code>, <code>tanh</code>, <code>hypot</code></td>
+<td>Angle, inverse-angle, and hyperbolic operations on real values.</td>
+</tr>
+<tr>
+<td>Exponential and logarithmic</td>
+<td><code>exp</code>, <code>expm1</code>, <code>ilogb</code>, <code>lgamma</code>, <code>log</code>, <code>log10</code>, <code>log1p</code>, <code>pow</code>, <code>pow10</code>, <code>scalbn</code></td>
+<td>Exponentials, logarithms, powers, scaling by powers of two, and gamma/log-gamma helpers.</td>
+</tr>
+<tr>
+<td>Rounding and remainders</td>
+<td><code>cbrt</code>, <code>ceil</code>, <code>fabs</code>, <code>fdim</code>, <code>floor</code>, <code>fmax</code>, <code>fmin</code>, <code>fmod</code>, <code>modf</code>, <code>nextafter</code>, <code>remainder</code>, <code>rint</code>, <code>sqrt</code></td>
+<td>Magnitude, rounding, remainder, root, and neighboring floating-point operations.</td>
+</tr>
+<tr>
+<td>Bit conversion and serialization</td>
+<td><code>bits32real</code>, <code>bits64real</code>, <code>export_int</code>, <code>export_real</code>, <code>export_real32</code>, <code>import_int</code>, <code>import_real</code>, <code>import_real32</code>, <code>realbits32</code>, <code>realbits64</code></td>
+<td>Convert between integer bit patterns, serialized byte formats, and real values.</td>
+</tr>
+<tr>
+<td>Classification and status</td>
+<td><code>finite</code>, <code>getFPcontrol</code>, <code>getFPstatus</code>, <code>isnan</code></td>
+<td>Floating-point classification plus emulated FP control and status accessors.</td>
+</tr>
+<tr>
+<td>Bessel family</td>
+<td><code>j0</code>, <code>j1</code>, <code>jn</code>, <code>y0</code>, <code>y1</code>, <code>yn</code></td>
+<td>Bessel functions of the first and second kinds.</td>
+</tr>
+<tr>
+<td>Error functions</td>
+<td><code>erf</code>, <code>erfc</code></td>
+<td>Gaussian error function helpers.</td>
+</tr>
+<tr>
+<td>Vector and matrix helpers</td>
+<td><code>dot</code>, <code>gemm</code>, <code>iamax</code>, <code>norm1</code>, <code>norm2</code>, <code>sort</code></td>
+<td>Small linear-algebra and numeric-array operations.</td>
+</tr>
+<tr>
+<td>Sign handling</td>
+<td><code>copysign</code></td>
+<td>Combine the magnitude of one real with the sign bit of another.</td>
+</tr>
+</tbody>
+</table>
 <h3 id="draw"><code>$Draw</code><a class="headerlink" href="#draw" title="Permanent link">&para;</a></h3>
-<p>62 functions for graphics via SDL2 (optional <code>gui</code> feature). Supports display allocation, image
-drawing, line and ellipse rendering, font metrics, and event handling.</p>
+<p>This module includes functions for graphics via SDL2 (optional <code>gui</code> feature).
+This module is to support display allocation, image drawing, line and ellipse rendering, font metrics, and event handling.</p>
+<table>
+<thead>
+<tr>
+<th>Area</th>
+<th>Functions</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Display</td>
+<td><code>Display.allocate</code>, <code>Display.cmap2rgb</code>, <code>Display.cmap2rgba</code>, <code>Display.color</code>, <code>Display.colormix</code>, <code>Display.getwindow</code>, <code>Display.namedimage</code>, <code>Display.newimage</code>, <code>Display.open</code>, <code>Display.publicscreen</code>, <code>Display.readimage</code>, <code>Display.rgb</code>, <code>Display.rgb2cmap</code>, <code>Display.startrefresh</code>, <code>Display.writeimage</code></td>
+<td>Display creation, color conversion, window binding, image allocation, and display I/O helpers.</td>
+</tr>
+<tr>
+<td>Font</td>
+<td><code>Font.bbox</code>, <code>Font.build</code>, <code>Font.open</code>, <code>Font.width</code></td>
+<td>Font loading, metrics, and bounding-box helpers.</td>
+</tr>
+<tr>
+<td>Image drawing</td>
+<td><code>Image.arc</code>, <code>Image.arcop</code>, <code>Image.arrow</code>, <code>Image.bezier</code>, <code>Image.bezierop</code>, <code>Image.bezspline</code>, <code>Image.bezsplineop</code>, <code>Image.border</code>, <code>Image.bottom</code>, <code>Image.draw</code>, <code>Image.drawop</code>, <code>Image.ellipse</code>, <code>Image.ellipseop</code>, <code>Image.fillarc</code>, <code>Image.fillarcop</code>, <code>Image.fillbezier</code>, <code>Image.fillbezierop</code>, <code>Image.fillbezspline</code>, <code>Image.fillbezsplineop</code>, <code>Image.fillellipse</code>, <code>Image.fillellipseop</code>, <code>Image.fillpoly</code>, <code>Image.fillpolyop</code>, <code>Image.flush</code>, <code>Image.gendraw</code>, <code>Image.gendrawop</code>, <code>Image.line</code>, <code>Image.lineop</code>, <code>Image.name</code>, <code>Image.origin</code>, <code>Image.poly</code>, <code>Image.polyop</code>, <code>Image.readpixels</code>, <code>Image.text</code>, <code>Image.textbg</code>, <code>Image.textbgop</code>, <code>Image.textop</code>, <code>Image.top</code>, <code>Image.writepixels</code></td>
+<td>Primitive drawing, compositing, text rendering, flush/present, pixel transfer, and z-order helpers.</td>
+</tr>
+<tr>
+<td>Screen</td>
+<td><code>Screen.allocate</code>, <code>Screen.bottom</code>, <code>Screen.newwindow</code>, <code>Screen.top</code></td>
+<td>Screen allocation, window creation, and stacking-order helpers.</td>
+</tr>
+<tr>
+<td>Current implementation status</td>
+<td>Implemented handlers include <code>Display.allocate</code>, <code>Display.color</code>, <code>Display.getwindow</code>, <code>Display.newimage</code>, <code>Font.open</code>, <code>Font.width</code>, <code>Image.border</code>, <code>Image.draw</code>, <code>Image.drawop</code>, <code>Image.ellipse</code>, <code>Image.ellipseop</code>, <code>Image.fillellipse</code>, <code>Image.fillellipseop</code>, <code>Image.flush</code>, <code>Image.line</code>, <code>Image.lineop</code>, <code>Image.text</code>, <code>Image.textop</code>, <code>Screen.allocate</code>, and <code>Screen.newwindow</code>. Remaining entries currently return stub values.</td>
+<td>SDL2-backed coverage exists for the common drawing path, but advanced Draw APIs are still incomplete.</td>
+</tr>
+</tbody>
+</table>
 <h3 id="tk"><code>$Tk</code><a class="headerlink" href="#tk" title="Permanent link">&para;</a></h3>
-<p>10 functions for the Tk widget toolkit. Supports toplevel windows, widget creation, command
-dispatch, named channels, and mouse event handling.</p>
-<h3 id="keyring"><code>$Keyring</code><a class="headerlink" href="#keyring" title="Permanent link">&para;</a></h3>
-<p>11 functions for cryptographic operations.</p>
+<p>This module includes functions for the Tk widget toolkit. Supports toplevel windows, widget creation, command dispatch, named channels, and mouse event handling.</p>
 <table>
 <thead>
 <tr>
@@ -883,6 +952,62 @@ dispatch, named channels, and mouse event handling.</p>
 </tr>
 </thead>
 <tbody>
+<tr>
+<td><code>cmd(top: ref Toplevel, command: string): string</code></td>
+<td>Execute a Tk command string and return a result string.</td>
+</tr>
+<tr>
+<td><code>color(name: string): int</code></td>
+<td>Resolve a Tk color name or encoded color value.</td>
+</tr>
+<tr>
+<td><code>getimage(top: ref Toplevel): ref Draw-&gt;Image</code></td>
+<td>Return the image associated with a toplevel window.</td>
+</tr>
+<tr>
+<td><code>keyboard(top: ref Toplevel, ctl: string): int</code></td>
+<td>Configure or query keyboard handling for a toplevel.</td>
+</tr>
+<tr>
+<td><code>namechan(name: string, c: chan of string): int</code></td>
+<td>Register a named channel used by Tk callbacks and <code>send</code>.</td>
+</tr>
+<tr>
+<td><code>pointer(top: ref Toplevel, ctl: string): int</code></td>
+<td>Configure or query pointer handling for a toplevel.</td>
+</tr>
+<tr>
+<td><code>putimage(top: ref Toplevel, img: ref Draw-&gt;Image): int</code></td>
+<td>Replace the image associated with a toplevel window.</td>
+</tr>
+<tr>
+<td><code>quote(value: string): string</code></td>
+<td>Quote a string for safe embedding in Tk command text.</td>
+</tr>
+<tr>
+<td><code>rect(top: ref Toplevel): Draw-&gt;Rect</code></td>
+<td>Return the current rectangle for the toplevel area.</td>
+</tr>
+<tr>
+<td><code>toplevel(display: ref Draw-&gt;Display, arg: string): ref Toplevel</code></td>
+<td>Create a top-level Tk window record and its backing image state.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="keyring"><code>$Keyring</code><a class="headerlink" href="#keyring" title="Permanent link">&para;</a></h3>
+<p>This module includes functions for cryptographic operations.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>md4(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>MD4 hash (real implementation)</td>
+</tr>
 <tr>
 <td><code>md5(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
 <td>MD5 hash (real implementation)</td>
@@ -892,13 +1017,91 @@ dispatch, named channels, and mouse event handling.</p>
 <td>SHA1 hash (real implementation)</td>
 </tr>
 <tr>
+<td><code>sha224(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>SHA224 hash (real implementation)</td>
+</tr>
+<tr>
+<td><code>sha256(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>SHA256 hash (real implementation)</td>
+</tr>
+<tr>
+<td><code>sha384(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>SHA384 hash (real implementation)</td>
+</tr>
+<tr>
+<td><code>sha512(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>SHA512 hash (real implementation)</td>
+</tr>
+<tr>
 <td><code>readauthinfo(path: string): ref Authinfo</code></td>
 <td>Read authentication info (stub)</td>
+</tr>
+<tr>
+<td><code>writeauthinfo(path: string, info: ref Authinfo): int</code></td>
+<td>Write authentication info (stub)</td>
+</tr>
+<tr>
+<td><code>getstring(fd: ref Sys-&gt;FD): string</code></td>
+<td>Read a string from a secure source (stub)</td>
+</tr>
+<tr>
+<td><code>putstring(fd: ref Sys-&gt;FD, s: string): int</code></td>
+<td>Write a string to a secure sink (stub)</td>
+</tr>
+<tr>
+<td><code>getbytearray(fd: ref Sys-&gt;FD): array of byte</code></td>
+<td>Read a byte array from a secure source (stub)</td>
+</tr>
+<tr>
+<td><code>putbytearray(fd: ref Sys-&gt;FD, data: array of byte): int</code></td>
+<td>Write a byte array to a secure sink (stub)</td>
+</tr>
+<tr>
+<td><code>auth(fd: ref Sys-&gt;FD, info: ref Authinfo): ref AuthResult</code></td>
+<td>Perform authentication exchange (stub)</td>
 </tr>
 </tbody>
 </table>
 <h3 id="crypt"><code>$Crypt</code><a class="headerlink" href="#crypt" title="Permanent link">&para;</a></h3>
-<p>Stub module with <code>md5</code> function for compiler signature computation.</p>
+<p>This module includes digest functions for cryptographic hashing.</p>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>md4(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>MD4 digest with incremental-state support.</td>
+</tr>
+<tr>
+<td><code>md5(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>MD5 digest with incremental-state support.</td>
+</tr>
+<tr>
+<td><code>sha1(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>SHA-1 digest with incremental-state support.</td>
+</tr>
+<tr>
+<td><code>sha224(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>SHA-224 digest with incremental-state support.</td>
+</tr>
+<tr>
+<td><code>sha256(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>SHA-256 digest with incremental-state support.</td>
+</tr>
+<tr>
+<td><code>sha384(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>SHA-384 digest with incremental-state support.</td>
+</tr>
+<tr>
+<td><code>sha512(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState</code></td>
+<td>SHA-512 digest with incremental-state support.</td>
+</tr>
+</tbody>
+</table>
 <h2 id="limbo-compiler-api">Limbo Compiler API<a class="headerlink" href="#limbo-compiler-api" title="Permanent link">&para;</a></h2>
 <p>The <code>ricevm-limbo</code> crate exposes a public Rust API:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1">// Compile source to a Module</span>

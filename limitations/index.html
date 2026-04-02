@@ -745,13 +745,14 @@ These include design choices made for simplicity and performance, as well as fea
   <code>fauth</code>, and <code>file2chan</code> have no host OS equivalent.</li>
 <li>About 240 pre-compiled Inferno programs fail: ~100 need command-line arguments (the programs work
   correctly but exit with usage errors), ~50 need Plan 9 namespace or device features, ~30 need
-  cryptographic modules beyond the current <code>$Keyring</code> stub, and ~60 have other environment dependencies.</li>
+  cryptographic modules beyond the current digest-only <code>$Keyring</code> and <code>$Crypt</code> coverage, and ~60
+  have other environment dependencies.</li>
 </ul>
 <h3 id="incomplete-modules">Incomplete Modules<a class="headerlink" href="#incomplete-modules" title="Permanent link">&para;</a></h3>
 <ul>
 <li><code>$Draw</code> has 35+ stub functions. Basic rendering (rectangles, lines, text, and images) works via
   SDL2, but many advanced drawing operations are not implemented.</li>
-<li><code>$Keyring</code> provides real MD5 and SHA1 digests, but IPint (big integer), TLS, and authentication
+<li><code>$Keyring</code> provides real MD4, MD5, SHA1, SHA224, SHA256, SHA384, and SHA512 digests, but IPint (big integer), TLS, and authentication
   functions are stubs.</li>
 </ul>
 <h2 id="compiler-limitations">Compiler Limitations<a class="headerlink" href="#compiler-limitations" title="Permanent link">&para;</a></h2>
@@ -768,7 +769,7 @@ These include design choices made for simplicity and performance, as well as fea
 <li><strong>No import signature hashes</strong>: all import signatures are 0; the VM uses name-based function matching.</li>
 </ul>
 <h2 id="compatibility">Compatibility<a class="headerlink" href="#compatibility" title="Permanent link">&para;</a></h2>
-<p>546 of 844 (65%) pre-compiled Inferno <code>.dis</code> programs pass. Excluding programs that need command-line
+<p>At the moment, 546 of 844 (65%) pre-compiled Inferno <code>.dis</code> programs pass. Excluding programs that need command-line
 arguments or are library modules not meant to run standalone, the effective pass rate is about 83%.</p>
 <p>The built-in compiler parses 159/159 (100%) of Inferno <code>cmd/</code> source files and compiles 155/159 (97%)
 with both the built-in and reference compilers producing identical outputs.</p>

@@ -1,0 +1,80 @@
+digraph RiceVMLimboWorkflow {
+fontname = "Helvetica,Arial,sans-serif"
+layout = dot
+rankdir = LR
+ranksep = 0.9
+nodesep = 0.7
+splines = true
+bgcolor = "white"
+compound = true
+
+node [
+fontname = "Helvetica,Arial,sans-serif",
+shape = rect,
+style = "filled",
+color = "#475569",
+fillcolor = "white",
+penwidth = 1.4,
+margin = "0.16,0.10"
+]
+
+edge [
+fontname = "Helvetica,Arial,sans-serif",
+fontsize = 10,
+color = "#475569",
+fontcolor = "#475569",
+penwidth = 1.2
+]
+
+subgraph cluster_limbo_compiler {
+label = "Limbo Compiler"
+fontname = "Helvetica,Arial,sans-serif"
+fontsize = 14
+style = "rounded"
+color = "#2563EB"
+penwidth = 1.4
+margin = 16
+
+program_b [label = "program.b", fillcolor = "#E0F2FE", color = "#0284C7"]
+sys_m [label = "sys.m", fillcolor = "#F8FAFC", color = "#64748B", style = "filled,dashed"]
+draw_m [label = "draw.m", fillcolor = "#F8FAFC", color = "#64748B", style = "filled,dashed"]
+compile_cmd [label = "ricevm-cli compile program.b", fillcolor = "#DBEAFE", color = "#2563EB"]
+
+program_b -> compile_cmd
+sys_m -> compile_cmd [style = dashed]
+draw_m -> compile_cmd [style = dashed]
+}
+
+subgraph cluster_dis_vm {
+label = "Dis VM"
+fontname = "Helvetica,Arial,sans-serif"
+fontsize = 14
+style = "rounded"
+color = "#65A30D"
+penwidth = 1.4
+margin = 16
+
+program_dis [label = "program.dis", fillcolor = "#ECFCCB", color = "#65A30D"]
+run_cmd [label = "ricevm-cli run program.dis", fillcolor = "#FCE7F3", color = "#DB2777"]
+
+program_dis -> run_cmd
+}
+
+subgraph cluster_utilities {
+label = "Utilities"
+fontname = "Helvetica,Arial,sans-serif"
+fontsize = 14
+style = "rounded"
+color = "#D97706"
+penwidth = 1.4
+margin = 16
+
+dis_cmd [label = "ricevm-cli dis program.dis", fillcolor = "#FEF3C7", color = "#D97706"]
+debug_cmd [label = "ricevm-cli debug program.dis", fillcolor = "#E9D5FF", color = "#7C3AED"]
+
+program_dis -> dis_cmd [style = dashed]
+program_dis -> debug_cmd [style = dashed]
+}
+
+compile_cmd -> program_dis
+}

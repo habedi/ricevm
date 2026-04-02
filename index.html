@@ -424,10 +424,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#highlights" class="md-nav__link">
+  <a href="#features" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Highlights
+        Features
       
     </span>
   </a>
@@ -435,10 +435,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#quick-example" class="md-nav__link">
+  <a href="#ricevm-architecture" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Quick Example
+        RiceVM Architecture
       
     </span>
   </a>
@@ -446,10 +446,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#project-structure" class="md-nav__link">
+  <a href="#documentation" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Project Structure
+        Documentation
       
     </span>
   </a>
@@ -599,10 +599,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#highlights" class="md-nav__link">
+  <a href="#features" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Highlights
+        Features
       
     </span>
   </a>
@@ -610,10 +610,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#quick-example" class="md-nav__link">
+  <a href="#ricevm-architecture" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Quick Example
+        RiceVM Architecture
       
     </span>
   </a>
@@ -621,10 +621,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#project-structure" class="md-nav__link">
+  <a href="#documentation" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Project Structure
+        Documentation
       
     </span>
   </a>
@@ -652,45 +652,23 @@
 
 
 <h1 id="ricevm">RiceVM<a class="headerlink" href="#ricevm" title="Permanent link">&para;</a></h1>
-<p><strong>A Dis virtual machine and Limbo compiler in Rust.</strong></p>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/habedi/ricevm/main/logo.svg" alt="Project Logo" width="200" />
+</p>
+
 <hr />
-<p>RiceVM is a re-implementation of the <a href="https://www.inferno-os.org/inferno/papers/dis.pdf">Dis virtual machine</a> in Rust.
-The Dis VM is a register machine that executes bytecode compiled from the
-<a href="https://inferno-os.org/inferno/papers/limbo.html">Limbo programming language</a>,
-originally designed for the <a href="https://en.wikipedia.org/wiki/Inferno_(operating_system)">Inferno operating system</a>.</p>
-<h2 id="highlights">Highlights<a class="headerlink" href="#highlights" title="Permanent link">&para;</a></h2>
+<p>RiceVM is a <a href="https://www.inferno-os.org/inferno/papers/dis.pdf">Dis virtual machine</a> and <a href="https://inferno-os.org/inferno/papers/limbo.html">Limbo</a>
+compiler implemented in Rust.</p>
+<h2 id="features">Features<a class="headerlink" href="#features" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>All 176 Dis VM opcodes</strong> implemented and audited against the reference C implementation</li>
-<li><strong>Built-in Limbo compiler</strong> that compiles <code>.b</code> source files to <code>.dis</code> bytecode without external tools</li>
-<li><strong>546/844 pre-compiled Inferno programs pass</strong> (65%); 159/159 Limbo source files parse (100%)</li>
-<li><strong>Built-in modules</strong>: <code>$Sys</code>, <code>$Math</code>, <code>$Draw</code> (SDL2), <code>$Tk</code>, <code>$Keyring</code> (MD5, SHA1), and <code>$Crypt</code></li>
-<li><strong>Cooperative threading</strong> with channels, spawn, and non-blocking stdin</li>
-<li><strong>Mark-and-sweep garbage collector</strong> with reference counting</li>
-<li><strong>GUI support</strong> via SDL2 with embedded bitmap font rendering (optional <code>gui</code> feature)</li>
-<li><strong>Audio support</strong> via cpal (optional <code>audio</code> feature)</li>
-<li><strong>Interactive debugger</strong> with breakpoints, single-stepping, and stack inspection</li>
-<li><strong>Cross-platform</strong>: Linux, macOS, and Windows</li>
+<li>Supports all 176 Dis VM opcodes</li>
+<li>Includes a Limbo compiler, <code>.dis</code> file disassembler, and debugger</li>
+<li>Includes built-in modules from Dis virtual machine, including <code>$Sys</code>, <code>$Math</code>, <code>$Crypt</code>, etc.</li>
+<li>Cooperative threading with channels, spawn, and non-blocking stdin</li>
+<li>Supports for GUI applications and audeo playback</li>
+<li>Fully cross-platform (runs on Windows, Linux, and macOS)</li>
 </ul>
-<h2 id="quick-example">Quick Example<a class="headerlink" href="#quick-example" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Write a Limbo program</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>cat<span class="w"> </span>&gt;<span class="w"> </span>hello.b<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="s">implement Hello;</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="s">include &quot;sys.m&quot;;</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="s">include &quot;draw.m&quot;;</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="s">Hello: module {</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="s">    init: fn(ctxt: ref Draw-&gt;Context, argv: list of string);</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="s">};</span>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="s">init(ctxt: ref Draw-&gt;Context, argv: list of string) {</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="s">    sys := load Sys Sys-&gt;PATH;</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="s">    sys-&gt;print(&quot;hello, world\n&quot;);</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="s">}</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="s">EOF</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>
-<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="c1"># Compile and run</span>
-<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>ricevm-cli<span class="w"> </span>compile<span class="w"> </span>hello.b
-<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>ricevm-cli<span class="w"> </span>run<span class="w"> </span>hello.dis<span class="w"> </span>--probe<span class="w"> </span>external/inferno-os/dis
-</code></pre></div>
-<h2 id="project-structure">Project Structure<a class="headerlink" href="#project-structure" title="Permanent link">&para;</a></h2>
+<h2 id="ricevm-architecture">RiceVM Architecture<a class="headerlink" href="#ricevm-architecture" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
@@ -701,7 +679,7 @@ originally designed for the <a href="https://en.wikipedia.org/wiki/Inferno_(oper
 <tbody>
 <tr>
 <td><code>ricevm-core</code></td>
-<td>Shared types: <code>Module</code>, <code>Opcode</code>, <code>Instruction</code>, <code>TypeDescriptor</code>, and errors</td>
+<td>Core shared types and utilities</td>
 </tr>
 <tr>
 <td><code>ricevm-loader</code></td>
@@ -709,18 +687,25 @@ originally designed for the <a href="https://en.wikipedia.org/wiki/Inferno_(oper
 </tr>
 <tr>
 <td><code>ricevm-execute</code></td>
-<td>Execution engine: 176 opcodes, heap, GC, built-in modules, and threading</td>
+<td>Dis runtime</td>
 </tr>
 <tr>
 <td><code>ricevm-limbo</code></td>
-<td>Built-in Limbo compiler: lexer, parser, code generator, and <code>.dis</code> writer</td>
+<td>Limbo compiler</td>
 </tr>
 <tr>
 <td><code>ricevm-cli</code></td>
-<td>CLI with <code>run</code>, <code>compile</code>, <code>dis</code>, and <code>debug</code> subcommands</td>
+<td>CLI frontend</td>
 </tr>
 </tbody>
 </table>
+<h2 id="documentation">Documentation<a class="headerlink" href="#documentation" title="Permanent link">&para;</a></h2>
+<ul>
+<li><a href="getting-started/">Getting Started</a></li>
+<li><a href="examples/">Examples</a></li>
+<li><a href="api-reference/">API Reference</a></li>
+<li><a href="limitations/">Limitations</a></li>
+</ul>
 
 
 

@@ -32,7 +32,7 @@ jobs:
     strategy:
       matrix:
         # Define the Rust versions to test against
-        rust-version: [ "1.85.0", "beta", "stable" ]
+        rust-version: [ "1.92.0", "beta", "stable" ]
 
     steps:
       - name: Checkout Repository

@@ -9,28 +9,20 @@
 
 [![Tests](https://img.shields.io/github/actions/workflow/status/habedi/ricevm/tests.yml?label=tests&style=flat&labelColor=282c34&color=4caf50&logo=github)](https://github.com/habedi/ricevm/actions/workflows/tests.yml)
 [![Code Coverage](https://img.shields.io/codecov/c/github/habedi/ricevm?style=flat&labelColor=282c34&color=ffca28&logo=codecov)](https://codecov.io/gh/habedi/ricevm)
-[![Docs](https://img.shields.io/badge/docs-latest-007ec6?style=flat&labelColor=282c34&logo=readthedocs)](docs)
+[![Docs](https://img.shields.io/badge/docs-latest-007ec6?style=flat&labelColor=282c34&logo=readthedocs)](https://habedi.github.io/ricevm/)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/habedi/ricevm)
 [![Release](https://img.shields.io/github/release/habedi/ricevm.svg?label=release&style=flat&labelColor=282c34&logo=github)](https://github.com/habedi/ricevm/releases/latest)
 
-RiceVM is a [Dis virtual machine](https://www.inferno-os.org/inferno/papers/dis.pdf) and
-[Limbo](https://inferno-os.org/inferno/papers/limbo.html) compiler in Rust.
-The Dis VM is a register machine that executes bytecode compiled from the Limbo programming
-language, originally designed for the [Inferno operating system](https://en.wikipedia.org/wiki/Inferno_(operating_system)).
+RiceVM is a [Dis virtual machine](https://www.inferno-os.org/inferno/papers/dis.pdf) and [Limbo](https://inferno-os.org/inferno/papers/limbo.html)
+compiler implemented in Rust.
 
 ### Features
 
-- All 176 Dis VM opcodes implemented and audited against the reference C implementation
-- Built-in Limbo compiler: compile `.b` source files to `.dis` bytecode without external tools
-- 546/844 (65%) pre-compiled Inferno programs pass; 159/159 Limbo source files parse
-- Built-in modules: `$Sys`, `$Math`, `$Draw` (SDL2), `$Tk` (widget toolkit), `$Keyring` (MD5, SHA1), and `$Crypt`
-- Cooperative threading with channels, spawn, and non-blocking stdin
-- Mark-and-sweep garbage collector with reference counting
-- GUI support via SDL2 (optional `gui` feature) with embedded bitmap font rendering
-- Audio support via cpal (optional `audio` feature)
-- Interactive debugger with breakpoints, single-stepping, and stack inspection
-- Disassembler for `.dis` module files
-- Cross-platform: runs on Linux, macOS, and Windows
+- Supports all 176 Dis VM opcodes and a fully functional Dis runtime
+- Includes a Limbo compiler, `.dis` file disassembler, and debugger
+- Includes built-in modules from Dis virtual machine, including `$Sys`, `$Math`, `$Crypt`, etc.
+- Supports for GUI applications and audeo playback
+- Fully cross-platform (runs on Windows, Linux, and macOS)
 
 See [ROADMAP.md](ROADMAP.md) for the full list of implemented and planned features.
 
@@ -80,7 +72,7 @@ cargo run -p ricevm-cli -- compile hello.b
 # Run the compiled program
 cargo run -p ricevm-cli -- run hello.dis --probe external/inferno-os/dis
 
-# Or compile using the reference Inferno Limbo compiler (runs on RiceVM itself)
+# Or compile using the original Inferno Limbo compiler (runs on RiceVM itself)
 cargo run -p ricevm-cli -- run external/inferno-os/dis/limbo.dis \
     --probe external/inferno-os/dis --probe external/inferno-os/dis/lib \
     -- -I external/inferno-os/module hello.b
@@ -88,11 +80,11 @@ cargo run -p ricevm-cli -- run external/inferno-os/dis/limbo.dis \
 # Run the compiled program
 cargo run -p ricevm-cli -- run hello.dis --probe external/inferno-os/dis
 
-# Run with instruction tracing (useful for debugging)
+# Run with instruction tracing (this is useful for debugging)
 cargo run -p ricevm-cli -- run external/inferno-os/dis/echo.dis \
     --probe external/inferno-os/dis --trace -- hello world
 
-# Run the About Inferno dialog with GUI (requires SDL2)
+# Run the About Inferno dialog with GUI (this needs SDL2)
 cargo run -p ricevm-cli --release --features gui -- run external/inferno-os/dis/wm/about.dis \
     --probe external/inferno-os/dis \
     --probe external/inferno-os/dis/lib \
@@ -101,17 +93,9 @@ cargo run -p ricevm-cli --release --features gui -- run external/inferno-os/dis/
 
 ---
 
-### Architecture
+### Documentation
 
-RiceVM consists of the following crates:
-
-| Crate                                   | Purpose                                                                                      |
-|-----------------------------------------|----------------------------------------------------------------------------------------------|
-| [ricevm-core](crates/ricevm-core)       | Core shared types, including `Module`, `Opcode`, `Instruction`, `TypeDescriptor`, and errors |
-| [ricevm-loader](crates/ricevm-loader)   | `.dis` binary format parser                                                                  |
-| [ricevm-execute](crates/ricevm-execute) | Execution engine: 176 opcodes, heap, GC, built-in modules, and threading                    |
-| [ricevm-limbo](crates/ricevm-limbo)     | Built-in Limbo compiler: lexer, parser, code generator, and `.dis` binary writer             |
-| [ricevm-cli](crates/ricevm-cli)         | CLI with `run`, `compile`, `dis`, and `debug` subcommands                                    |
+See the [RiceVM documenation](https://habedi.github.io/ricevm/) for more details.
 
 ---
 

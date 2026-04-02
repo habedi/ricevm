@@ -505,6 +505,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Architecture
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#built-in-modules" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -671,6 +682,17 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Architecture
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#built-in-modules" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -796,6 +818,37 @@
 
 
 <h1 id="api-reference">API Reference<a class="headerlink" href="#api-reference" title="Permanent link">&para;</a></h1>
+<h2 id="architecture">Architecture<a class="headerlink" href="#architecture" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Crate</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ricevm-core</code></td>
+<td>Shared types and utilities</td>
+</tr>
+<tr>
+<td><code>ricevm-loader</code></td>
+<td><code>.dis</code> binary format parser</td>
+</tr>
+<tr>
+<td><code>ricevm-execute</code></td>
+<td>Dis runtime</td>
+</tr>
+<tr>
+<td><code>ricevm-limbo</code></td>
+<td>Limbo compiler</td>
+</tr>
+<tr>
+<td><code>ricevm-cli</code></td>
+<td>CLI frontend</td>
+</tr>
+</tbody>
+</table>
 <h2 id="built-in-modules">Built-in Modules<a class="headerlink" href="#built-in-modules" title="Permanent link">&para;</a></h2>
 <h3 id="sys"><code>$Sys</code><a class="headerlink" href="#sys" title="Permanent link">&para;</a></h3>
 <p>This module includes functions for system I/O, process control, and string formatting.</p>

@@ -10,7 +10,7 @@ use ricevm_core::{AddressMode, MiddleMode, Module};
 #[command(
     name = "ricevm",
     version,
-    about = "RiceVM: A Dis virtual machine implementation in Rust"
+    about = "RiceVM: A Dis virtual machine and Limbo compiler in Rust"
 )]
 struct Cli {
     #[command(subcommand)]

@@ -1,0 +1,153 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  call-tests:
+    uses: ./.github/workflows/tests.yml
+
+  create-release:
+    name: Create release draft
+    runs-on: ubuntu-latest
+    needs: call-tests
+    permissions:
+      contents: write
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      release_tag: ${{ steps.release_tag.outputs.release_tag }}
+    steps:
+      - name: Set release tag
+        id: release_tag
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "release_tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "release_tag=draft-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.release_tag.outputs.release_tag }}
+          release_name: Release ${{ steps.release_tag.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          draft: true
+          prerelease: false
+
+  build-linux-amd64:
+    name: Build Linux AMD64
+    runs-on: ubuntu-latest
+    needs: create-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p ricevm-cli
+
+      - name: Package release asset
+        run: |
+          mkdir -p dist
+          cp target/release/ricevm-cli dist/
+          cd dist && tar czf ../ricevm-linux-amd64.tar.gz ricevm-cli
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./ricevm-linux-amd64.tar.gz
+          asset_name: ricevm-linux-amd64.tar.gz
+          asset_content_type: application/gzip
+
+  build-macos-arm64:
+    name: Build macOS ARM64
+    runs-on: macos-14
+    needs: create-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p ricevm-cli
+
+      - name: Package release asset
+        run: |
+          mkdir -p dist
+          cp target/release/ricevm-cli dist/
+          cd dist && tar czf ../ricevm-macos-arm64.tar.gz ricevm-cli
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./ricevm-macos-arm64.tar.gz
+          asset_name: ricevm-macos-arm64.tar.gz
+          asset_content_type: application/gzip
+
+  build-windows-amd64:
+    name: Build Windows AMD64
+    runs-on: windows-latest
+    needs: create-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release -p ricevm-cli
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target\release\ricevm-cli.exe" -DestinationPath "ricevm-windows-amd64.zip" -Force
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./ricevm-windows-amd64.zip
+          asset_name: ricevm-windows-amd64.zip
+          asset_content_type: application/zip

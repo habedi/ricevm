@@ -52,7 +52,7 @@ cargo build --release
 cargo run -p ricevm-cli -- run external/inferno-os/dis/echo.dis \
     --probe external/inferno-os/dis -- hello world
 
-# Disassemble a .dis module
+# Disassemble a `.dis` file
 cargo run -p ricevm-cli -- dis external/inferno-os/dis/echo.dis
 
 # Create a Hello world program in Limbo language (`hello.b`)

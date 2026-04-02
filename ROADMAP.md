@@ -113,9 +113,9 @@ This document outlines the features implemented in RiceVM and the future goals f
     - `cmd`: full command dispatch (widget creation, configure, cget, winfo, bind, send, pack -in/-side, compound commands)
     - `namechan`: registers named channels for Tk event delivery
     - `pointer`, `keyboard`, `quote`, `color`, `rect`, `getimage`, and `putimage`
-- [x] `$Keyring` module (11 functions: `md5`, `sha1`, `sha224`, `sha256` with real digests; `readauthinfo`, `writeauthinfo`, `getstring`, `putstring`,
-  `getbytearray`, `putbytearray`, and `auth` stubs)
-- [x] `$Crypt` module (`md5`, `sha1`, `sha224`, and `sha256` digests)
+- [x] `$Keyring` module (14 functions: `md4`, `md5`, `sha1`, `sha224`, `sha256`, `sha384`, and `sha512` with real digests; `readauthinfo`,
+  `writeauthinfo`, `getstring`, `putstring`, `getbytearray`, `putbytearray`, and `auth` stubs)
+- [x] `$Crypt` module (`md4`, `md5`, `sha1`, `sha224`, `sha256`, `sha384`, and `sha512` digests)
 - [x] Exception handler table lookup for `raise` opcode and nil dereference faults
 - [x] Name-based function dispatch with signature-hash fallback for built-in and loaded modules
 

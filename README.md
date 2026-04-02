@@ -1,6 +1,6 @@
 <div align="center">
   <picture>
-    <img alt="Project Logo" src="docs/assets/logo.svg" height="30%" width="30%">
+    <img alt="Project Logo" src="docs/assets/logo.svg" height="25%" width="25%">
   </picture>
 <br>
 
@@ -96,6 +96,11 @@ cargo run -p ricevm-cli --release --features gui -- run external/inferno-os/dis/
     --probe external/inferno-os/dis/lib \
     --root external/inferno-os
 ```
+
+[//]: # (### Usage Workflow)
+
+[//]: # ()
+[//]: # ([![RiceVM Usage Workflow]&#40;docs/assets/diagrams/usage_workflow.svg&#41;]&#40;docs/assets/diagrams/usage_workflow.svg&#41;)
 
 ---
 

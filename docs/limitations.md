@@ -19,13 +19,14 @@ These include design choices made for simplicity and performance, as well as fea
   `fauth`, and `file2chan` have no host OS equivalent.
 - About 240 pre-compiled Inferno programs fail: ~100 need command-line arguments (the programs work
   correctly but exit with usage errors), ~50 need Plan 9 namespace or device features, ~30 need
-  cryptographic modules beyond the current `$Keyring` stub, and ~60 have other environment dependencies.
+  cryptographic modules beyond the current digest-only `$Keyring` and `$Crypt` coverage, and ~60
+  have other environment dependencies.
 
 ### Incomplete Modules
 
 - `$Draw` has 35+ stub functions. Basic rendering (rectangles, lines, text, and images) works via
   SDL2, but many advanced drawing operations are not implemented.
-- `$Keyring` provides real MD5, SHA1, SHA224, and SHA256 digests, but IPint (big integer), TLS, and authentication
+- `$Keyring` provides real MD4, MD5, SHA1, SHA224, SHA256, SHA384, and SHA512 digests, but IPint (big integer), TLS, and authentication
   functions are stubs.
 
 ## Compiler Limitations
@@ -44,7 +45,7 @@ The built-in Limbo compiler (`ricevm-limbo`) handles a large subset of the langu
 
 ## Compatibility
 
-546 of 844 (65%) pre-compiled Inferno `.dis` programs pass. Excluding programs that need command-line
+At the moment, 546 of 844 (65%) pre-compiled Inferno `.dis` programs pass. Excluding programs that need command-line
 arguments or are library modules not meant to run standalone, the effective pass rate is about 83%.
 
 The built-in compiler parses 159/159 (100%) of Inferno `cmd/` source files and compiles 155/159 (97%)

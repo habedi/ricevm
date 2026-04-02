@@ -1,7 +1,7 @@
 # RiceVM
 
 <p align="center">
-  <img src="assets/logo.svg" alt="Project Logo" width="200" />
+  <img src="assets/logo.svg" alt="Project Logo" width="250" />
 </p>
 
 ---

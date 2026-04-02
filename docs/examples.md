@@ -92,7 +92,7 @@ ricevm-cli run chan_demo.dis --probe external/inferno-os/dis
 
 ## Running Pre-compiled Inferno Programs
 
-RiceVM includes 866 pre-compiled `.dis` files from the Inferno OS distribution:
+RiceVM includes 800+ pre-compiled `.dis` files from the Inferno OS distribution:
 
 ```bash
 # List files

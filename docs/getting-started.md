@@ -106,3 +106,9 @@ cargo run -p ricevm-cli -- debug external/inferno-os/dis/echo.dis \
 | `--no-gc`      | Disable mark-and-sweep garbage collection               |
 | `-I PATH`      | Include search path for `.m` files (compile subcommand) |
 | `-o PATH`      | Output file path (compile subcommand)                   |
+
+### Usage Workflow
+
+<p align="center">
+  <img src="../assets/diagrams/usage_workflow.svg" alt="RiceVM Usage Workflow"/>
+</p>

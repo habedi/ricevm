@@ -6,6 +6,8 @@ site_url: https://habedi.github.io/ricevm/
 
 theme:
   name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default

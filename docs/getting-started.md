@@ -2,7 +2,8 @@
 
 ## Build from Source
 
-RiceVM requires Rust 1.92.0 or newer. The optional GUI feature requires SDL2.
+RiceVM needs Rust 1.92.0 or newer to build.
+The optional GUI feature needs SDL2.
 
 ```bash
 # Clone the repository with the Inferno OS submodule
@@ -19,10 +20,10 @@ cargo run -p ricevm-cli -- --version
 ### Optional Features
 
 ```bash
-# Build with SDL2 GUI support (requires libsdl2-dev)
+# Build with SDL2 GUI support (needs `libsdl2-dev` on Debian/Ubuntu)
 cargo build --release --features gui
 
-# Build with audio support (requires cpal dependencies)
+# Build with audio support
 cargo build --release --features audio
 ```
 
@@ -88,20 +89,20 @@ cargo run -p ricevm-cli -- debug external/inferno-os/dis/echo.dis \
 
 ## CLI Reference
 
-| Subcommand | Description |
-|------------|-------------|
-| `run` | Execute a `.dis` module file |
-| `compile` | Compile a Limbo `.b` source to `.dis` bytecode |
-| `dis` | Disassemble a `.dis` module into human-readable output |
-| `debug` | Debug a `.dis` module interactively |
+| Subcommand | Description                                            |
+|------------|--------------------------------------------------------|
+| `run`      | Execute a `.dis` module file                           |
+| `compile`  | Compile a Limbo `.b` source to `.dis` bytecode         |
+| `dis`      | Disassemble a `.dis` module into human-readable output |
+| `debug`    | Debug a `.dis` module interactively                    |
 
 ### Common Flags
 
-| Flag | Description |
-|------|-------------|
-| `--probe PATH` | Add a directory to the module search path (repeatable) |
-| `--root PATH` | Map Inferno root paths to a host directory |
-| `--trace` | Print each instruction as it executes |
-| `--no-gc` | Disable mark-and-sweep garbage collection |
-| `-I PATH` | Include search path for `.m` files (compile subcommand) |
-| `-o PATH` | Output file path (compile subcommand) |
+| Flag           | Description                                             |
+|----------------|---------------------------------------------------------|
+| `--probe PATH` | Add a directory to the module search path (repeatable)  |
+| `--root PATH`  | Map Inferno root paths to a host directory              |
+| `--trace`      | Print each instruction as it executes                   |
+| `--no-gc`      | Disable mark-and-sweep garbage collection               |
+| `-I PATH`      | Include search path for `.m` files (compile subcommand) |
+| `-o PATH`      | Output file path (compile subcommand)                   |

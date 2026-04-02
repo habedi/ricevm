@@ -32,7 +32,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Type conversions: all `cvt*` variants including string/real/big/word
 - [x] `cvtfw`/`cvtfl` with correct rounding (±0.5, not truncation)
 - [x] `cvtrf`/`cvtfr` as f32↔f64 conversion (SREAL = IEEE 754 float)
-- [x] `cvtwc`/`cvtcw` as decimal string formatting/parsing (matching C strtol)
+- [x] `cvtwc`/`cvtcw` as decimal string formatting/parsing (this matches C `strtol`)
 - [x] `cvtfc` using `%g` format for real-to-string conversion
 - [x] Bitwise and shift: word, byte, and big variants including logical shift right
 - [x] Control flow: `call`, `ret`, `frame`, `jmp`, `exit`, `goto`, `casew`, `casec`, `casel`, and `raise`
@@ -58,7 +58,8 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Pointer type with heap object tracking and reference counting
 - [x] String type with full Unicode support and copy-on-write
 - [x] Array type with bounds checking and heap array references
-- [x] `ArraySlice` type for shared-storage array views (Bufio buffer semantics); fully supported in `cvtac`, `slicela`, `pread`, `pwrite`, and channel operations
+- [x] `ArraySlice` type for shared-storage array views (Bufio buffer semantics); fully supported in `cvtac`, `slicela`, `pread`, `pwrite`, and channel
+  operations
 - [x] List type (singly linked with typed head values)
 - [x] Channel type (allocation and simplified send and receive)
 - [x] ADT (abstract data type) support
@@ -112,7 +113,8 @@ This document outlines the features implemented in RiceVM and the future goals f
     - `cmd`: full command dispatch (widget creation, configure, cget, winfo, bind, send, pack -in/-side, compound commands)
     - `namechan`: registers named channels for Tk event delivery
     - `pointer`, `keyboard`, `quote`, `color`, `rect`, `getimage`, and `putimage`
-- [x] `$Keyring` module (11 functions: `md5`, `sha1`, `sha224`, `sha256` with real digests; `readauthinfo`, `writeauthinfo`, `getstring`, `putstring`, `getbytearray`, `putbytearray`, and `auth` stubs)
+- [x] `$Keyring` module (11 functions: `md5`, `sha1`, `sha224`, `sha256` with real digests; `readauthinfo`, `writeauthinfo`, `getstring`, `putstring`,
+  `getbytearray`, `putbytearray`, and `auth` stubs)
 - [x] `$Crypt` module (stub with `md5` function for compiler signature computation)
 - [x] Exception handler table lookup for `raise` opcode and nil dereference faults
 - [x] Name-based function dispatch with signature-hash fallback for built-in and loaded modules
@@ -143,7 +145,8 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Embedded 8x13 bitmap font for all printable ASCII (no external font library needed)
 - [x] Mouse click dispatch to Tk button widgets (sends command to named channels)
 - [x] Mouse and keyboard event delivery to Tk
-- [x] Virtual device files: `/dev/sysctl`, `/dev/sysname`, `/dev/user`, `/dev/time`, `/dev/cons`, `/dev/null`, `/dev/random`, `/dev/drivers`, `/prog/N/status`, `/prog/N/wait`, `/prog/N/ns`, `/prog/N/ctl`, and `/env/*`
+- [x] Virtual device files: `/dev/sysctl`, `/dev/sysname`, `/dev/user`, `/dev/time`, `/dev/cons`, `/dev/null`, `/dev/random`, `/dev/drivers`,
+  `/prog/N/status`, `/prog/N/wait`, `/prog/N/ns`, `/prog/N/ctl`, and `/env/*`
 
 ### Audio Support
 
@@ -173,7 +176,8 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 ### Compatibility
 
-- [x] 546 of 844 pre-compiled Inferno `.dis` programs pass (65%); ~83% effective pass rate excluding programs that need arguments or are library modules
+- [x] 546 of 844 pre-compiled Inferno `.dis` programs pass (65%); ~83% effective pass rate excluding programs that need arguments or are library
+  modules
 - [x] 58 timeouts (programs waiting for interactive input; expected with no stdin)
 - [x] Systematic audit against reference xec.c implementation
 - [ ] Target: 600+ programs passing (70%+); remaining failures are mostly environment-dependent (Plan 9 namespaces, crypto, device files)
@@ -183,7 +187,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Cargo workspace with modular crate structure
 - [x] CI pipeline with automated tests
 - [x] Dual license (MIT and Apache 2.0)
-- [x] 233 tests total:
+- [x] 200+ tests total:
     - Unit tests for instruction decoding and execution
     - Property-based tests for arithmetic (commutativity, associativity, and identity)
     - Property-based tests for string operations (slicec bounds, addc associativity)
@@ -192,7 +196,7 @@ This document outlines the features implemented in RiceVM and the future goals f
     - Limbo compiler end-to-end test
 - [x] End-to-end pipeline tests with hand-crafted `.dis` binaries
 - [x] Fuzz testing setup for the module loader (`cargo-fuzz` with `libfuzzer`)
-- [x] 866 pre-compiled `.dis` files available via `external/inferno-os` submodule
+- [x] 800+ pre-compiled `.dis` files available via `external/inferno-os` submodule
 - [x] `make lint` passes (clippy with `-D warnings -D clippy::unwrap_used -D clippy::expect_used`)
 - [x] `make test` passes (233 tests, 0 failures)
 
@@ -234,13 +238,16 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 #### Design Choices
 
-- Cooperative threading with non-blocking stdin: the run loop rotates threads by quantum; stdin reads use a background thread to avoid blocking the VM; a preemptive scheduler with OS threads exists but is not connected because it would require `Arc<Mutex<>>` refactoring of VmState
-- `op_ret` does not restore module context from the frame; the `mcall` wrapper handles module context restoration instead (correct behavior, different structure from reference)
+- Cooperative threading with non-blocking stdin: the run loop rotates threads by quantum; stdin reads use a background thread to avoid blocking the
+  VM; a preemptive scheduler with OS threads exists but is not connected because it would require `Arc<Mutex<>>` refactoring of VmState
+- `op_ret` does not restore module context from the frame; the `mcall` wrapper handles module context restoration instead (correct behavior, different
+  structure from reference)
 
 #### Unimplementable on Host OS
 
 - `$Sys` stubs that require Plan 9 namespace semantics: `bind`, `mount`, `unmount`, `export`, `fauth`, and `file2chan` (no host OS equivalent)
-- ~240 pre-compiled programs fail: ~100 need command-line arguments (working correctly), ~50 need Plan 9 namespace/device features, ~30 need crypto modules beyond the current `$Keyring` stub, and ~60 have other environment dependencies
+- ~240 pre-compiled programs fail: ~100 need command-line arguments (working correctly), ~50 need Plan 9 namespace/device features, ~30 need crypto
+  modules beyond the current `$Keyring` stub, and ~60 have other environment dependencies
 
 #### Incomplete Modules
 

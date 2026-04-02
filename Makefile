@@ -62,7 +62,7 @@ install-deps: install-snap ## Install development dependencies
 	@cargo install cargo-tarpaulin
 	@cargo install cargo-audit
 	@cargo install cargo-careful
-	@cargo install cargo-nextest
+	@cargo install --locked cargo-nextest
 
 .PHONY: lint
 lint: format ## Run the linters
@@ -92,22 +92,19 @@ careful: ## Run security checks on Rust code
 .PHONY: docs
 docs: format ## Generate the documentation
 	@echo "Generating documentation..."
+	@mkdocs build
 	@cargo doc --no-deps --document-private-items
 
-.PHONE: figs
-figs: ## Generate the figures in the assets directory
-	@echo "Generating figures..."
-	@$(SHELL) $(ASSET_DIR)/make_figures.sh $(ASSET_DIR)
+
+.PHONY: docs-serve
+docs-serve: docs ## Serve Vq MkDocs locally
+	@echo "Serving documentation locally..."
+	python -m http.server --directory ./site
 
 .PHONY: fix-lint
 fix-lint: ## Fix the linter warnings
 	@echo "Fixing linter warnings..."
 	@cargo clippy --fix --allow-dirty --allow-staged --all-targets --workspace --all-features -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
-
-.PHONY: testdata
-testdata: ## Download the datasets used in tests
-	@echo "Downloading test data..."
-	@$(SHELL) $(TEST_DATA_DIR)/download_datasets.sh $(TEST_DATA_DIR)
 
 .PHONY: nextest
 nextest: ## Run tests using nextest

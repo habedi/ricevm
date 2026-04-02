@@ -6,11 +6,14 @@ These examples assume RiceVM is built and the Inferno OS submodule is checked ou
 
 ```limbo
 implement Hello;
+
 include "sys.m";
 include "draw.m";
+
 Hello: module {
     init: fn(nil: ref Draw->Context, nil: list of string);
 };
+
 init(nil: ref Draw->Context, nil: list of string) {
     sys := load Sys Sys->PATH;
     sys->print("hello, world\n");
@@ -26,11 +29,14 @@ ricevm-cli run hello.dis --probe external/inferno-os/dis
 
 ```limbo
 implement Echo;
+
 include "sys.m";
 include "draw.m";
+
 Echo: module {
     init: fn(nil: ref Draw->Context, args: list of string);
 };
+
 init(nil: ref Draw->Context, args: list of string) {
     sys := load Sys Sys->PATH;
     if (args != nil)
@@ -58,14 +64,18 @@ ricevm-cli run echo.dis --probe external/inferno-os/dis -- hello world
 
 ```limbo
 implement ChanDemo;
+
 include "sys.m";
 include "draw.m";
+
 ChanDemo: module {
     init: fn(nil: ref Draw->Context, nil: list of string);
 };
+
 sender(c: chan of int) {
     c <-= 42;
 }
+
 init(nil: ref Draw->Context, nil: list of string) {
     sys := load Sys Sys->PATH;
     c := chan of int;

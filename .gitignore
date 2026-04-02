@@ -86,3 +86,5 @@ tests/testdata/*.parquet
 .env
 .claude/
 NOTES.md
+site/
+.codex

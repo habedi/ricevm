@@ -270,6 +270,20 @@ pub(crate) enum ModuleKind {
     },
 }
 
+fn decode_return_target(vm: &VmState<'_>, ret_ptr: i32) -> crate::address::AddrTarget {
+    if ret_ptr == 0 {
+        return crate::address::AddrTarget::None;
+    }
+    if ret_ptr & crate::address::HEAP_REF_FLAG != 0 {
+        let ref_idx = (ret_ptr & !crate::address::HEAP_REF_FLAG) as usize;
+        if let Some(&(id, offset)) = vm.heap_refs.get(ref_idx) {
+            return crate::address::AddrTarget::HeapArray { id, offset };
+        }
+        return crate::address::AddrTarget::None;
+    }
+    crate::address::decode_virtual_addr(ret_ptr, 0)
+}
+
 pub(crate) fn resolve_module_ref(
     vm: &VmState<'_>,
     heap_id: heap::HeapId,
@@ -420,7 +434,7 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             let data_off = vm.frames.current_data_offset();
             let ret_ptr = crate::memory::read_word(&vm.frames.data, data_off + 16);
             if ret_ptr != 0 {
-                let target = crate::address::decode_virtual_addr(ret_ptr, 0);
+                let target = decode_return_target(vm, ret_ptr);
                 let ret_val = crate::memory::read_word(&vm.frames.data, data_off);
                 vm.write_word_at(target, ret_val)?;
             }
@@ -839,6 +853,8 @@ mod tests {
 
     use super::*;
     use crate::address::AddrTarget;
+    use crate::builtin::{BuiltinFunc, BuiltinModule};
+    use crate::heap::HeapData;
     use crate::memory;
 
     fn test_module() -> Module {
@@ -873,6 +889,12 @@ mod tests {
             imports: vec![],
             handlers: vec![],
         }
+    }
+
+    fn dummy_builtin(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+        let frame_base = vm.frames.current_data_offset();
+        memory::write_word(&mut vm.frames.data, frame_base, 1234);
+        Ok(())
     }
 
     /// Regression: casew must use binary search and find values at exact
@@ -1075,5 +1097,58 @@ mod tests {
             2,
             "ret does not dec_ref; GC handles cleanup"
         );
+    }
+
+    #[test]
+    fn builtin_mcall_writes_return_value_to_heap_record_field() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.modules.register(BuiltinModule {
+            name: "$TestReturn",
+            funcs: vec![BuiltinFunc {
+                name: "ret",
+                sig: 0,
+                frame_size: 32,
+                handler: dummy_builtin,
+            }],
+        });
+
+        let module_id = vm
+            .modules
+            .find_builtin("$TestReturn")
+            .expect("builtin module should be registered");
+        let mod_ref_id = vm.heap.alloc(
+            0,
+            HeapData::ModuleRef {
+                module_id,
+                func_map: vec![Some(0)],
+            },
+        );
+        let record_id = vm.heap.alloc(0, HeapData::Record(vec![0u8; 8]));
+        let ref_idx = vm.heap_refs.len();
+        vm.heap_refs.push((record_id, 4));
+
+        let frame_off = vm.frames.alloc_pending(32).expect("frame alloc");
+        memory::write_word(
+            &mut vm.frames.data,
+            frame_off + 16,
+            crate::address::HEAP_REF_FLAG | ref_idx as i32,
+        );
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = frame_off as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref_id as i32;
+        vm.next_pc = 1;
+
+        op_mcall(&mut vm).expect("builtin mcall should succeed");
+
+        let data = match &vm.heap.get(record_id).expect("record should exist").data {
+            HeapData::Record(data) => data,
+            other => panic!("expected record, got {other:?}"),
+        };
+        assert_eq!(memory::read_word(data, 4), 1234);
     }
 }

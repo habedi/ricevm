@@ -1,28 +1,34 @@
-## RiceVM
-
 <div align="center">
   <picture>
-    <img alt="Project Logo" src="logo.svg" height="25%" width="25%">
+    <img alt="Project Logo" src="docs/assets/logo.svg" height="30%" width="30%">
   </picture>
-</div>
 <br>
 
-[![Tests](https://img.shields.io/github/actions/workflow/status/habedi/ricevm/tests.yml?label=tests&style=flat&labelColor=282c34&color=4caf50&logo=github)](https://github.com/habedi/ricevm/actions/workflows/tests.yml)
-[![Code Coverage](https://img.shields.io/codecov/c/github/habedi/ricevm?style=flat&labelColor=282c34&color=ffca28&logo=codecov)](https://codecov.io/gh/habedi/ricevm)
-[![Docs](https://img.shields.io/badge/docs-latest-007ec6?style=flat&labelColor=282c34&logo=readthedocs)](https://habedi.github.io/ricevm/)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/habedi/ricevm)
+<h2>RiceVM</h2>
+
+[![Tests](https://img.shields.io/github/actions/workflow/status/habedi/ricevm/tests.yml?label=tests&style=flat&labelColor=282c34&logo=github)](https://github.com/habedi/ricevm/actions/workflows/tests.yml)
+[![Code Coverage](https://img.shields.io/codecov/c/github/habedi/ricevm?label=coverage&style=flat&labelColor=282c34&logo=codecov)](https://codecov.io/gh/habedi/ricevm)
+[![Docs](https://img.shields.io/badge/docs-read-007ec6?label=docs&style=flat&labelColor=282c34&logo=readthedocs)](https://habedi.github.io/ricevm/)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-007ec6?style=flat&labelColor=282c34&logo=open-source-initiative)](https://github.com/habedi/ricevm/)
 [![Release](https://img.shields.io/github/release/habedi/ricevm.svg?label=release&style=flat&labelColor=282c34&logo=github)](https://github.com/habedi/ricevm/releases/latest)
 
-RiceVM is a [Dis virtual machine](https://www.inferno-os.org/inferno/papers/dis.pdf) and [Limbo](https://inferno-os.org/inferno/papers/limbo.html)
-compiler implemented in Rust.
+A Dis virtual machine and Limbo compiler implemented in Rust
+
+</div>
+
+---
+
+RiceVM is a cross-platform [Dis virtual machine](https://www.inferno-os.org/inferno/papers/dis.pdf) and
+[Limbo](https://inferno-os.org/inferno/papers/limbo.html) compiler implemented in Rust.
 
 ### Features
 
-- Supports all 176 Dis VM opcodes and a fully functional Dis runtime
+- Supports all 176 Dis VM opcodes
+- Provides a fully functional Dis runtime (with GC, concurrency, etc.)
 - Includes a Limbo compiler, `.dis` file disassembler, and debugger
-- Includes built-in modules from Dis virtual machine, including `$Sys`, `$Math`, `$Crypt`, etc.
-- Supports for GUI applications and audeo playback
-- Fully cross-platform (runs on Windows, Linux, and macOS)
+- Includes most of the built-in modules from Dis virtual machine, including `$Sys`, `$Math`, `$Crypt`, etc.
+- Supports for GUI applications and audio playback
+- Is fully cross-platform (runs on Windows, Linux, and macOS)
 
 See [ROADMAP.md](ROADMAP.md) for the full list of implemented and planned features.
 
@@ -95,7 +101,7 @@ cargo run -p ricevm-cli --release --features gui -- run external/inferno-os/dis/
 
 ### Documentation
 
-See the [RiceVM documenation](https://habedi.github.io/ricevm/) for more details.
+See the [RiceVM documentation](https://habedi.github.io/ricevm/) for more details.
 
 ---
 

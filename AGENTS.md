@@ -36,7 +36,8 @@ Priorities, in order:
 
 - `crates/ricevm-core/`: Shared types (Module, Opcode, Instruction, TypeDescriptor, and errors). No runtime logic.
 - `crates/ricevm-loader/`: Binary format parser for `.dis` module files. One public function: `load(&[u8]) -> Result<Module, LoadError>`.
-- `crates/ricevm-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, $Keyring, $Crypt, and audio),
+- `crates/ricevm-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, $Keyring, $Crypt, and
+  audio),
   virtual device files, and file-based module loading.
 - `crates/ricevm-limbo/`: Built-in Limbo compiler. Lexer, parser, code generator, and .dis binary writer.
   Compiles Limbo source to Dis bytecode end-to-end without depending on the reference limbo.dis compiler in the Inferno OS.
@@ -61,25 +62,25 @@ ricevm-cli
 
 ### Key Internal Modules in `ricevm-execute`
 
-| Module         | Purpose                                                                                |
-|----------------|----------------------------------------------------------------------------------------|
-| `vm.rs`        | `VmState` struct, execution loop with cooperative threading, and thread suspend/resume |
-| `frame.rs`     | `FrameStack` with two-phase push (`alloc_pending` and `activate_pending`)              |
-| `heap.rs`      | `Heap` with reference counting, copy-on-write strings, and `ArraySlice` shared views   |
-| `gc.rs`        | Mark-and-sweep garbage collector (scans frames, MP, and loaded module MPs)             |
-| `address.rs`   | Operand resolution with `ModuleMp` virtual ranges and `decode_virtual_addr`            |
-| `memory.rs`    | Typed read/write on byte buffers with bounds checking                                  |
-| `data.rs`      | Module data (MP) initialization with type-aware elem sizes and nested arrays           |
+| Module         | Purpose                                                                                          |
+|----------------|--------------------------------------------------------------------------------------------------|
+| `vm.rs`        | `VmState` struct, execution loop with cooperative threading, and thread suspend/resume           |
+| `frame.rs`     | `FrameStack` with two-phase push (`alloc_pending` and `activate_pending`)                        |
+| `heap.rs`      | `Heap` with reference counting, copy-on-write strings, and `ArraySlice` shared views             |
+| `gc.rs`        | Mark-and-sweep garbage collector (scans frames, MP, and loaded module MPs)                       |
+| `address.rs`   | Operand resolution with `ModuleMp` virtual ranges and `decode_virtual_addr`                      |
+| `memory.rs`    | Typed read/write on byte buffers with bounds checking                                            |
+| `data.rs`      | Module data (MP) initialization with type-aware elem sizes and nested arrays                     |
 | `filetab.rs`   | Portable file descriptor table with in-memory pipe, virtual device files, and non-blocking stdin |
-| `ops/`         | 176 instruction handlers organized by category                                         |
-| `sys.rs`       | Built-in `$Sys` module (43 functions with tuple return support, `%b`, `%u`, and `%.*`) |
-| `math.rs`      | Built-in `$Math` module (66 functions including linear algebra)                        |
-| `draw.rs`      | Built-in `$Draw` module (SDL2 backend, optional `gui` feature)                         |
-| `tk.rs`        | Built-in `$Tk` module (widget toolkit with embedded bitmap font and SDL2 rendering)    |
-| `audio.rs`     | `/dev/audio` and `/dev/audioctl` support (cpal backend, optional `audio` feature)      |
-| `builtin.rs`   | `ModuleRegistry` for built-in module registration with name and signature lookup       |
-| `scheduler.rs` | Preemptive thread scheduler infrastructure (not yet connected to main loop)            |
-| `channel.rs`   | Channel data structure for inter-thread communication                                  |
+| `ops/`         | 176 instruction handlers organized by category                                                   |
+| `sys.rs`       | Built-in `$Sys` module (43 functions with tuple return support, `%b`, `%u`, and `%.*`)           |
+| `math.rs`      | Built-in `$Math` module (66 functions including linear algebra)                                  |
+| `draw.rs`      | Built-in `$Draw` module (SDL2 backend, optional `gui` feature)                                   |
+| `tk.rs`        | Built-in `$Tk` module (widget toolkit with embedded bitmap font and SDL2 rendering)              |
+| `audio.rs`     | `/dev/audio` and `/dev/audioctl` support (cpal backend, optional `audio` feature)                |
+| `builtin.rs`   | `ModuleRegistry` for built-in module registration with name and signature lookup                 |
+| `scheduler.rs` | Preemptive thread scheduler infrastructure (not yet connected to main loop)                      |
+| `channel.rs`   | Channel data structure for inter-thread communication                                            |
 
 ### Key Design Decisions
 
@@ -145,15 +146,15 @@ Always compare against these files when fixing instruction correctness issues.
 
 Run `make lint` and `make test` for any change. Key targets:
 
-| Target      | Command            | What It Runs                                                                    |
-|-------------|---------------------|---------------------------------------------------------------------------------|
-| Format      | `make format`       | `cargo fmt`                                                                     |
-| Lint        | `make lint`         | `cargo clippy` with `-D warnings -D clippy::unwrap_used -D clippy::expect_used` |
-| Test        | `make test`         | All workspace tests with `--nocapture`                                          |
-| Test Limbo  | `make test-limbo`   | Built-in vs reference compiler correctness and coverage                         |
-| Build       | `make build`        | Release build                                                                   |
-| Coverage    | `make coverage`     | `cargo tarpaulin` with XML and HTML output                                      |
-| Audit       | `make audit`        | `cargo audit` on dependencies                                                   |
+| Target     | Command           | What It Runs                                                                    |
+|------------|-------------------|---------------------------------------------------------------------------------|
+| Format     | `make format`     | `cargo fmt`                                                                     |
+| Lint       | `make lint`       | `cargo clippy` with `-D warnings -D clippy::unwrap_used -D clippy::expect_used` |
+| Test       | `make test`       | All workspace tests with `--nocapture`                                          |
+| Test Limbo | `make test-limbo` | Built-in vs reference compiler correctness and coverage                         |
+| Build      | `make build`      | Release build                                                                   |
+| Coverage   | `make coverage`   | `cargo tarpaulin` with XML and HTML output                                      |
+| Audit      | `make audit`      | `cargo audit` on dependencies                                                   |
 
 ## Testing Expectations
 
@@ -161,7 +162,8 @@ Run `make lint` and `make test` for any change. Key targets:
 - Integration tests for the loader live in `crates/ricevm-loader/tests/`.
 - Pipeline tests (loader to executor) live in `crates/ricevm-cli/tests/`, including tests with real Inferno `.dis` files.
 - Property-based tests cover arithmetic commutativity/associativity, string slice bounds, and conversion roundtrips.
-- Regression tests exist for every major bug fix (movmp, casew, slicea, slicela ref counting, cvtac ArraySlice, byte2char, channel blocking, spawn, etc.).
+- Regression tests exist for every major bug fix (movmp, casew, slicea, slicela ref counting, cvtac ArraySlice, byte2char, channel blocking, spawn,
+  etc.).
 - Fuzz testing for the loader is set up in `crates/ricevm-loader/fuzz/`.
 - No public API change is complete without a corresponding test.
 - The built-in Limbo compiler can compile and run programs:

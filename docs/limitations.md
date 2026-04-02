@@ -1,12 +1,13 @@
 # Current Limitations
 
-RiceVM is a substantial implementation of the Dis VM, but some features are incomplete or missing.
+RiceVM currently supports a large subset of the Dis VM and Limbo language, but there are some limitations to be aware of.
+These include design choices made for simplicity and performance, as well as features that are not implementable on the host OS or are still incomplete.
 
 ## VM Limitations
 
 ### Design Choices
 
-- **Cooperative threading**: the run loop rotates threads by quantum (2048 instructions). A preemptive
+- **Cooperative threading**: currently, the run loop rotates threads by quantum (2048 instructions). A preemptive
   scheduler with OS threads exists as infrastructure but is not connected, because it would require
   `Arc<Mutex<>>` refactoring of `VmState`.
 - **Non-blocking stdin**: stdin reads use a background thread to avoid freezing all VM threads. Reads
@@ -14,7 +15,7 @@ RiceVM is a substantial implementation of the Dis VM, but some features are inco
 
 ### Not Implementable on the Host OS
 
-- `$Sys` functions that require Plan 9 namespace semantics: `bind`, `mount`, `unmount`, `export`,
+- `$Sys` functions that need Plan 9 namespace semantics: `bind`, `mount`, `unmount`, `export`,
   `fauth`, and `file2chan` have no host OS equivalent.
 - About 240 pre-compiled Inferno programs fail: ~100 need command-line arguments (the programs work
   correctly but exit with usage errors), ~50 need Plan 9 namespace or device features, ~30 need

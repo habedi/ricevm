@@ -1,5 +1,5 @@
 {
-  description = "RiceVM: A Dis virtual machine implementation in Rust";
+  description = "RiceVM: A Dis virtual machine and Limbo compiler in Rust";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -18,22 +18,39 @@
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              # Build
+              # Rust toolchain
               rustup
-              cargo
-              rustc
 
-              # Development
-              rust-analyzer
-              clippy
-              rustfmt
+              # Build dependencies
+              pkg-config
+              openssl
 
-              # Testing
+              # Optional: GUI support (SDL2)
+              SDL2
+              SDL2_ttf
+
+              # Optional: audio support
+              alsa-lib
+
+              # Development tools
               cargo-nextest
+              cargo-tarpaulin
+              cargo-audit
+
+              # Documentation
+              python3Packages.mkdocs-material
 
               # Git hooks
               pre-commit
             ];
+
+            # Ensure the linker can find SDL2 and OpenSSL
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
+              SDL2
+              SDL2_ttf
+              openssl
+              alsa-lib
+            ]);
           };
         }
       );
@@ -43,11 +60,19 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          default = pkgs.rustPlatform.buildRustPackage {
+          default = pkgs.rustPlatform.buildRustPackage rec {
             pname = "ricevm";
-            version = "0.1.0-alpha.1";
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
+
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+            ];
+
+            buildInputs = with pkgs; [
+              openssl
+            ];
           };
         }
       );

@@ -18,16 +18,6 @@ and [Limbo](https://inferno-os.org/inferno/papers/limbo.html) compiler implement
 - Supports for GUI applications and audio playback
 - Is fully cross-platform (runs on Windows, Linux, and macOS)
 
-## Architecture
-
-| Crate            | Purpose                     |
-|------------------|-----------------------------|
-| `ricevm-core`    | Shared types and utilities  |
-| `ricevm-loader`  | `.dis` binary format parser |
-| `ricevm-execute` | Dis runtime                 |
-| `ricevm-limbo`   | Limbo compiler              |
-| `ricevm-cli`     | CLI frontend                |
-
 ## Documentation
 
 - [Getting Started](getting-started.md)

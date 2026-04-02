@@ -1,5 +1,15 @@
 # API Reference
 
+## Architecture
+
+| Crate            | Purpose                     |
+|------------------|-----------------------------|
+| `ricevm-core`    | Shared types and utilities  |
+| `ricevm-loader`  | `.dis` binary format parser |
+| `ricevm-execute` | Dis runtime                 |
+| `ricevm-limbo`   | Limbo compiler              |
+| `ricevm-cli`     | CLI frontend                |
+
 ## Built-in Modules
 
 ### `$Sys`

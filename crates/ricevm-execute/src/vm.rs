@@ -80,12 +80,14 @@ pub(crate) struct SuspendedThread {
     pub blocked_on: Option<heap::HeapId>,
 }
 
-// $Keyring digest handlers using real MD5/SHA1
+// $Keyring digest handlers using real MD5, SHA1, SHA224, and SHA256
 
 /// DigestState stored as a heap record. The first 4 bytes contain a "kind" tag
-/// (0=md5, 1=sha1), followed by the running hash state bytes.
+/// (0=md5, 1=sha1, 2=sha224, 3=sha256), followed by the accumulated input bytes.
 const DIGEST_MD5: i32 = 0;
 const DIGEST_SHA1: i32 = 1;
+const DIGEST_SHA224: i32 = 2;
+const DIGEST_SHA256: i32 = 3;
 
 fn keyring_md5(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     keyring_digest(vm, DIGEST_MD5)
@@ -95,9 +97,22 @@ fn keyring_sha1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     keyring_digest(vm, DIGEST_SHA1)
 }
 
-/// md5/sha1(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState
+fn keyring_sha224(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    keyring_digest(vm, DIGEST_SHA224)
+}
+
+fn keyring_sha256(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    keyring_digest(vm, DIGEST_SHA256)
+}
+
+/// md5/sha1/sha224/sha256(
+///     data: array of byte,
+///     n: int,
+///     digest: array of byte,
+///     state: ref DigestState,
+/// ): ref DigestState
 ///
-/// The DigestState is a heap record storing: [kind(4 bytes), accumulated_data_length(4 bytes), accumulated_data...]
+/// The DigestState is a heap record storing: [kind(4 bytes), accumulated_data...]
 /// When digest is non-nil, we finalize the hash and write the result.
 fn keyring_digest(vm: &mut VmState<'_>, kind: i32) -> Result<(), ExecError> {
     use crate::heap::{HeapData, HeapId};
@@ -140,16 +155,32 @@ fn keyring_digest(vm: &mut VmState<'_>, kind: i32) -> Result<(), ExecError> {
 
     // If digest array is provided, finalize and write the hash
     if digest_id != heap::NIL {
-        let digest_bytes: Vec<u8> = if kind == DIGEST_MD5 {
-            use md5::Digest;
-            let mut hasher = md5::Md5::new();
-            hasher.update(&accumulated);
-            hasher.finalize().to_vec()
-        } else {
-            use sha1::Digest;
-            let mut hasher = sha1::Sha1::new();
-            hasher.update(&accumulated);
-            hasher.finalize().to_vec()
+        let digest_bytes: Vec<u8> = match kind {
+            DIGEST_MD5 => {
+                use md5::Digest;
+                let mut hasher = md5::Md5::new();
+                hasher.update(&accumulated);
+                hasher.finalize().to_vec()
+            }
+            DIGEST_SHA1 => {
+                use sha1::Digest;
+                let mut hasher = sha1::Sha1::new();
+                hasher.update(&accumulated);
+                hasher.finalize().to_vec()
+            }
+            DIGEST_SHA224 => {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha224::new();
+                hasher.update(&accumulated);
+                hasher.finalize().to_vec()
+            }
+            DIGEST_SHA256 => {
+                use sha2::Digest;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&accumulated);
+                hasher.finalize().to_vec()
+            }
+            _ => Vec::new(),
         };
         vm.heap.array_write(digest_id, 0, &digest_bytes);
     }
@@ -260,16 +291,32 @@ impl<'m> VmState<'m> {
         modules.register(crate::tk::create_tk_module());
         modules.register(crate::builtin::BuiltinModule {
             name: "$Crypt",
-            funcs: vec![crate::builtin::BuiltinFunc {
-                name: "md5",
-                sig: 0x07656377,
-                frame_size: 48,
-                handler: |vm| {
-                    let frame_base = vm.frames.current_data_offset();
-                    crate::memory::write_word(&mut vm.frames.data, frame_base, 0);
-                    Ok(())
+            funcs: vec![
+                crate::builtin::BuiltinFunc {
+                    name: "md5",
+                    sig: 0x07656377,
+                    frame_size: 56,
+                    handler: keyring_md5,
                 },
-            }],
+                crate::builtin::BuiltinFunc {
+                    name: "sha1",
+                    sig: 0x07656377,
+                    frame_size: 56,
+                    handler: keyring_sha1,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "sha224",
+                    sig: 0x07656377,
+                    frame_size: 56,
+                    handler: keyring_sha224,
+                },
+                crate::builtin::BuiltinFunc {
+                    name: "sha256",
+                    sig: 0x07656377,
+                    frame_size: 56,
+                    handler: keyring_sha256,
+                },
+            ],
         });
         modules.register(crate::builtin::BuiltinModule {
             name: "$Keyring",
@@ -290,13 +337,13 @@ impl<'m> VmState<'m> {
                     name: "sha224",
                     sig: 0x07656377,
                     frame_size: 56,
-                    handler: keyring_sha1, // use sha1 as fallback
+                    handler: keyring_sha224,
                 },
                 crate::builtin::BuiltinFunc {
                     name: "sha256",
                     sig: 0x07656377,
                     frame_size: 56,
-                    handler: keyring_sha1, // use sha1 as fallback
+                    handler: keyring_sha256,
                 },
                 crate::builtin::BuiltinFunc {
                     name: "readauthinfo",
@@ -1134,5 +1181,183 @@ fn format_mid(label: &str, op: &ricevm_core::MiddleOperand) -> String {
         MiddleMode::SmallImmediate => format!("{label}=${}", op.register1),
         MiddleMode::SmallOffsetFp => format!("{label}={}(fp)", op.register1),
         MiddleMode::SmallOffsetMp => format!("{label}={}(mp)", op.register1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap, RuntimeFlags,
+        TypeDescriptor, XMAGIC,
+    };
+
+    use super::*;
+    use crate::heap::HeapData;
+
+    fn test_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "vm_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    fn alloc_byte_array(vm: &mut VmState<'_>, data: &[u8]) -> heap::HeapId {
+        vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: data.to_vec(),
+                length: data.len(),
+            },
+        )
+    }
+
+    #[test]
+    fn keyring_sha224_writes_real_digest() {
+        use sha2::Digest;
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let frame_base = vm.frames.current_data_offset();
+        let data_id = alloc_byte_array(&mut vm, b"abc");
+        let digest_id = alloc_byte_array(&mut vm, &[0; 28]);
+
+        memory::write_word(&mut vm.frames.data, frame_base + 32, data_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 36, 3);
+        memory::write_word(&mut vm.frames.data, frame_base + 40, digest_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 44, heap::NIL as i32);
+
+        keyring_sha224(&mut vm).expect("sha224 handler should succeed");
+
+        let expected = sha2::Sha224::digest(b"abc").to_vec();
+        let actual = vm
+            .heap
+            .array_read(digest_id, 0, expected.len())
+            .expect("digest array should exist");
+        assert_eq!(actual, expected);
+
+        let state_id = memory::read_word(&vm.frames.data, frame_base) as heap::HeapId;
+        let state = vm.heap.get(state_id).expect("state record should exist");
+        let HeapData::Record(state_bytes) = &state.data else {
+            panic!("digest state should be stored as a record");
+        };
+        assert_eq!(memory::read_word(state_bytes, 0), DIGEST_SHA224);
+        assert_eq!(&state_bytes[4..], b"abc");
+    }
+
+    #[test]
+    fn keyring_sha256_supports_incremental_state() {
+        use sha2::Digest;
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let frame_base = vm.frames.current_data_offset();
+        let first_chunk_id = alloc_byte_array(&mut vm, b"abc");
+
+        memory::write_word(&mut vm.frames.data, frame_base + 32, first_chunk_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 36, 3);
+        memory::write_word(&mut vm.frames.data, frame_base + 40, heap::NIL as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 44, heap::NIL as i32);
+
+        keyring_sha256(&mut vm).expect("first sha256 call should succeed");
+        let state_id = memory::read_word(&vm.frames.data, frame_base) as heap::HeapId;
+
+        let second_chunk_id = alloc_byte_array(&mut vm, b"def");
+        let digest_id = alloc_byte_array(&mut vm, &[0; 32]);
+        memory::write_word(&mut vm.frames.data, frame_base + 32, second_chunk_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 36, 3);
+        memory::write_word(&mut vm.frames.data, frame_base + 40, digest_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 44, state_id as i32);
+
+        keyring_sha256(&mut vm).expect("second sha256 call should succeed");
+
+        let expected = sha2::Sha256::digest(b"abcdef").to_vec();
+        let actual = vm
+            .heap
+            .array_read(digest_id, 0, expected.len())
+            .expect("digest array should exist");
+        assert_eq!(actual, expected);
+
+        let final_state_id = memory::read_word(&vm.frames.data, frame_base) as heap::HeapId;
+        let state = vm
+            .heap
+            .get(final_state_id)
+            .expect("final state record should exist");
+        let HeapData::Record(state_bytes) = &state.data else {
+            panic!("digest state should be stored as a record");
+        };
+        assert_eq!(memory::read_word(state_bytes, 0), DIGEST_SHA256);
+        assert_eq!(&state_bytes[4..], b"abcdef");
+    }
+
+    #[test]
+    fn crypt_module_registers_real_sha256_handler() {
+        use sha2::Digest;
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let frame_base = vm.frames.current_data_offset();
+        let data_id = alloc_byte_array(&mut vm, b"abc");
+        let digest_id = alloc_byte_array(&mut vm, &[0; 32]);
+
+        memory::write_word(&mut vm.frames.data, frame_base + 32, data_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 36, 3);
+        memory::write_word(&mut vm.frames.data, frame_base + 40, digest_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 44, heap::NIL as i32);
+
+        let module_id = vm
+            .modules
+            .find_builtin("$Crypt")
+            .expect("$Crypt should be registered");
+        let crypt = vm
+            .modules
+            .get_module(module_id)
+            .expect("$Crypt module should exist");
+        assert_eq!(
+            crypt.funcs.iter().map(|func| func.name).collect::<Vec<_>>(),
+            vec!["md5", "sha1", "sha224", "sha256"]
+        );
+        let sha256 = crypt
+            .funcs
+            .iter()
+            .find(|func| func.name == "sha256")
+            .expect("$Crypt->sha256 should be registered");
+
+        (sha256.handler)(&mut vm).expect("$Crypt->sha256 should succeed");
+
+        let expected = sha2::Sha256::digest(b"abc").to_vec();
+        let actual = vm
+            .heap
+            .array_read(digest_id, 0, expected.len())
+            .expect("digest array should exist");
+        assert_eq!(actual, expected);
     }
 }

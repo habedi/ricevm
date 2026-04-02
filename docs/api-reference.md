@@ -45,11 +45,13 @@ dispatch, named channels, and mouse event handling.
 |-----------------------------------------------------------------------------------------------------|---------------------------------|
 | `md5(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState`  | MD5 hash (real implementation)  |
 | `sha1(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA1 hash (real implementation) |
+| `sha224(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA224 hash (real implementation) |
+| `sha256(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA256 hash (real implementation) |
 | `readauthinfo(path: string): ref Authinfo`                                                          | Read authentication info (stub) |
 
 ### `$Crypt`
 
-Stub module with `md5` function for compiler signature computation.
+Digest functions for cryptographic hashing. Supports `md5`, `sha1`, `sha224`, and `sha256`.
 
 ## Limbo Compiler API
 

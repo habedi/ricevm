@@ -25,7 +25,7 @@ These include design choices made for simplicity and performance, as well as fea
 
 - `$Draw` has 35+ stub functions. Basic rendering (rectangles, lines, text, and images) works via
   SDL2, but many advanced drawing operations are not implemented.
-- `$Keyring` provides real MD5 and SHA1 digests, but IPint (big integer), TLS, and authentication
+- `$Keyring` provides real MD5, SHA1, SHA224, and SHA256 digests, but IPint (big integer), TLS, and authentication
   functions are stubs.
 
 ## Compiler Limitations

@@ -540,6 +540,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#built-in-and-loaded-modules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Built-in and Loaded Modules
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#cli-reference" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -783,6 +794,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#built-in-and-loaded-modules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Built-in and Loaded Modules
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#cli-reference" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -902,6 +924,63 @@ The optional GUI feature needs SDL2.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>cargo<span class="w"> </span>run<span class="w"> </span>-p<span class="w"> </span>ricevm-cli<span class="w"> </span>--<span class="w"> </span>debug<span class="w"> </span>external/inferno-os/dis/echo.dis<span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">    </span>--probe<span class="w"> </span>external/inferno-os/dis
 </code></pre></div>
+<h2 id="built-in-and-loaded-modules">Built-in and Loaded Modules<a class="headerlink" href="#built-in-and-loaded-modules" title="Permanent link">&para;</a></h2>
+<p>RiceVM has two kinds of modules:</p>
+<p>Built-in modules are compiled into the binary and need no external files:</p>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>$Sys</code></td>
+<td>System I/O, formatting, process control</td>
+</tr>
+<tr>
+<td><code>$Math</code></td>
+<td>Trigonometry, linear algebra, bit conversions</td>
+</tr>
+<tr>
+<td><code>$Draw</code></td>
+<td>Graphics via SDL2 (optional <code>gui</code> feature)</td>
+</tr>
+<tr>
+<td><code>$Tk</code></td>
+<td>Widget toolkit</td>
+</tr>
+<tr>
+<td><code>$Keyring</code></td>
+<td>MD5, SHA1, and authentication stubs</td>
+</tr>
+<tr>
+<td><code>$Crypt</code></td>
+<td>Cryptographic stubs</td>
+</tr>
+</tbody>
+</table>
+<p>Programs that only use built-in modules run without any flags:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>ricevm-cli<span class="w"> </span>compile<span class="w"> </span>hello.b
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>ricevm-cli<span class="w"> </span>run<span class="w"> </span>hello.dis<span class="w">     </span><span class="c1"># Works because $Sys is built into RiceVM</span>
+</code></pre></div>
+<p>Loaded modules are <code>.dis</code> files on disk (like <code>bufio.dis</code>, <code>regex.dis</code>, <code>daytime.dis</code>) that programs load at runtime via the <code>load</code> instruction.
+These need <code>--probe</code> paths so the VM can find them:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="c1"># Programs using Bufio, regex, or other library modules</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>ricevm-cli<span class="w"> </span>run<span class="w"> </span>wc.dis<span class="w"> </span>--probe<span class="w"> </span>/path/to/dis<span class="w"> </span>--probe<span class="w"> </span>/path/to/dis/lib
+</code></pre></div>
+<p>If you cloned with <code>--recursive</code>, the Inferno OS submodule provides these modules:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>ricevm-cli<span class="w"> </span>run<span class="w"> </span>program.dis<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="w">    </span>--probe<span class="w"> </span>external/inferno-os/dis<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="w">    </span>--probe<span class="w"> </span>external/inferno-os/dis/lib
+</code></pre></div>
+<div class="admonition tip">
+<p class="admonition-title">Pre-built release binaries</p>
+</div>
+<p>Release binaries do not include the Inferno module files. Clone the repository
+with <code>git clone --recursive</code> to get them, or download the <code>.dis</code> files separately
+from the <a href="https://github.com/inferno-os/inferno-os">Inferno OS repository</a>.</p>
 <h2 id="cli-reference">CLI Reference<a class="headerlink" href="#cli-reference" title="Permanent link">&para;</a></h2>
 <table>
 <thead>

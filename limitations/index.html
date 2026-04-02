@@ -734,10 +734,10 @@ incomplete.</p>
 <h2 id="vm-limitations">VM Limitations<a class="headerlink" href="#vm-limitations" title="Permanent link">&para;</a></h2>
 <h3 id="design-choices">Design Choices<a class="headerlink" href="#design-choices" title="Permanent link">&para;</a></h3>
 <ul>
-<li><strong>Cooperative threading</strong>: currently, the run loop rotates threads by quantum (2048 instructions). A preemptive
+<li>Cooperative threading: currently, the run loop rotates threads by quantum (2048 instructions). A preemptive
   scheduler with OS threads exists as infrastructure but is not connected, because it would require
   <code>Arc&lt;Mutex&lt;&gt;&gt;</code> refactoring of <code>VmState</code>.</li>
-<li><strong>Non-blocking stdin</strong>: stdin reads use a background thread to avoid freezing all VM threads. Reads
+<li>Non-blocking stdin: stdin reads use a background thread to avoid freezing all VM threads. Reads
   return EOF after 250ms if no data is available.</li>
 </ul>
 <h3 id="not-implementable-on-the-host-os">Not Implementable on the Host OS<a class="headerlink" href="#not-implementable-on-the-host-os" title="Permanent link">&para;</a></h3>
@@ -759,15 +759,12 @@ incomplete.</p>
 <h2 id="compiler-limitations">Compiler Limitations<a class="headerlink" href="#compiler-limitations" title="Permanent link">&para;</a></h2>
 <p>The built-in Limbo compiler (<code>ricevm-limbo</code>) handles a large subset of the language but has gaps:</p>
 <ul>
-<li><strong>No type checker</strong>: type inference is used during code generation, but there is no validation pass
-  that reports type errors before execution.</li>
-<li><strong>No alt statement codegen</strong>: the <code>alt</code> statement parses but does not generate the alt table format
-  required by the VM.</li>
-<li><strong>No exception handler block codegen</strong>: <code>raise</code> works, but <code>{ ... } exception { ... }</code> blocks do
-  not generate handler table entries.</li>
-<li><strong>Simplified ADT support</strong>: inline ADTs work for simple fields; complex nested ADTs, pick types, and
-  cyclic types are not fully supported in code generation.</li>
-<li><strong>No import signature hashes</strong>: all import signatures are 0; the VM uses name-based function matching.</li>
+<li>No type checker: type inference is used during code generation, but there is no validation pass that reports type errors before execution.</li>
+<li>No alt statement codegen: the <code>alt</code> statement parses but does not generate the alt table format required by the VM.</li>
+<li>No exception handler block codegen: <code>raise</code> works, but <code>{ ... } exception { ... }</code> blocks do not generate handler table entries.</li>
+<li>Simplified ADT support: inline ADTs work for simple fields; complex nested ADTs, pick types, and cyclic types are not fully supported in code
+  generation.</li>
+<li>No import signature hashes: all import signatures are 0; the VM uses name-based function matching.</li>
 </ul>
 <h2 id="compatibility">Compatibility<a class="headerlink" href="#compatibility" title="Permanent link">&para;</a></h2>
 <p>At the moment, 546 of 844 (65%) pre-compiled Inferno <code>.dis</code> programs pass. Excluding programs that need command-line

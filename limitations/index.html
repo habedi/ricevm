@@ -20,7 +20,7 @@
         
       
       
-      <link rel="icon" href="../assets/images/favicon.png">
+      <link rel="icon" href="../assets/logo.svg">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
@@ -92,8 +92,7 @@
   <nav class="md-header__inner md-grid" aria-label="Header">
     <a href=".." title="RiceVM Documentation" class="md-header__button md-logo" aria-label="RiceVM Documentation" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../assets/logo.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -336,8 +335,7 @@
   <label class="md-nav__title" for="__drawer">
     <a href=".." title="RiceVM Documentation" class="md-nav__button md-logo" aria-label="RiceVM Documentation" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="../assets/logo.svg" alt="logo">
 
     </a>
     RiceVM Documentation
@@ -730,11 +728,12 @@
 
 
 <h1 id="current-limitations">Current Limitations<a class="headerlink" href="#current-limitations" title="Permanent link">&para;</a></h1>
-<p>RiceVM is a substantial implementation of the Dis VM, but some features are incomplete or missing.</p>
+<p>RiceVM currently supports a large subset of the Dis VM and Limbo language, but there are some limitations to be aware of.
+These include design choices made for simplicity and performance, as well as features that are not implementable on the host OS or are still incomplete.</p>
 <h2 id="vm-limitations">VM Limitations<a class="headerlink" href="#vm-limitations" title="Permanent link">&para;</a></h2>
 <h3 id="design-choices">Design Choices<a class="headerlink" href="#design-choices" title="Permanent link">&para;</a></h3>
 <ul>
-<li><strong>Cooperative threading</strong>: the run loop rotates threads by quantum (2048 instructions). A preemptive
+<li><strong>Cooperative threading</strong>: currently, the run loop rotates threads by quantum (2048 instructions). A preemptive
   scheduler with OS threads exists as infrastructure but is not connected, because it would require
   <code>Arc&lt;Mutex&lt;&gt;&gt;</code> refactoring of <code>VmState</code>.</li>
 <li><strong>Non-blocking stdin</strong>: stdin reads use a background thread to avoid freezing all VM threads. Reads
@@ -742,7 +741,7 @@
 </ul>
 <h3 id="not-implementable-on-the-host-os">Not Implementable on the Host OS<a class="headerlink" href="#not-implementable-on-the-host-os" title="Permanent link">&para;</a></h3>
 <ul>
-<li><code>$Sys</code> functions that require Plan 9 namespace semantics: <code>bind</code>, <code>mount</code>, <code>unmount</code>, <code>export</code>,
+<li><code>$Sys</code> functions that need Plan 9 namespace semantics: <code>bind</code>, <code>mount</code>, <code>unmount</code>, <code>export</code>,
   <code>fauth</code>, and <code>file2chan</code> have no host OS equivalent.</li>
 <li>About 240 pre-compiled Inferno programs fail: ~100 need command-line arguments (the programs work
   correctly but exit with usage errors), ~50 need Plan 9 namespace or device features, ~30 need

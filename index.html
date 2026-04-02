@@ -20,7 +20,7 @@
         
       
       
-      <link rel="icon" href="assets/images/favicon.png">
+      <link rel="icon" href="assets/logo.svg">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
@@ -92,8 +92,7 @@
   <nav class="md-header__inner md-grid" aria-label="Header">
     <a href="." title="RiceVM Documentation" class="md-header__button md-logo" aria-label="RiceVM Documentation" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="assets/logo.svg" alt="logo">
 
     </a>
     <label class="md-header__button md-icon" for="__drawer">
@@ -336,8 +335,7 @@
   <label class="md-nav__title" for="__drawer">
     <a href="." title="RiceVM Documentation" class="md-nav__button md-logo" aria-label="RiceVM Documentation" data-md-component="logo">
       
-  
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+  <img src="assets/logo.svg" alt="logo">
 
     </a>
     RiceVM Documentation
@@ -653,7 +651,7 @@
 
 <h1 id="ricevm">RiceVM<a class="headerlink" href="#ricevm" title="Permanent link">&para;</a></h1>
 <p align="center">
-  <img src="https://raw.githubusercontent.com/habedi/ricevm/main/logo.svg" alt="Project Logo" width="200" />
+  <img src="assets/logo.svg" alt="Project Logo" width="200" />
 </p>
 
 <hr />
@@ -661,11 +659,12 @@
 and <a href="https://inferno-os.org/inferno/papers/limbo.html">Limbo</a> compiler implemented in Rust.</p>
 <h2 id="features">Features<a class="headerlink" href="#features" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Supports all 176 Dis VM opcodes and a fully functional Dis runtime</li>
+<li>Supports all 176 Dis VM opcodes</li>
+<li>Provides a fully functional Dis runtime (with GC, concurrency, etc.)</li>
 <li>Includes a Limbo compiler, <code>.dis</code> file disassembler, and debugger</li>
-<li>Includes built-in modules from Dis virtual machine, including <code>$Sys</code>, <code>$Math</code>, <code>$Crypt</code>, etc.</li>
+<li>Includes most of the built-in modules from Dis virtual machine, including <code>$Sys</code>, <code>$Math</code>, <code>$Crypt</code>, etc.</li>
 <li>Supports for GUI applications and audio playback</li>
-<li>Fully cross-platform (runs on Windows, Linux, and macOS)</li>
+<li>Is fully cross-platform (runs on Windows, Linux, and macOS)</li>
 </ul>
 <h2 id="architecture">Architecture<a class="headerlink" href="#architecture" title="Permanent link">&para;</a></h2>
 <table>

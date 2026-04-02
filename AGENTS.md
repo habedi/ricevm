@@ -4,11 +4,13 @@ This file provides guidance to coding agents collaborating on this repository.
 
 ## Mission
 
-RiceVM is a re-implementation of the Dis virtual machine in Rust.
+RiceVM is a Dis virtual machine and Limbo compiler in Rust.
 The Dis VM is a register machine that executes bytecode compiled from the Limbo programming language.
+The project includes a built-in Limbo compiler that compiles `.b` source files to `.dis` bytecode
+without depending on the reference compiler from Inferno OS.
 Priorities, in order:
 
-1. Correct implementation of the Dis VM specification.
+1. Correct implementation of the Dis VM specification and Limbo language.
 2. Clean, idiomatic Rust with safe abstractions over VM internals.
 3. Clear separation of concerns across workspace crates.
 4. Maintainable and well-tested code.

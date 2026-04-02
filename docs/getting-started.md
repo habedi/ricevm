@@ -87,6 +87,49 @@ cargo run -p ricevm-cli -- debug external/inferno-os/dis/echo.dis \
     --probe external/inferno-os/dis
 ```
 
+## Built-in and Loaded Modules
+
+RiceVM has two kinds of modules:
+
+Built-in modules are compiled into the binary and need no external files:
+
+| Module     | Description                                   |
+|------------|-----------------------------------------------|
+| `$Sys`     | System I/O, formatting, process control       |
+| `$Math`    | Trigonometry, linear algebra, bit conversions |
+| `$Draw`    | Graphics via SDL2 (optional `gui` feature)    |
+| `$Tk`      | Widget toolkit                                |
+| `$Keyring` | MD5, SHA1, and authentication stubs           |
+| `$Crypt`   | Cryptographic stubs                           |
+
+Programs that only use built-in modules run without any flags:
+
+```bash
+ricevm-cli compile hello.b
+ricevm-cli run hello.dis     # Works because $Sys is built into RiceVM
+```
+
+Loaded modules are `.dis` files on disk (like `bufio.dis`, `regex.dis`, `daytime.dis`) that programs load at runtime via the `load` instruction.
+These need `--probe` paths so the VM can find them:
+
+```bash
+# Programs using Bufio, regex, or other library modules
+ricevm-cli run wc.dis --probe /path/to/dis --probe /path/to/dis/lib
+```
+
+If you cloned with `--recursive`, the Inferno OS submodule provides these modules:
+
+```bash
+ricevm-cli run program.dis \
+    --probe external/inferno-os/dis \
+    --probe external/inferno-os/dis/lib
+```
+
+!!! tip "Pre-built release binaries"
+    Release binaries do not include the Inferno module files. Clone the repository
+    with `git clone --recursive` to get them, or download the `.dis` files separately
+    from the [Inferno OS repository](https://github.com/inferno-os/inferno-os).
+
 ## CLI Reference
 
 | Subcommand | Description                                            |
@@ -107,7 +150,7 @@ cargo run -p ricevm-cli -- debug external/inferno-os/dis/echo.dis \
 | `-I PATH`      | Include search path for `.m` files (compile subcommand) |
 | `-o PATH`      | Output file path (compile subcommand)                   |
 
-### Usage Workflow
+### CLI Usage Workflow
 
 <p align="center">
   <img src="../assets/diagrams/usage_workflow.svg" alt="RiceVM Usage Workflow"/>

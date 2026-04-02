@@ -50,6 +50,25 @@ jobs:
           commitish: ${{ github.sha }}
           draft: true
           prerelease: false
+          body: |
+            ## What's Included
+
+            Pre-built `ricevm-cli` binaries for each platform. The binary includes the
+            built-in Limbo compiler and all built-in VM modules (`$Sys`, `$Math`, `$Draw`,
+            `$Tk`, `$Keyring`, and `$Crypt`).
+
+            ## Inferno Module Files
+
+            Programs that load external modules (like Bufio, regex, or daytime) need the
+            Inferno OS `.dis` files. These are **not** included in the release binaries.
+            To get them:
+
+            ```bash
+            git clone --depth=1 https://github.com/inferno-os/inferno-os.git
+            ricevm-cli run program.dis --probe inferno-os/dis --probe inferno-os/dis/lib
+            ```
+
+            Programs that only use built-in modules (like `$Sys`) work without any extra files.
 
   build-linux-amd64:
     name: Build Linux AMD64
@@ -70,10 +89,7 @@ jobs:
         run: cargo build --release -p ricevm-cli
 
       - name: Package release asset
-        run: |
-          mkdir -p dist
-          cp target/release/ricevm-cli dist/
-          cd dist && tar czf ../ricevm-linux-amd64.tar.gz ricevm-cli
+        run: gzip -c target/release/ricevm-cli > ricevm-linux-amd64.gz
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1
@@ -81,8 +97,46 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./ricevm-linux-amd64.tar.gz
-          asset_name: ricevm-linux-amd64.tar.gz
+          asset_path: ./ricevm-linux-amd64.gz
+          asset_name: ricevm-linux-amd64.gz
+          asset_content_type: application/gzip
+
+  build-linux-arm64:
+    name: Build Linux ARM64 (cross-compile)
+    runs-on: ubuntu-latest
+    needs: create-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add ARM64 target and install cross-compilation tools
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release -p ricevm-cli --target aarch64-unknown-linux-gnu
+
+      - name: Package release asset
+        run: gzip -c target/aarch64-unknown-linux-gnu/release/ricevm-cli > ricevm-linux-arm64.gz
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./ricevm-linux-arm64.gz
+          asset_name: ricevm-linux-arm64.gz
           asset_content_type: application/gzip
 
   build-macos-arm64:
@@ -104,10 +158,7 @@ jobs:
         run: cargo build --release -p ricevm-cli
 
       - name: Package release asset
-        run: |
-          mkdir -p dist
-          cp target/release/ricevm-cli dist/
-          cd dist && tar czf ../ricevm-macos-arm64.tar.gz ricevm-cli
+        run: gzip -c target/release/ricevm-cli > ricevm-macos-arm64.gz
 
       - name: Upload release asset
         uses: actions/upload-release-asset@v1
@@ -115,8 +166,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./ricevm-macos-arm64.tar.gz
-          asset_name: ricevm-macos-arm64.tar.gz
+          asset_path: ./ricevm-macos-arm64.gz
+          asset_name: ricevm-macos-arm64.gz
           asset_content_type: application/gzip
 
   build-windows-amd64:
@@ -150,4 +201,40 @@ jobs:
           upload_url: ${{ needs.create-release.outputs.upload_url }}
           asset_path: ./ricevm-windows-amd64.zip
           asset_name: ricevm-windows-amd64.zip
+          asset_content_type: application/zip
+
+  build-windows-arm64:
+    name: Build Windows ARM64 (cross-compile)
+    runs-on: windows-latest
+    needs: create-release
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add ARM64 target
+        run: rustup target add aarch64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build --release -p ricevm-cli --target aarch64-pc-windows-msvc
+
+      - name: Package release asset
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target\aarch64-pc-windows-msvc\release\ricevm-cli.exe" -DestinationPath "ricevm-windows-arm64.zip" -Force
+
+      - name: Upload release asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./ricevm-windows-arm64.zip
+          asset_name: ricevm-windows-arm64.zip
           asset_content_type: application/zip

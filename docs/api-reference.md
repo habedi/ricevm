@@ -57,7 +57,8 @@ This module is to support display allocation, image drawing, line and ellipse re
 
 ### `$Tk`
 
-This module includes functions for the Tk widget toolkit. Supports toplevel windows, widget creation, command dispatch, named channels, and mouse event handling.
+This module includes functions for the Tk widget toolkit. Supports toplevel windows, widget creation, command dispatch, named channels, and mouse
+event handling.
 
 | Function                                                          | Description                                                      |
 |-------------------------------------------------------------------|------------------------------------------------------------------|
@@ -113,16 +114,16 @@ The `ricevm-limbo` crate exposes a public Rust API:
 
 ```rust
 // Compile source to a Module
-let module = ricevm_limbo::compile(src, "hello.b")?;
+let module = ricevm_limbo::compile(src, "hello.b") ?;
 
 // Compile source to .dis binary bytes
-let bytes = ricevm_limbo::compile_to_bytes(src, "hello.b")?;
+let bytes = ricevm_limbo::compile_to_bytes(src, "hello.b") ?;
 
 // Compile with include paths
 let opts = ricevm_limbo::CompileOptions {
-    include_paths: vec!["external/inferno-os/module".to_string()],
+include_paths: vec!["external/inferno-os/module".to_string()],
 };
-let module = ricevm_limbo::compile_with_options(src, "hello.b", &opts)?;
+let module = ricevm_limbo::compile_with_options(src, "hello.b", & opts) ?;
 ```
 
 ## Virtual Device Files

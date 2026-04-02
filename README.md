@@ -92,21 +92,25 @@ cargo run -p ricevm-cli -- run external/inferno-os/dis/echo.dis \
 
 # Run the About Inferno dialog with GUI (this needs SDL2)
 cargo run -p ricevm-cli --release --features gui -- run external/inferno-os/dis/wm/about.dis \
-    --probe external/inferno-os/dis \
-    --probe external/inferno-os/dis/lib \
+    --probe external/inferno-os/dis --probe external/inferno-os/dis/lib \
     --root external/inferno-os
 ```
+
+#### Pre-built Binaries
+
+The latest release of RiceVM can be downloaded from [here](https://github.com/habedi/ricevm/releases/latest) insead of building it from source.
 
 [//]: # (### Usage Workflow)
 
 [//]: # ()
+
 [//]: # ([![RiceVM Usage Workflow]&#40;docs/assets/diagrams/usage_workflow.svg&#41;]&#40;docs/assets/diagrams/usage_workflow.svg&#41;)
 
 ---
 
 ### Documentation
 
-See the [RiceVM documentation](https://habedi.github.io/ricevm/) for more details.
+Check the [RiceVM documentation](https://habedi.github.io/ricevm/) for usage examples and API reference for the CLI and built-in Limbo modules, etc.
 
 ---
 

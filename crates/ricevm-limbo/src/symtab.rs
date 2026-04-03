@@ -139,3 +139,157 @@ impl SymbolTable {
         ResolvedType::Adt(format!("{module}.{type_name}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn define_and_lookup_variable() {
+        let mut st = SymbolTable::new();
+        st.define(
+            "x",
+            Symbol::Var {
+                ty: ResolvedType::Int,
+            },
+        );
+        let sym = st.lookup("x");
+        assert!(sym.is_some());
+        match sym.unwrap() {
+            Symbol::Var { ty } => assert_eq!(*ty, ResolvedType::Int),
+            _ => panic!("expected Var symbol"),
+        }
+    }
+
+    #[test]
+    fn define_and_lookup_const() {
+        let mut st = SymbolTable::new();
+        st.define(
+            "N",
+            Symbol::Const {
+                ty: ResolvedType::Int,
+                value: ConstValue::Int(42),
+            },
+        );
+        let sym = st.lookup("N").unwrap();
+        match sym {
+            Symbol::Const { ty, value } => {
+                assert_eq!(*ty, ResolvedType::Int);
+                match value {
+                    ConstValue::Int(v) => assert_eq!(*v, 42),
+                    _ => panic!("expected Int const"),
+                }
+            }
+            _ => panic!("expected Const symbol"),
+        }
+    }
+
+    #[test]
+    fn lookup_missing_returns_none() {
+        let st = SymbolTable::new();
+        assert!(st.lookup("nonexistent").is_none());
+    }
+
+    #[test]
+    fn register_module_and_lookup_members() {
+        let mut st = SymbolTable::new();
+        let mut members = HashMap::new();
+        members.insert(
+            "print".to_string(),
+            Symbol::Func {
+                ty: FnType {
+                    params: vec![("s".to_string(), ResolvedType::String)],
+                    ret: Some(Box::new(ResolvedType::Int)),
+                },
+            },
+        );
+        members.insert(
+            "FD".to_string(),
+            Symbol::Type {
+                resolved: ResolvedType::Adt("Sys.FD".to_string()),
+            },
+        );
+        st.register_module("Sys", members);
+
+        // Lookup qualified member
+        let print_sym = st.lookup_qualified("Sys", "print");
+        assert!(print_sym.is_some());
+        match print_sym.unwrap() {
+            Symbol::Func { ty } => {
+                assert_eq!(ty.params.len(), 1);
+                assert_eq!(ty.params[0].0, "s");
+            }
+            _ => panic!("expected Func symbol"),
+        }
+
+        // Lookup missing member
+        assert!(st.lookup_qualified("Sys", "nonexistent").is_none());
+        // Lookup missing module
+        assert!(st.lookup_qualified("Draw", "Context").is_none());
+    }
+
+    #[test]
+    fn resolve_module_type_found() {
+        let mut st = SymbolTable::new();
+        let mut members = HashMap::new();
+        members.insert(
+            "Context".to_string(),
+            Symbol::Type {
+                resolved: ResolvedType::Adt("Draw.Context".to_string()),
+            },
+        );
+        st.register_module("Draw", members);
+
+        let ty = st.resolve_module_type("Draw", "Context");
+        assert_eq!(ty, ResolvedType::Adt("Draw.Context".to_string()));
+    }
+
+    #[test]
+    fn resolve_module_type_not_found_returns_adt() {
+        let st = SymbolTable::new();
+        let ty = st.resolve_module_type("Draw", "Unknown");
+        assert_eq!(ty, ResolvedType::Adt("Draw.Unknown".to_string()));
+    }
+
+    #[test]
+    fn resolved_type_is_ptr() {
+        assert!(!ResolvedType::Int.is_ptr());
+        assert!(!ResolvedType::Byte.is_ptr());
+        assert!(!ResolvedType::Big.is_ptr());
+        assert!(!ResolvedType::Real.is_ptr());
+        assert!(!ResolvedType::Unknown.is_ptr());
+        assert!(ResolvedType::String.is_ptr());
+        assert!(ResolvedType::Nil.is_ptr());
+        assert!(ResolvedType::Array(Box::new(ResolvedType::Int)).is_ptr());
+        assert!(ResolvedType::List(Box::new(ResolvedType::Int)).is_ptr());
+        assert!(ResolvedType::Chan(Box::new(ResolvedType::Int)).is_ptr());
+        assert!(ResolvedType::Ref(Box::new(ResolvedType::Int)).is_ptr());
+        assert!(ResolvedType::Module("Sys".to_string()).is_ptr());
+    }
+
+    #[test]
+    fn resolved_type_is_array() {
+        assert!(ResolvedType::Array(Box::new(ResolvedType::Int)).is_array());
+        assert!(!ResolvedType::Int.is_array());
+        assert!(!ResolvedType::String.is_array());
+    }
+
+    #[test]
+    fn resolved_type_frame_size() {
+        assert_eq!(ResolvedType::Int.frame_size(), 4);
+        assert_eq!(ResolvedType::Byte.frame_size(), 4);
+        assert_eq!(ResolvedType::String.frame_size(), 4);
+        assert_eq!(ResolvedType::Big.frame_size(), 8);
+        assert_eq!(ResolvedType::Real.frame_size(), 8);
+    }
+
+    #[test]
+    fn add_include_path() {
+        let mut st = SymbolTable::new();
+        st.add_include_path("/usr/lib/inferno");
+        st.add_include_path("/opt/limbo");
+        assert_eq!(st.include_paths.len(), 2);
+        assert_eq!(st.include_paths[0], "/usr/lib/inferno");
+        assert_eq!(st.include_paths[1], "/opt/limbo");
+    }
+}

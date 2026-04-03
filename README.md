@@ -96,15 +96,13 @@ cargo run -p ricevm-cli --release --features gui -- run external/inferno-os/dis/
     --root external/inferno-os
 ```
 
+#### Simple Demo
+
+[![asciicast](https://asciinema.org/a/BM2tUfsqKEwqPsxD.svg)](https://asciinema.org/a/BM2tUfsqKEwqPsxD)
+
 #### Pre-built Binaries
 
 The latest release of RiceVM can be downloaded from [here](https://github.com/habedi/ricevm/releases/latest) insead of building it from source.
-
-[//]: # (### Usage Workflow)
-
-[//]: # ()
-
-[//]: # ([![RiceVM Usage Workflow]&#40;docs/assets/diagrams/usage_workflow.svg&#41;]&#40;docs/assets/diagrams/usage_workflow.svg&#41;)
 
 ---
 

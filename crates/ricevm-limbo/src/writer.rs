@@ -243,3 +243,256 @@ fn write_data_header(buf: &mut Vec<u8>, item_type: u8, count: i32, offset: i32) 
     }
     write_op(buf, offset);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ricevm_core::{
+        ExportEntry, Header, ImportModule, Instruction, MiddleOperand, Opcode, Operand, PointerMap,
+        RuntimeFlags, TypeDescriptor,
+    };
+
+    /// Helper: build a minimal valid Module.
+    fn minimal_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0), // no HAS_IMPORT flag since no imports
+                stack_extent: 480,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 1,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Ret,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 16,
+                pointer_map: PointerMap { bytes: vec![0x80] },
+                pointer_count: 1,
+            }],
+            data: vec![],
+            name: "Test".to_string(),
+            exports: vec![ExportEntry {
+                pc: 0,
+                frame_type: 0,
+                signature: 0,
+                name: "init".to_string(),
+            }],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    #[test]
+    fn roundtrip_minimal_module() {
+        let module = minimal_module();
+        let bytes = write_dis(&module);
+        let loaded = ricevm_loader::load(&bytes).expect("should load roundtripped module");
+        assert_eq!(loaded.header.magic, XMAGIC);
+        assert_eq!(loaded.header.code_size, 1);
+        assert_eq!(loaded.code.len(), 1);
+        assert_eq!(loaded.code[0].opcode, Opcode::Ret);
+        assert_eq!(loaded.name, "Test");
+        assert_eq!(loaded.exports.len(), 1);
+        assert_eq!(loaded.exports[0].name, "init");
+        assert_eq!(loaded.types.len(), 1);
+    }
+
+    #[test]
+    fn roundtrip_with_data_section() {
+        let mut module = minimal_module();
+        module.header.data_size = 8;
+        module.data.push(DataItem::String {
+            offset: 0,
+            value: "hello".to_string(),
+        });
+        let bytes = write_dis(&module);
+        let loaded = ricevm_loader::load(&bytes).expect("should load module with data");
+        assert_eq!(loaded.data.len(), 1);
+        match &loaded.data[0] {
+            DataItem::String { offset, value } => {
+                assert_eq!(*offset, 0);
+                assert_eq!(value, "hello");
+            }
+            other => panic!("expected String data item, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_with_imports() {
+        let mut module = minimal_module();
+        module.header.runtime_flags = RuntimeFlags(RuntimeFlags::HAS_IMPORT.0);
+        module.imports.push(ImportModule {
+            functions: vec![ricevm_core::ImportEntry {
+                signature: 0x1234_5678,
+                name: "print".to_string(),
+            }],
+        });
+        let bytes = write_dis(&module);
+        let loaded = ricevm_loader::load(&bytes).expect("should load module with imports");
+        assert_eq!(loaded.imports.len(), 1);
+        assert_eq!(loaded.imports[0].functions.len(), 1);
+        assert_eq!(loaded.imports[0].functions[0].name, "print");
+        assert_eq!(loaded.imports[0].functions[0].signature, 0x1234_5678);
+    }
+
+    // ── Operand encoding tests ──────────────────────────────────
+
+    #[test]
+    fn write_op_zero() {
+        let mut buf = Vec::new();
+        write_op(&mut buf, 0);
+        assert_eq!(buf, vec![0x00]);
+    }
+
+    #[test]
+    fn write_op_63() {
+        let mut buf = Vec::new();
+        write_op(&mut buf, 63);
+        assert_eq!(buf, vec![63]);
+    }
+
+    #[test]
+    fn write_op_64_needs_two_bytes() {
+        let mut buf = Vec::new();
+        write_op(&mut buf, 64);
+        assert_eq!(buf.len(), 2);
+        // 64 = 0x0040 → high byte = 0x80 | 0x00 = 0x80, low byte = 0x40
+        assert_eq!(buf[0], 0x80);
+        assert_eq!(buf[1], 0x40);
+    }
+
+    #[test]
+    fn write_op_127() {
+        let mut buf = Vec::new();
+        write_op(&mut buf, 127);
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], 0x80);
+        assert_eq!(buf[1], 0x7F);
+    }
+
+    #[test]
+    fn write_op_128() {
+        let mut buf = Vec::new();
+        write_op(&mut buf, 128);
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0], 0x80);
+        assert_eq!(buf[1], 0x80);
+    }
+
+    #[test]
+    fn write_op_8191() {
+        let mut buf = Vec::new();
+        write_op(&mut buf, 8191);
+        assert_eq!(buf.len(), 2);
+        // 8191 = 0x1FFF → high byte = 0x80 | 0x1F = 0x9F, low byte = 0xFF
+        assert_eq!(buf[0], 0x9F);
+        assert_eq!(buf[1], 0xFF);
+    }
+
+    #[test]
+    fn write_op_8192_needs_four_bytes() {
+        let mut buf = Vec::new();
+        write_op(&mut buf, 8192);
+        assert_eq!(buf.len(), 4);
+        // 8192 = 0x00002000 → 0xC0, 0x00, 0x20, 0x00
+        assert_eq!(buf[0], 0xC0);
+        assert_eq!(buf[1], 0x00);
+        assert_eq!(buf[2], 0x20);
+        assert_eq!(buf[3], 0x00);
+    }
+
+    #[test]
+    fn write_op_negative_one() {
+        let mut buf = Vec::new();
+        write_op(&mut buf, -1);
+        // -1 as u8 = 0xFF, which is in range -64..0
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0], 0xFF);
+    }
+
+    #[test]
+    fn write_op_negative_64() {
+        let mut buf = Vec::new();
+        write_op(&mut buf, -64);
+        // -64 as u8 = 0xC0, in range -64..0
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf[0], 0xC0);
+    }
+
+    #[test]
+    fn data_section_has_terminating_null() {
+        let module = minimal_module();
+        let bytes = write_dis(&module);
+        // Find the data section: it comes after the code section.
+        // The data section should be just a single 0x00 terminator since data is empty.
+        // We can verify by loading and checking the module loads correctly.
+        let loaded = ricevm_loader::load(&bytes).expect("should load");
+        assert!(loaded.data.is_empty());
+    }
+
+    #[test]
+    fn write_cstring_null_terminated() {
+        let mut buf = Vec::new();
+        write_cstring(&mut buf, "hello");
+        assert_eq!(buf, b"hello\0");
+    }
+
+    #[test]
+    fn roundtrip_multiple_instructions() {
+        let mut module = minimal_module();
+        module.header.code_size = 3;
+        module.code = vec![
+            Instruction {
+                opcode: Opcode::Movw,
+                source: Operand {
+                    mode: AddressMode::Immediate,
+                    register1: 42,
+                    register2: 0,
+                },
+                middle: MiddleOperand::UNUSED,
+                destination: Operand {
+                    mode: AddressMode::OffsetIndirectFp,
+                    register1: 40,
+                    register2: 0,
+                },
+            },
+            Instruction {
+                opcode: Opcode::Addw,
+                source: Operand {
+                    mode: AddressMode::Immediate,
+                    register1: 1,
+                    register2: 0,
+                },
+                middle: MiddleOperand::UNUSED,
+                destination: Operand {
+                    mode: AddressMode::OffsetIndirectFp,
+                    register1: 40,
+                    register2: 0,
+                },
+            },
+            Instruction {
+                opcode: Opcode::Ret,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            },
+        ];
+        let bytes = write_dis(&module);
+        let loaded = ricevm_loader::load(&bytes).expect("should load multiple instructions");
+        assert_eq!(loaded.code.len(), 3);
+        assert_eq!(loaded.code[0].opcode, Opcode::Movw);
+        assert_eq!(loaded.code[0].source.register1, 42);
+        assert_eq!(loaded.code[1].opcode, Opcode::Addw);
+        assert_eq!(loaded.code[2].opcode, Opcode::Ret);
+    }
+}

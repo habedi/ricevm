@@ -310,3 +310,78 @@ fn eval_const_expr(expr: &Expr) -> ConstValue {
         _ => ConstValue::Int(0),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token::Span;
+
+    #[test]
+    fn eval_const_int() {
+        let expr = Expr::IntLit(42, Span::default());
+        assert!(matches!(eval_const_expr(&expr), ConstValue::Int(42)));
+    }
+
+    #[test]
+    fn eval_const_add() {
+        let expr = Expr::Binary(
+            Box::new(Expr::IntLit(10, Span::default())),
+            BinOp::Add,
+            Box::new(Expr::IntLit(32, Span::default())),
+            Span::default(),
+        );
+        assert!(matches!(eval_const_expr(&expr), ConstValue::Int(42)));
+    }
+
+    #[test]
+    fn eval_const_shift() {
+        let expr = Expr::Binary(
+            Box::new(Expr::IntLit(1, Span::default())),
+            BinOp::Lshift,
+            Box::new(Expr::IntLit(8, Span::default())),
+            Span::default(),
+        );
+        assert!(matches!(eval_const_expr(&expr), ConstValue::Int(256)));
+    }
+
+    #[test]
+    fn eval_const_neg() {
+        let expr = Expr::Unary(
+            UnaryOp::Neg,
+            Box::new(Expr::IntLit(7, Span::default())),
+            Span::default(),
+        );
+        assert!(matches!(eval_const_expr(&expr), ConstValue::Int(-7)));
+    }
+
+    #[test]
+    fn eval_const_string() {
+        let expr = Expr::StringLit("hello".to_string(), Span::default());
+        assert!(matches!(eval_const_expr(&expr), ConstValue::String(s) if s == "hello"));
+    }
+
+    #[test]
+    fn process_includes_extracts_module_decl() {
+        let src = r#"implement Test;
+Test: module {
+    PATH: con "$Test";
+    init: fn(nil: ref Draw->Context, nil: list of string);
+};
+"#;
+        let tokens = Lexer::new(src, "<test>")
+            .tokenize()
+            .ok()
+            .unwrap_or_default();
+        let file = crate::parser::Parser::new(tokens, "<test>")
+            .parse_file()
+            .ok()
+            .unwrap_or_else(|| SourceFile {
+                implement: vec![],
+                includes: vec![],
+                decls: vec![],
+            });
+        let mut symtab = SymbolTable::new();
+        process_includes(&file, &mut symtab);
+        assert!(symtab.lookup("Test").is_some());
+    }
+}

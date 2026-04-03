@@ -73,3 +73,100 @@ impl ModuleRegistry {
             .find(|f| f.sig == sig)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_handler(_: &mut VmState<'_>) -> Result<(), ExecError> {
+        Ok(())
+    }
+
+    #[test]
+    fn register_and_find_module() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(BuiltinModule {
+            name: "$Test",
+            funcs: vec![BuiltinFunc {
+                name: "hello",
+                sig: 0x1234,
+                frame_size: 32,
+                handler: dummy_handler,
+            }],
+        });
+        assert_eq!(reg.find_builtin("$Test"), Some(0));
+        assert_eq!(reg.find_builtin("$Missing"), None);
+    }
+
+    #[test]
+    fn get_func_by_index() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(BuiltinModule {
+            name: "$Sys",
+            funcs: vec![
+                BuiltinFunc {
+                    name: "print",
+                    sig: 0xAA,
+                    frame_size: 40,
+                    handler: dummy_handler,
+                },
+                BuiltinFunc {
+                    name: "write",
+                    sig: 0xBB,
+                    frame_size: 48,
+                    handler: dummy_handler,
+                },
+            ],
+        });
+        let f = reg.get_func(0, 1);
+        assert!(f.is_some());
+        assert_eq!(f.map(|f| f.name), Some("write"));
+        assert!(reg.get_func(0, 5).is_none());
+        assert!(reg.get_func(9, 0).is_none());
+    }
+
+    #[test]
+    fn get_func_by_signature() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(BuiltinModule {
+            name: "$Sys",
+            funcs: vec![
+                BuiltinFunc {
+                    name: "print",
+                    sig: 0xAA,
+                    frame_size: 40,
+                    handler: dummy_handler,
+                },
+                BuiltinFunc {
+                    name: "write",
+                    sig: 0xBB,
+                    frame_size: 48,
+                    handler: dummy_handler,
+                },
+            ],
+        });
+        let f = reg.get_func_by_sig(0, 0xBB);
+        assert_eq!(f.map(|f| f.name), Some("write"));
+        assert!(reg.get_func_by_sig(0, 0xFF).is_none());
+    }
+
+    #[test]
+    fn multiple_modules() {
+        let mut reg = ModuleRegistry::new();
+        reg.register(BuiltinModule {
+            name: "$Sys",
+            funcs: vec![],
+        });
+        reg.register(BuiltinModule {
+            name: "$Math",
+            funcs: vec![],
+        });
+        reg.register(BuiltinModule {
+            name: "$Draw",
+            funcs: vec![],
+        });
+        assert_eq!(reg.find_builtin("$Sys"), Some(0));
+        assert_eq!(reg.find_builtin("$Math"), Some(1));
+        assert_eq!(reg.find_builtin("$Draw"), Some(2));
+    }
+}

@@ -1696,3 +1696,283 @@ fn mid_fp(offset: i32) -> MiddleOperand {
         register1: offset,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::token::Span;
+
+    fn s() -> Span {
+        Span::default()
+    }
+
+    /// Helper: compile a minimal Limbo source string through lexer+parser+codegen.
+    fn compile_src(src: &str) -> Result<Module, String> {
+        let tokens = crate::lexer::Lexer::new(src, "test.b")
+            .tokenize()
+            .map_err(|e| format!("{e}"))?;
+        let ast = crate::parser::Parser::new(tokens, "test.b")
+            .parse_file()
+            .map_err(|e| format!("{e}"))?;
+        CodeGen::new().compile(&ast)
+    }
+
+    // ── Hello world ─────────────────────────────────────────────
+
+    #[test]
+    fn hello_world_produces_exports_and_imports() {
+        let src = r#"
+implement Test;
+include "sys.m";
+sys: Sys;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    sys = load Sys Sys->PATH;
+    sys->print("hello world\n");
+}
+"#;
+        let module = compile_src(src).expect("hello world should compile");
+        // Should have one export: "init"
+        assert_eq!(module.exports.len(), 1);
+        assert_eq!(module.exports[0].name, "init");
+        assert_eq!(module.exports[0].pc, 0);
+        // Should have imports (sys module functions)
+        assert!(!module.imports.is_empty());
+        // Code should have more than just a Ret
+        assert!(module.code.len() > 1);
+    }
+
+    // ── If/else produces branch instructions ────────────────────
+
+    #[test]
+    fn if_else_produces_branch_instructions() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x: int;
+    x = 1;
+    if(x == 0)
+        x = 2;
+    else
+        x = 3;
+}
+"#;
+        let module = compile_src(src).expect("if/else should compile");
+        // Should contain a Beqw (branch-equal-word) instruction
+        let has_beqw = module.code.iter().any(|i| i.opcode == Opcode::Beqw);
+        assert!(has_beqw, "if/else should produce a Beqw instruction");
+        // Should also contain a Jmp for the else skip
+        let has_jmp = module.code.iter().any(|i| i.opcode == Opcode::Jmp);
+        assert!(
+            has_jmp,
+            "if/else should produce a Jmp instruction for the else branch"
+        );
+    }
+
+    // ── While loop produces jump-back ───────────────────────────
+
+    #[test]
+    fn while_loop_produces_jump_back() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := 0;
+    while(x < 10)
+        x++;
+}
+"#;
+        let module = compile_src(src).expect("while loop should compile");
+        // Should have a Jmp instruction that jumps back (to an earlier PC)
+        let jmp_instrs: Vec<_> = module
+            .code
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.opcode == Opcode::Jmp)
+            .collect();
+        assert!(!jmp_instrs.is_empty(), "while loop should produce a Jmp");
+        // The Jmp target should be before the Jmp itself (jump back to loop start)
+        for (idx, inst) in &jmp_instrs {
+            if inst.destination.mode == AddressMode::Immediate {
+                let target = inst.destination.register1 as usize;
+                if target < *idx {
+                    return; // Found a backwards jump — test passes
+                }
+            }
+        }
+        panic!("while loop should produce a backwards Jmp (jump-back)");
+    }
+
+    // ── String concatenation produces Addc ──────────────────────
+
+    #[test]
+    fn string_concat_produces_addc() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    s := "hello";
+    s = s + " world";
+}
+"#;
+        let module = compile_src(src).expect("string concat should compile");
+        let has_addc = module.code.iter().any(|i| i.opcode == Opcode::Addc);
+        assert!(has_addc, "string concatenation should produce Addc opcode");
+    }
+
+    // ── Channel creation produces Newcw ─────────────────────────
+
+    #[test]
+    fn channel_creation_produces_newcw() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    c := chan of int;
+}
+"#;
+        let module = compile_src(src).expect("channel creation should compile");
+        let has_newcw = module.code.iter().any(|i| i.opcode == Opcode::Newcw);
+        assert!(has_newcw, "channel creation should produce Newcw opcode");
+    }
+
+    // ── Local function calls produce Call ────────────────────────
+
+    #[test]
+    fn local_function_call_produces_call() {
+        let src = r#"
+implement Test;
+helper(): int
+{
+    return 42;
+}
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := helper();
+}
+"#;
+        let module = compile_src(src).expect("local function call should compile");
+        let has_call = module.code.iter().any(|i| i.opcode == Opcode::Call);
+        assert!(has_call, "local function call should produce Call opcode");
+        // Should also have a Frame instruction to set up the call frame
+        let has_frame = module.code.iter().any(|i| i.opcode == Opcode::Frame);
+        assert!(has_frame, "local function call should produce Frame opcode");
+    }
+
+    // ── Return value writes through return pointer ──────────────
+
+    #[test]
+    fn return_value_writes_through_return_pointer() {
+        let src = r#"
+implement Test;
+answer(): int
+{
+    return 42;
+}
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := answer();
+}
+"#;
+        let module = compile_src(src).expect("return value should compile");
+        // The return statement should produce Movw to 0(16(fp)) — double indirect through fp[16]
+        let has_movw_double_ind = module.code.iter().any(|i| {
+            i.opcode == Opcode::Movw
+                && i.destination.mode == AddressMode::OffsetDoubleIndirectFp
+                && i.destination.register1 == 16
+                && i.destination.register2 == 0
+        });
+        assert!(
+            has_movw_double_ind,
+            "return value should write through 0(16(fp)) — the return pointer"
+        );
+    }
+
+    // ── AST-level codegen ───────────────────────────────────────
+
+    #[test]
+    fn compile_empty_init() {
+        let file = SourceFile {
+            implement: vec!["Test".to_string()],
+            includes: vec![],
+            decls: vec![Decl::Func(FuncDecl {
+                name: QualName {
+                    qualifier: None,
+                    name: "init".to_string(),
+                },
+                sig: FuncSig {
+                    name: "init".to_string(),
+                    params: vec![],
+                    ret: None,
+                    span: s(),
+                },
+                body: Block {
+                    stmts: vec![],
+                    span: s(),
+                },
+                span: s(),
+            })],
+        };
+        let module = CodeGen::new().compile(&file).expect("empty init compiles");
+        assert_eq!(module.name, "Test");
+        assert_eq!(module.exports.len(), 1);
+        assert_eq!(module.exports[0].name, "init");
+        // Should have at least a Ret instruction
+        assert!(!module.code.is_empty());
+        assert_eq!(module.code.last().unwrap().opcode, Opcode::Ret);
+    }
+
+    #[test]
+    fn compile_integer_assignment() {
+        let file = SourceFile {
+            implement: vec!["Test".to_string()],
+            includes: vec![],
+            decls: vec![Decl::Func(FuncDecl {
+                name: QualName {
+                    qualifier: None,
+                    name: "init".to_string(),
+                },
+                sig: FuncSig {
+                    name: "init".to_string(),
+                    params: vec![],
+                    ret: None,
+                    span: s(),
+                },
+                body: Block {
+                    stmts: vec![Stmt::Expr(Expr::DeclAssign(
+                        vec!["x".to_string()],
+                        Box::new(Expr::IntLit(42, s())),
+                        s(),
+                    ))],
+                    span: s(),
+                },
+                span: s(),
+            })],
+        };
+        let module = CodeGen::new().compile(&file).expect("int assign compiles");
+        // Should contain Movw with immediate 42
+        let has_movw_42 = module.code.iter().any(|i| {
+            i.opcode == Opcode::Movw
+                && i.source.mode == AddressMode::Immediate
+                && i.source.register1 == 42
+        });
+        assert!(has_movw_42, "should have Movw $42");
+    }
+
+    #[test]
+    fn module_header_has_correct_sizes() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := 1;
+}
+"#;
+        let module = compile_src(src).expect("should compile");
+        assert_eq!(module.header.magic, XMAGIC);
+        assert_eq!(module.header.code_size, module.code.len() as i32);
+        assert_eq!(module.header.type_size, module.types.len() as i32);
+        assert_eq!(module.header.export_size, module.exports.len() as i32);
+    }
+}

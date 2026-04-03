@@ -51,13 +51,13 @@ jobs:
           draft: true
           prerelease: false
           body: |
-            ## What's Included
+            ### What's Included
 
             Pre-built `ricevm-cli` binaries for each platform. The binary includes the
             built-in Limbo compiler and all built-in VM modules (`$Sys`, `$Math`, `$Draw`,
             `$Tk`, `$Keyring`, and `$Crypt`).
 
-            ## Inferno Module Files
+            ### Inferno Module Files
 
             Programs that load external modules (like Bufio, regex, or daytime) need the
             Inferno OS `.dis` files. These are **not** included in the release binaries.

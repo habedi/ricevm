@@ -1008,3 +1008,582 @@ fn math_import_real32(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     write_real_return(vm, base, val);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap, RuntimeFlags,
+        TypeDescriptor, XMAGIC,
+    };
+
+    use super::*;
+    use crate::vm::VmState;
+
+    /// Create a module whose entry frame is 64 bytes -- large enough for
+    /// binary math functions (which read up to offset 40+8 = 48).
+    fn test_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "math_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    /// Helper: set a unary real argument at ARG1_OFF and call the function,
+    /// then read the real return value from RET_OFF.
+    fn call_unary_real(f: fn(&mut VmState<'_>) -> Result<(), ExecError>, arg: f64) -> f64 {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, arg);
+        f(&mut vm).expect("math function should succeed");
+        memory::read_real(&vm.frames.data, base + RET_OFF)
+    }
+
+    /// Helper: set two real arguments and call a binary function.
+    fn call_binary_real(
+        f: fn(&mut VmState<'_>) -> Result<(), ExecError>,
+        arg1: f64,
+        arg2: f64,
+    ) -> f64 {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, arg1);
+        memory::write_real(&mut vm.frames.data, base + ARG2_OFF, arg2);
+        f(&mut vm).expect("math function should succeed");
+        memory::read_real(&vm.frames.data, base + RET_OFF)
+    }
+
+    // ---- Trigonometric functions ----
+
+    #[test]
+    fn sin_zero() {
+        let r = call_unary_real(math_sin, 0.0);
+        assert!((r - 0.0).abs() < 1e-15, "sin(0) = 0, got {r}");
+    }
+
+    #[test]
+    fn sin_pi_half() {
+        let r = call_unary_real(math_sin, std::f64::consts::FRAC_PI_2);
+        assert!((r - 1.0).abs() < 1e-15, "sin(pi/2) = 1, got {r}");
+    }
+
+    #[test]
+    fn cos_zero() {
+        let r = call_unary_real(math_cos, 0.0);
+        assert!((r - 1.0).abs() < 1e-15, "cos(0) = 1, got {r}");
+    }
+
+    #[test]
+    fn cos_pi() {
+        let r = call_unary_real(math_cos, std::f64::consts::PI);
+        assert!((r - (-1.0)).abs() < 1e-15, "cos(pi) = -1, got {r}");
+    }
+
+    #[test]
+    fn tan_zero() {
+        let r = call_unary_real(math_tan, 0.0);
+        assert!((r - 0.0).abs() < 1e-15, "tan(0) = 0, got {r}");
+    }
+
+    #[test]
+    fn tan_pi_over_4() {
+        let r = call_unary_real(math_tan, std::f64::consts::FRAC_PI_4);
+        assert!((r - 1.0).abs() < 1e-12, "tan(pi/4) = 1, got {r}");
+    }
+
+    // ---- Inverse trigonometric ----
+
+    #[test]
+    fn asin_zero() {
+        let r = call_unary_real(math_asin, 0.0);
+        assert!((r - 0.0).abs() < 1e-15, "asin(0) = 0, got {r}");
+    }
+
+    #[test]
+    fn acos_one() {
+        let r = call_unary_real(math_acos, 1.0);
+        assert!((r - 0.0).abs() < 1e-15, "acos(1) = 0, got {r}");
+    }
+
+    #[test]
+    fn atan_zero() {
+        let r = call_unary_real(math_atan, 0.0);
+        assert!((r - 0.0).abs() < 1e-15, "atan(0) = 0, got {r}");
+    }
+
+    #[test]
+    fn atan2_unit() {
+        let r = call_binary_real(math_atan2, 1.0, 1.0);
+        assert!(
+            (r - std::f64::consts::FRAC_PI_4).abs() < 1e-15,
+            "atan2(1,1) = pi/4, got {r}"
+        );
+    }
+
+    // ---- sqrt, pow, log, exp ----
+
+    #[test]
+    fn sqrt_four() {
+        let r = call_unary_real(math_sqrt, 4.0);
+        assert!((r - 2.0).abs() < 1e-15, "sqrt(4) = 2, got {r}");
+    }
+
+    #[test]
+    fn sqrt_zero() {
+        let r = call_unary_real(math_sqrt, 0.0);
+        assert!((r - 0.0).abs() < 1e-15, "sqrt(0) = 0, got {r}");
+    }
+
+    #[test]
+    fn sqrt_one() {
+        let r = call_unary_real(math_sqrt, 1.0);
+        assert!((r - 1.0).abs() < 1e-15, "sqrt(1) = 1, got {r}");
+    }
+
+    #[test]
+    fn pow_two_cubed() {
+        let r = call_binary_real(math_pow, 2.0, 3.0);
+        assert!((r - 8.0).abs() < 1e-12, "pow(2,3) = 8, got {r}");
+    }
+
+    #[test]
+    fn pow_anything_zero() {
+        let r = call_binary_real(math_pow, 42.0, 0.0);
+        assert!((r - 1.0).abs() < 1e-15, "pow(42,0) = 1, got {r}");
+    }
+
+    #[test]
+    fn log_one() {
+        let r = call_unary_real(math_log, 1.0);
+        assert!((r - 0.0).abs() < 1e-15, "ln(1) = 0, got {r}");
+    }
+
+    #[test]
+    fn log_e() {
+        let r = call_unary_real(math_log, std::f64::consts::E);
+        assert!((r - 1.0).abs() < 1e-15, "ln(e) = 1, got {r}");
+    }
+
+    #[test]
+    fn log10_hundred() {
+        let r = call_unary_real(math_log10, 100.0);
+        assert!((r - 2.0).abs() < 1e-12, "log10(100) = 2, got {r}");
+    }
+
+    #[test]
+    fn exp_zero() {
+        let r = call_unary_real(math_exp, 0.0);
+        assert!((r - 1.0).abs() < 1e-15, "exp(0) = 1, got {r}");
+    }
+
+    #[test]
+    fn exp_one() {
+        let r = call_unary_real(math_exp, 1.0);
+        assert!(
+            (r - std::f64::consts::E).abs() < 1e-12,
+            "exp(1) = e, got {r}"
+        );
+    }
+
+    // ---- floor, ceil, rint ----
+
+    #[test]
+    fn floor_positive_fraction() {
+        let r = call_unary_real(math_floor, 2.7);
+        assert!((r - 2.0).abs() < 1e-15, "floor(2.7) = 2, got {r}");
+    }
+
+    #[test]
+    fn floor_negative_fraction() {
+        let r = call_unary_real(math_floor, -2.3);
+        assert!((r - (-3.0)).abs() < 1e-15, "floor(-2.3) = -3, got {r}");
+    }
+
+    #[test]
+    fn ceil_positive_fraction() {
+        let r = call_unary_real(math_ceil, 2.3);
+        assert!((r - 3.0).abs() < 1e-15, "ceil(2.3) = 3, got {r}");
+    }
+
+    #[test]
+    fn ceil_negative_fraction() {
+        let r = call_unary_real(math_ceil, -2.7);
+        assert!((r - (-2.0)).abs() < 1e-15, "ceil(-2.7) = -2, got {r}");
+    }
+
+    #[test]
+    fn ceil_integer() {
+        let r = call_unary_real(math_ceil, 5.0);
+        assert!((r - 5.0).abs() < 1e-15, "ceil(5.0) = 5, got {r}");
+    }
+
+    #[test]
+    fn rint_rounds_half() {
+        let r = call_unary_real(math_rint, 2.5);
+        assert!((r - 3.0).abs() < 1e-15, "rint(2.5) = 3, got {r}");
+    }
+
+    // ---- fabs, cbrt ----
+
+    #[test]
+    fn fabs_negative() {
+        let r = call_unary_real(math_fabs, -3.14);
+        assert!((r - 3.14).abs() < 1e-15, "fabs(-3.14) = 3.14, got {r}");
+    }
+
+    #[test]
+    fn cbrt_27() {
+        let r = call_unary_real(math_cbrt, 27.0);
+        assert!((r - 3.0).abs() < 1e-12, "cbrt(27) = 3, got {r}");
+    }
+
+    // ---- Hyperbolic ----
+
+    #[test]
+    fn sinh_zero() {
+        let r = call_unary_real(math_sinh, 0.0);
+        assert!((r - 0.0).abs() < 1e-15, "sinh(0) = 0, got {r}");
+    }
+
+    #[test]
+    fn cosh_zero() {
+        let r = call_unary_real(math_cosh, 0.0);
+        assert!((r - 1.0).abs() < 1e-15, "cosh(0) = 1, got {r}");
+    }
+
+    #[test]
+    fn tanh_zero() {
+        let r = call_unary_real(math_tanh, 0.0);
+        assert!((r - 0.0).abs() < 1e-15, "tanh(0) = 0, got {r}");
+    }
+
+    // ---- Bit conversion functions ----
+
+    #[test]
+    fn realbits64_roundtrip() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+
+        let original: f64 = 3.14;
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, original);
+        math_realbits64(&mut vm).expect("realbits64 should succeed");
+        let bits = memory::read_big(&vm.frames.data, base + RET_OFF);
+
+        // Now convert back using bits64real
+        let mut vm2 = VmState::new(&module).expect("vm should initialize");
+        let base2 = vm2.frames.current_data_offset();
+        memory::write_big(&mut vm2.frames.data, base2 + ARG1_OFF, bits);
+        math_bits64real(&mut vm2).expect("bits64real should succeed");
+        let result = memory::read_real(&vm2.frames.data, base2 + RET_OFF);
+
+        assert!(
+            (result - original).abs() < 1e-15,
+            "roundtrip: expected {original}, got {result}"
+        );
+    }
+
+    #[test]
+    fn realbits32_roundtrip() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+
+        let original: f64 = 2.5; // exactly representable as f32
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, original);
+        math_realbits32(&mut vm).expect("realbits32 should succeed");
+        let bits = memory::read_word(&vm.frames.data, base + RET_OFF);
+
+        // Now convert back using bits32real
+        let mut vm2 = VmState::new(&module).expect("vm should initialize");
+        let base2 = vm2.frames.current_data_offset();
+        memory::write_word(&mut vm2.frames.data, base2 + ARG1_OFF, bits);
+        math_bits32real(&mut vm2).expect("bits32real should succeed");
+        let result = memory::read_real(&vm2.frames.data, base2 + RET_OFF);
+
+        assert!(
+            (result - original).abs() < 1e-15,
+            "roundtrip: expected {original}, got {result}"
+        );
+    }
+
+    #[test]
+    fn bits64real_known_value() {
+        // IEEE 754: 1.0 as f64 has bits 0x3FF0000000000000
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_big(
+            &mut vm.frames.data,
+            base + ARG1_OFF,
+            0x3FF0000000000000_u64 as i64,
+        );
+        math_bits64real(&mut vm).expect("bits64real should succeed");
+        let result = memory::read_real(&vm.frames.data, base + RET_OFF);
+        assert!(
+            (result - 1.0).abs() < 1e-15,
+            "bits64real(0x3FF0...) = 1.0, got {result}"
+        );
+    }
+
+    // ---- Functions returning int ----
+
+    #[test]
+    fn isnan_detects_nan() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, f64::NAN);
+        math_isnan(&mut vm).expect("isnan should succeed");
+        let result = memory::read_word(&vm.frames.data, base + RET_OFF);
+        assert_eq!(result, 1, "isnan(NaN) should be 1");
+    }
+
+    #[test]
+    fn isnan_rejects_normal() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, 42.0);
+        math_isnan(&mut vm).expect("isnan should succeed");
+        let result = memory::read_word(&vm.frames.data, base + RET_OFF);
+        assert_eq!(result, 0, "isnan(42.0) should be 0");
+    }
+
+    #[test]
+    fn finite_normal() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, 1.0);
+        math_finite(&mut vm).expect("finite should succeed");
+        let result = memory::read_word(&vm.frames.data, base + RET_OFF);
+        assert_eq!(result, 1, "finite(1.0) should be 1");
+    }
+
+    #[test]
+    fn finite_infinity() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, f64::INFINITY);
+        math_finite(&mut vm).expect("finite should succeed");
+        let result = memory::read_word(&vm.frames.data, base + RET_OFF);
+        assert_eq!(result, 0, "finite(inf) should be 0");
+    }
+
+    // ---- Binary real ops ----
+
+    #[test]
+    fn fmod_basic() {
+        let r = call_binary_real(math_fmod, 7.0, 3.0);
+        assert!((r - 1.0).abs() < 1e-12, "fmod(7,3) = 1, got {r}");
+    }
+
+    #[test]
+    fn hypot_3_4() {
+        let r = call_binary_real(math_hypot, 3.0, 4.0);
+        assert!((r - 5.0).abs() < 1e-12, "hypot(3,4) = 5, got {r}");
+    }
+
+    #[test]
+    fn fmax_picks_larger() {
+        let r = call_binary_real(math_fmax, 2.0, 5.0);
+        assert!((r - 5.0).abs() < 1e-15, "fmax(2,5) = 5, got {r}");
+    }
+
+    #[test]
+    fn fmin_picks_smaller() {
+        let r = call_binary_real(math_fmin, 2.0, 5.0);
+        assert!((r - 2.0).abs() < 1e-15, "fmin(2,5) = 2, got {r}");
+    }
+
+    #[test]
+    fn copysign_positive_to_negative() {
+        let r = call_binary_real(math_copysign, 3.0, -1.0);
+        assert!((r - (-3.0)).abs() < 1e-15, "copysign(3,-1) = -3, got {r}");
+    }
+
+    // ---- pow10, scalbn ----
+
+    #[test]
+    fn pow10_two() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_word(&mut vm.frames.data, base + ARG1_OFF, 2);
+        math_pow10(&mut vm).expect("pow10 should succeed");
+        let result = memory::read_real(&vm.frames.data, base + RET_OFF);
+        assert!(
+            (result - 100.0).abs() < 1e-12,
+            "pow10(2) = 100, got {result}"
+        );
+    }
+
+    #[test]
+    fn scalbn_basic() {
+        // scalbn(1.5, 3) = 1.5 * 2^3 = 12.0
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, 1.5);
+        memory::write_word(&mut vm.frames.data, base + ARG2_OFF, 3);
+        math_scalbn(&mut vm).expect("scalbn should succeed");
+        let result = memory::read_real(&vm.frames.data, base + RET_OFF);
+        assert!(
+            (result - 12.0).abs() < 1e-12,
+            "scalbn(1.5,3) = 12.0, got {result}"
+        );
+    }
+
+    // ---- modf ----
+
+    #[test]
+    fn modf_splits_correctly() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, 3.75);
+        math_modf(&mut vm).expect("modf should succeed");
+        let int_part = memory::read_real(&vm.frames.data, base + RET_OFF);
+        let frac_part = memory::read_real(&vm.frames.data, base + RET_OFF + 8);
+        assert!(
+            (int_part - 3.0).abs() < 1e-15,
+            "modf(3.75) int = 3, got {int_part}"
+        );
+        assert!(
+            (frac_part - 0.75).abs() < 1e-15,
+            "modf(3.75) frac = 0.75, got {frac_part}"
+        );
+    }
+
+    // ---- ilogb ----
+
+    #[test]
+    fn ilogb_of_8() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, 8.0);
+        math_ilogb(&mut vm).expect("ilogb should succeed");
+        let result = memory::read_word(&vm.frames.data, base + RET_OFF);
+        assert_eq!(result, 3, "ilogb(8) = 3, got {result}");
+    }
+
+    #[test]
+    fn ilogb_of_zero() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, 0.0);
+        math_ilogb(&mut vm).expect("ilogb should succeed");
+        let result = memory::read_word(&vm.frames.data, base + RET_OFF);
+        assert_eq!(result, i32::MIN, "ilogb(0) = i32::MIN, got {result}");
+    }
+
+    // ---- expm1, log1p ----
+
+    #[test]
+    fn expm1_zero() {
+        let r = call_unary_real(math_expm1, 0.0);
+        assert!((r - 0.0).abs() < 1e-15, "expm1(0) = 0, got {r}");
+    }
+
+    #[test]
+    fn log1p_zero() {
+        let r = call_unary_real(math_log1p, 0.0);
+        assert!((r - 0.0).abs() < 1e-15, "log1p(0) = 0, got {r}");
+    }
+
+    // ---- fdim ----
+
+    #[test]
+    fn fdim_positive_diff() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, 5.0);
+        memory::write_real(&mut vm.frames.data, base + ARG2_OFF, 3.0);
+        math_fdim(&mut vm).expect("fdim should succeed");
+        let result = memory::read_real(&vm.frames.data, base + RET_OFF);
+        assert!((result - 2.0).abs() < 1e-15, "fdim(5,3) = 2, got {result}");
+    }
+
+    #[test]
+    fn fdim_negative_diff_returns_zero() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let base = vm.frames.current_data_offset();
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, 3.0);
+        memory::write_real(&mut vm.frames.data, base + ARG2_OFF, 5.0);
+        math_fdim(&mut vm).expect("fdim should succeed");
+        let result = memory::read_real(&vm.frames.data, base + RET_OFF);
+        assert!((result - 0.0).abs() < 1e-15, "fdim(3,5) = 0, got {result}");
+    }
+
+    // ---- getFPcontrol / getFPstatus ----
+
+    #[test]
+    fn get_fp_control_returns_zero() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        math_get_fp_control(&mut vm).expect("getFPcontrol should succeed");
+        let base = vm.frames.current_data_offset();
+        let result = memory::read_word(&vm.frames.data, base + RET_OFF);
+        assert_eq!(result, 0, "getFPcontrol should return 0");
+    }
+
+    #[test]
+    fn get_fp_status_returns_zero() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        math_get_fp_status(&mut vm).expect("getFPstatus should succeed");
+        let base = vm.frames.current_data_offset();
+        let result = memory::read_word(&vm.frames.data, base + RET_OFF);
+        assert_eq!(result, 0, "getFPstatus should return 0");
+    }
+
+    // ---- create_math_module ----
+
+    #[test]
+    fn create_math_module_has_expected_functions() {
+        let m = create_math_module();
+        assert_eq!(m.name, "$Math");
+        let names: Vec<&str> = m.funcs.iter().map(|f| f.name).collect();
+        assert!(names.contains(&"sin"), "should contain sin");
+        assert!(names.contains(&"cos"), "should contain cos");
+        assert!(names.contains(&"sqrt"), "should contain sqrt");
+        assert!(names.contains(&"pow"), "should contain pow");
+        assert!(names.contains(&"log"), "should contain log");
+        assert!(names.contains(&"floor"), "should contain floor");
+        assert!(names.contains(&"ceil"), "should contain ceil");
+    }
+}

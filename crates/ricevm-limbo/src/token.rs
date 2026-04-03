@@ -184,3 +184,54 @@ impl TokenKind {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyword_returns_correct_token_kinds() {
+        assert_eq!(TokenKind::keyword("if"), Some(TokenKind::If));
+        assert_eq!(TokenKind::keyword("else"), Some(TokenKind::Else));
+        assert_eq!(TokenKind::keyword("while"), Some(TokenKind::While));
+        assert_eq!(TokenKind::keyword("for"), Some(TokenKind::For));
+        assert_eq!(TokenKind::keyword("fn"), Some(TokenKind::Fn));
+        assert_eq!(TokenKind::keyword("return"), Some(TokenKind::Return));
+        assert_eq!(TokenKind::keyword("int"), Some(TokenKind::Int));
+        assert_eq!(TokenKind::keyword("string"), Some(TokenKind::String_));
+        assert_eq!(TokenKind::keyword("nil"), Some(TokenKind::Nil));
+        assert_eq!(TokenKind::keyword("module"), Some(TokenKind::Module));
+        assert_eq!(TokenKind::keyword("implement"), Some(TokenKind::Implement));
+        assert_eq!(TokenKind::keyword("include"), Some(TokenKind::Include));
+        assert_eq!(TokenKind::keyword("con"), Some(TokenKind::Con));
+        assert_eq!(TokenKind::keyword("adt"), Some(TokenKind::Adt));
+        assert_eq!(TokenKind::keyword("ref"), Some(TokenKind::Ref));
+        assert_eq!(TokenKind::keyword("chan"), Some(TokenKind::Chan));
+        assert_eq!(TokenKind::keyword("array"), Some(TokenKind::Array));
+        assert_eq!(TokenKind::keyword("list"), Some(TokenKind::List));
+        assert_eq!(TokenKind::keyword("self"), Some(TokenKind::Self_));
+        assert_eq!(TokenKind::keyword("spawn"), Some(TokenKind::Spawn));
+        assert_eq!(TokenKind::keyword("raise"), Some(TokenKind::Raise));
+        assert_eq!(TokenKind::keyword("iota"), Some(TokenKind::Iota));
+        assert_eq!(TokenKind::keyword("exception"), Some(TokenKind::Exception));
+    }
+
+    #[test]
+    fn keyword_returns_none_for_non_keywords() {
+        assert_eq!(TokenKind::keyword("foo"), None);
+        assert_eq!(TokenKind::keyword("bar"), None);
+        assert_eq!(TokenKind::keyword("main"), None);
+        assert_eq!(TokenKind::keyword("init"), None);
+        assert_eq!(TokenKind::keyword(""), None);
+        assert_eq!(TokenKind::keyword("IF"), None);
+        assert_eq!(TokenKind::keyword("Int"), None);
+        assert_eq!(TokenKind::keyword("123"), None);
+    }
+
+    #[test]
+    fn span_default() {
+        let s = Span::default();
+        assert_eq!(s.line, 0);
+        assert_eq!(s.col, 0);
+    }
+}

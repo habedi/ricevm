@@ -242,3 +242,364 @@ pub(crate) fn op_tail(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     };
     vm.move_ptr_to_dst(tail_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap, RuntimeFlags,
+        TypeDescriptor, XMAGIC,
+    };
+
+    use super::*;
+    use crate::address::AddrTarget;
+
+    fn test_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "list_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    #[test]
+    fn consw_creates_single_element_list() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // dst starts as NIL (empty list)
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 42;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_consw(&mut vm).expect("consw should succeed");
+
+        let list_id = memory::read_word(&vm.frames.data, fp) as HeapId;
+        assert_ne!(list_id, heap::NIL);
+
+        let obj = vm.heap.get(list_id).expect("list should exist");
+        match &obj.data {
+            HeapData::List { head, tail } => {
+                assert_eq!(memory::read_word(head, 0), 42);
+                assert_eq!(*tail, heap::NIL);
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn consw_prepends_to_existing_list() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Build list [10] first
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 10;
+        vm.dst = AddrTarget::Frame(fp);
+        op_consw(&mut vm).expect("consw should succeed");
+
+        // Prepend 20 -> [20, 10]
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 20;
+        vm.dst = AddrTarget::Frame(fp);
+        op_consw(&mut vm).expect("consw should succeed");
+
+        let list_id = memory::read_word(&vm.frames.data, fp) as HeapId;
+        let obj = vm.heap.get(list_id).expect("list should exist");
+        match &obj.data {
+            HeapData::List { head, tail } => {
+                assert_eq!(memory::read_word(head, 0), 20);
+                assert_ne!(*tail, heap::NIL);
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn consp_creates_list_of_pointers() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let str_id = vm.heap.alloc(0, HeapData::Str("hello".to_string()));
+
+        // dst = NIL (empty list)
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = str_id as i32;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_consp(&mut vm).expect("consp should succeed");
+
+        let list_id = memory::read_word(&vm.frames.data, fp) as HeapId;
+        assert_ne!(list_id, heap::NIL);
+
+        let obj = vm.heap.get(list_id).expect("list should exist");
+        match &obj.data {
+            HeapData::List { head, tail } => {
+                assert_eq!(memory::read_word(head, 0) as HeapId, str_id);
+                assert_eq!(*tail, heap::NIL);
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn headw_extracts_head_value() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let list_id = vm.heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![99, 0, 0, 0],
+                tail: heap::NIL,
+            },
+        );
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = list_id as i32;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_headw(&mut vm).expect("headw should succeed");
+        assert_eq!(memory::read_word(&vm.frames.data, fp), 99);
+    }
+
+    #[test]
+    fn headp_extracts_pointer_head() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let str_id = vm.heap.alloc(0, HeapData::Str("world".to_string()));
+        let mut head_bytes = vec![0u8; 4];
+        memory::write_word(&mut head_bytes, 0, str_id as i32);
+
+        let list_id = vm.heap.alloc(
+            0,
+            HeapData::List {
+                head: head_bytes,
+                tail: heap::NIL,
+            },
+        );
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = list_id as i32;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_headp(&mut vm).expect("headp should succeed");
+        assert_eq!(memory::read_word(&vm.frames.data, fp) as HeapId, str_id);
+    }
+
+    #[test]
+    fn headw_of_nil_returns_zero() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = heap::NIL as i32;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_headw(&mut vm).expect("headw of nil should succeed");
+        assert_eq!(memory::read_word(&vm.frames.data, fp), 0);
+    }
+
+    #[test]
+    fn headb_extracts_byte_head() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let list_id = vm.heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![0xAB],
+                tail: heap::NIL,
+            },
+        );
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = list_id as i32;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_headb(&mut vm).expect("headb should succeed");
+        assert_eq!(vm.frames.data[fp], 0xAB);
+    }
+
+    #[test]
+    fn tail_advances_to_next_node() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let second = vm.heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![2, 0, 0, 0],
+                tail: heap::NIL,
+            },
+        );
+        let first = vm.heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![1, 0, 0, 0],
+                tail: second,
+            },
+        );
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = first as i32;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_tail(&mut vm).expect("tail should succeed");
+        let result = memory::read_word(&vm.frames.data, fp) as HeapId;
+        assert_eq!(result, second);
+    }
+
+    #[test]
+    fn tail_of_nil_returns_nil() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = heap::NIL as i32;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_tail(&mut vm).expect("tail of nil should succeed");
+        assert_eq!(memory::read_word(&vm.frames.data, fp) as HeapId, heap::NIL);
+    }
+
+    #[test]
+    fn tail_of_single_element_returns_nil() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let single = vm.heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![1, 0, 0, 0],
+                tail: heap::NIL,
+            },
+        );
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = single as i32;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_tail(&mut vm).expect("tail should succeed");
+        assert_eq!(memory::read_word(&vm.frames.data, fp) as HeapId, heap::NIL);
+    }
+
+    #[test]
+    fn consb_creates_byte_list() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 0x42;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_consb(&mut vm).expect("consb should succeed");
+
+        let list_id = memory::read_word(&vm.frames.data, fp) as HeapId;
+        let obj = vm.heap.get(list_id).expect("list should exist");
+        match &obj.data {
+            HeapData::List { head, tail } => {
+                assert_eq!(head.len(), 1);
+                assert_eq!(head[0], 0x42);
+                assert_eq!(*tail, heap::NIL);
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_consw_headw_tail() {
+        // Build [30, 20, 10], then extract head+tail to verify structure
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Start with NIL
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+
+        // cons 10 -> [10]
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 10;
+        vm.dst = AddrTarget::Frame(fp);
+        op_consw(&mut vm).expect("consw 10");
+
+        // cons 20 -> [20, 10]
+        vm.imm_src = 20;
+        op_consw(&mut vm).expect("consw 20");
+
+        // cons 30 -> [30, 20, 10]
+        vm.imm_src = 30;
+        op_consw(&mut vm).expect("consw 30");
+
+        // headw -> 30
+        let list_id = memory::read_word(&vm.frames.data, fp) as HeapId;
+        let fp2 = fp + 4;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = list_id as i32;
+        vm.dst = AddrTarget::Frame(fp2);
+        op_headw(&mut vm).expect("headw");
+        assert_eq!(memory::read_word(&vm.frames.data, fp2), 30);
+
+        // tail -> rest = [20, 10]
+        let fp3 = fp + 8;
+        memory::write_word(&mut vm.frames.data, fp3, heap::NIL as i32);
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = list_id as i32;
+        vm.dst = AddrTarget::Frame(fp3);
+        op_tail(&mut vm).expect("tail");
+        let rest_id = memory::read_word(&vm.frames.data, fp3) as HeapId;
+        assert_ne!(rest_id, heap::NIL);
+
+        // headw of rest -> 20
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = rest_id as i32;
+        vm.dst = AddrTarget::Frame(fp2);
+        op_headw(&mut vm).expect("headw of rest");
+        assert_eq!(memory::read_word(&vm.frames.data, fp2), 20);
+    }
+}

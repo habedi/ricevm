@@ -484,8 +484,8 @@ mod tests {
         if (0..=63).contains(&value) {
             vec![value as u8]
         } else if (-64..=-1).contains(&value) {
-            // 0x40 range: byte = value & 0xFF, which will have bits[7:6] = 01
-            vec![(value & 0xFF) as u8]
+            // 1-byte signed: top 2 bits = 01, low 6 bits carry the sign-extended value.
+            vec![0x40 | ((value & 0x3F) as u8)]
         } else {
             // Use 4-byte encoding for simplicity
             let mut buf = [0u8; 4];
@@ -671,5 +671,404 @@ mod tests {
         assert_eq!(exports[0].frame_type, 1);
         assert_eq!(exports[0].signature, 0x12345678);
         assert_eq!(exports[0].name, "init");
+    }
+
+    /// Regression: `encode_operand` must produce bytes that round-trip through
+    /// `Reader::read_operand` for every representable value, including the
+    /// 1-byte signed range (-64..=-1). An earlier version of this helper
+    /// masked the value with `0xFF`, which placed `11` in the top two bits
+    /// and misled the reader into parsing a 4-byte operand, corrupting every
+    /// test that passed a negative value through the helper.
+    #[test]
+    fn encode_operand_roundtrips_for_all_ranges() {
+        // The helper uses 1-byte encodings for small values and 4-byte
+        // encoding otherwise. The 4-byte Dis operand sign-extends from bit 5
+        // of the first byte, so the representable range is roughly ±2^29.
+        // Stay inside that range so the roundtrip assertion is well-defined.
+        let cases = [
+            0,
+            1,
+            63, // 1-byte positive
+            -1,
+            -2,
+            -32,
+            -64, // 1-byte signed (the regression range)
+            64,
+            100,
+            8191,
+            -65,
+            -8192, // 4-byte encoding
+            (1 << 29) - 1,
+            -(1 << 29), // edges of the 4-byte sign-extension window
+        ];
+        for value in cases {
+            let bytes = encode_operand(value);
+            let mut r = Reader::new(&bytes);
+            let decoded = r
+                .read_operand("roundtrip")
+                .unwrap_or_else(|e| panic!("read_operand failed for value {value}: {e:?}"));
+            assert_eq!(
+                decoded, value,
+                "encode_operand({value}) -> {bytes:?} decoded as {decoded}"
+            );
+            assert!(
+                r.read_byte("after").is_err(),
+                "encode_operand({value}) produced extra bytes: {bytes:?}"
+            );
+        }
+    }
+
+    /// Double-indirect addressing modes (src/dst codes 4 and 5) must read two
+    /// operand registers, not one. A regression that reads only one would
+    /// desynchronize every subsequent instruction.
+    #[test]
+    fn parse_code_double_indirect_reads_two_registers() {
+        let mut bytes = Vec::new();
+        // addr_code: mid=0, src=5 (double-indirect fp), dst=4 (double-indirect mp)
+        //   0b00_101_100 = 0x2C
+        bytes.push(Opcode::Addw as u8);
+        bytes.push(0x2C);
+        bytes.extend(encode_operand(12)); // src register1
+        bytes.extend(encode_operand(4)); // src register2
+        bytes.extend(encode_operand(7)); // dst register1
+        bytes.extend(encode_operand(8)); // dst register2
+
+        let mut r = Reader::new(&bytes);
+        let code = parse_code(&mut r, 1).unwrap();
+
+        assert_eq!(code[0].source.mode, AddressMode::OffsetDoubleIndirectFp);
+        assert_eq!(code[0].source.register1, 12);
+        assert_eq!(code[0].source.register2, 4);
+        assert_eq!(
+            code[0].destination.mode,
+            AddressMode::OffsetDoubleIndirectMp
+        );
+        assert_eq!(code[0].destination.register1, 7);
+        assert_eq!(code[0].destination.register2, 8);
+        // No bytes should remain unread.
+        assert!(
+            r.read_byte("after").is_err(),
+            "parser left bytes behind -> misaligned reads"
+        );
+    }
+
+    /// Non-double-indirect modes must leave register2 at its default (0).
+    #[test]
+    fn parse_code_single_indirect_leaves_register2_zero() {
+        let mut bytes = Vec::new();
+        // mid=0, src=2 (immediate), dst=0 (indirect mp)
+        //   0b00_010_000 = 0x10
+        bytes.push(Opcode::Movw as u8);
+        bytes.push(0x10);
+        bytes.extend(encode_operand(5)); // src immediate value
+        bytes.extend(encode_operand(16)); // dst mp offset
+
+        let mut r = Reader::new(&bytes);
+        let code = parse_code(&mut r, 1).unwrap();
+
+        assert_eq!(code[0].source.mode, AddressMode::Immediate);
+        assert_eq!(code[0].source.register1, 5);
+        assert_eq!(code[0].source.register2, 0);
+        assert_eq!(code[0].destination.mode, AddressMode::OffsetIndirectMp);
+        assert_eq!(code[0].destination.register1, 16);
+        assert_eq!(code[0].destination.register2, 0);
+        assert!(r.read_byte("after").is_err());
+    }
+
+    /// All three middle-operand modes must parse a single register value.
+    #[test]
+    fn parse_code_middle_operand_modes() {
+        let triples = [
+            (1u8, MiddleMode::SmallImmediate, 42),
+            (2u8, MiddleMode::SmallOffsetFp, 12),
+            (3u8, MiddleMode::SmallOffsetMp, 20),
+        ];
+        for (mid_bits, expected_mode, mid_val) in triples {
+            let mut bytes = Vec::new();
+            // src=3 (unused), dst=3 (unused) -> 0b??_011_011 with ?? being mid
+            let addr_code = (mid_bits << 6) | 0x1B;
+            bytes.push(Opcode::Addw as u8);
+            bytes.push(addr_code);
+            bytes.extend(encode_operand(mid_val));
+
+            let mut r = Reader::new(&bytes);
+            let code = parse_code(&mut r, 1).unwrap();
+
+            assert_eq!(code[0].middle.mode, expected_mode);
+            assert_eq!(code[0].middle.register1, mid_val);
+            assert!(
+                r.read_byte("after").is_err(),
+                "unread bytes for mid mode {mid_bits}"
+            );
+        }
+    }
+
+    /// Address mode bits 6 and 7 are reserved: the decoder must reject them.
+    #[test]
+    fn parse_code_rejects_invalid_address_mode() {
+        for invalid in [6u8, 7u8] {
+            let mut bytes = Vec::new();
+            // src = invalid, dst = 3 (unused)
+            let addr_code = (invalid << 3) | 0x03;
+            bytes.push(Opcode::Exit as u8);
+            bytes.push(addr_code);
+
+            let mut r = Reader::new(&bytes);
+            let result = parse_code(&mut r, 1);
+            assert!(
+                matches!(result, Err(LoadError::InvalidAddressMode(m)) if m == invalid),
+                "address mode {invalid} should be rejected, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_code_rejects_invalid_opcode() {
+        let bytes = vec![0xFFu8, 0x1B];
+        let mut r = Reader::new(&bytes);
+        let result = parse_code(&mut r, 1);
+        assert!(
+            matches!(result, Err(LoadError::InvalidOpcode(0xFF))),
+            "0xFF should be rejected as an unknown opcode, got {result:?}"
+        );
+    }
+
+    /// value_bit64 with the high bit of the upper word set must decode as a
+    /// negative i64, not a positive value from sign-ignored bit munging.
+    #[test]
+    fn parse_data_bigs_preserves_negative_sign() {
+        let mut bytes = Vec::new();
+        // datum code: type=8 (bigs), count=2
+        bytes.push(0x82);
+        // offset = 8
+        bytes.extend(encode_operand(8));
+        // first: -1 (0xFFFFFFFF_FFFFFFFF) big-endian
+        bytes.extend(&[0xFF; 8]);
+        // second: i64::MIN
+        bytes.extend(&[0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        // terminator
+        bytes.push(0x00);
+
+        let mut r = Reader::new(&bytes);
+        let data = parse_data(&mut r).unwrap();
+
+        match &data[0] {
+            DataItem::Bigs { offset, values } => {
+                assert_eq!(*offset, 8);
+                assert_eq!(values, &[-1i64, i64::MIN]);
+            }
+            other => panic!("expected Bigs, got {other:?}"),
+        }
+    }
+
+    /// The data section must chain multiple items (bytes, array, set_array,
+    /// restore_base) terminated by a zero byte.
+    #[test]
+    fn parse_data_chains_items_and_terminates() {
+        let mut bytes = Vec::new();
+        // array: type=5 count=0 -> inline extended count
+        bytes.push(0x50);
+        bytes.extend(encode_operand(1)); // count (extended)
+        bytes.extend(encode_operand(0)); // offset
+        bytes.extend(&[0x00, 0x00, 0x00, 0x02]); // element_type
+        bytes.extend(&[0x00, 0x00, 0x00, 0x04]); // length
+        // set_array: type=6 count=1
+        bytes.push(0x61);
+        bytes.extend(encode_operand(0)); // offset
+        bytes.extend(&[0x00, 0x00, 0x00, 0x00]); // index
+        // bytes item: type=1 count=3
+        bytes.push(0x13);
+        bytes.extend(encode_operand(0)); // offset
+        bytes.extend(&[0xAA, 0xBB, 0xCC]);
+        // restore_load_address: type=7 count=1 (embed count to avoid extended read)
+        bytes.push(0x71);
+        bytes.extend(encode_operand(0)); // offset (unused but still consumed)
+        // terminator
+        bytes.push(0x00);
+
+        let mut r = Reader::new(&bytes);
+        let items = parse_data(&mut r).unwrap();
+
+        assert_eq!(items.len(), 4);
+        matches!(items[0], DataItem::Array { .. });
+        matches!(items[1], DataItem::SetArray { .. });
+        if let DataItem::Bytes { values, .. } = &items[2] {
+            assert_eq!(values, &vec![0xAAu8, 0xBB, 0xCC]);
+        } else {
+            panic!("expected Bytes");
+        }
+        matches!(items[3], DataItem::RestoreBase);
+    }
+
+    /// Unknown data item type 9 must raise InvalidDataType, not be silently
+    /// skipped. Accidental acceptance would corrupt the MP.
+    #[test]
+    fn parse_data_rejects_unknown_item_type() {
+        let mut bytes = Vec::new();
+        bytes.push(0x91); // type=9, count=1
+        bytes.extend(encode_operand(0));
+        let mut r = Reader::new(&bytes);
+        let result = parse_data(&mut r);
+        assert!(
+            matches!(result, Err(LoadError::InvalidDataType(9))),
+            "data type 9 should be rejected, got {result:?}"
+        );
+    }
+
+    /// Handler section encodes named cases followed by a wildcard pc. The
+    /// decoder appends a wildcard `ExceptionCase` with `name == None` for it.
+    #[test]
+    fn parse_handlers_named_cases_plus_wildcard() {
+        let mut bytes = Vec::new();
+        bytes.extend(encode_operand(1)); // handler count
+        bytes.extend(encode_operand(16)); // exception_offset
+        bytes.extend(encode_operand(0)); // begin_pc
+        bytes.extend(encode_operand(10)); // end_pc
+        bytes.extend(encode_operand(-1)); // type_desc_number (-> None)
+        // packed_cases: exception_type_count (upper 16) = 1, total_count (lower 16) = 2
+        bytes.extend(encode_operand((1 << 16) | 2));
+        bytes.extend(b"oops\0");
+        bytes.extend(encode_operand(5)); // pc for "oops"
+        bytes.extend(b"bad\0");
+        bytes.extend(encode_operand(6)); // pc for "bad"
+        bytes.extend(encode_operand(7)); // wildcard pc
+        bytes.push(0x00); // trailing null
+
+        let mut r = Reader::new(&bytes);
+        let handlers = parse_handlers(&mut r).unwrap();
+
+        assert_eq!(handlers.len(), 1);
+        let h = &handlers[0];
+        assert_eq!(h.exception_offset, 16);
+        assert_eq!(h.begin_pc, 0);
+        assert_eq!(h.end_pc, 10);
+        assert_eq!(h.type_descriptor, None);
+        // Two named cases plus an appended wildcard.
+        assert_eq!(h.cases.len(), 3);
+        assert_eq!(h.cases[0].name.as_deref(), Some("oops"));
+        assert_eq!(h.cases[0].pc, 5);
+        assert_eq!(h.cases[1].name.as_deref(), Some("bad"));
+        assert_eq!(h.cases[1].pc, 6);
+        assert!(h.cases[2].name.is_none(), "last case must be the wildcard");
+        assert_eq!(h.cases[2].pc, 7);
+    }
+
+    /// Handler section without a trailing null byte must error, not succeed.
+    #[test]
+    fn parse_handlers_missing_trailing_null_errors() {
+        let mut bytes = Vec::new();
+        bytes.extend(encode_operand(0)); // 0 handlers
+        bytes.push(0x01); // wrong terminator
+
+        let mut r = Reader::new(&bytes);
+        let result = parse_handlers(&mut r);
+        assert!(matches!(result, Err(LoadError::Other(_))));
+    }
+
+    /// Import section decodes multiple modules with multiple functions and
+    /// requires a trailing null byte.
+    #[test]
+    fn parse_imports_multiple_modules_with_trailing_null() {
+        let mut bytes = Vec::new();
+        bytes.extend(encode_operand(2)); // 2 modules
+        // module 0: 1 function
+        bytes.extend(encode_operand(1));
+        bytes.extend(&[0xAA, 0xBB, 0xCC, 0xDD]); // signature
+        bytes.extend(b"foo\0");
+        // module 1: 2 functions
+        bytes.extend(encode_operand(2));
+        bytes.extend(&[0x11, 0x22, 0x33, 0x44]);
+        bytes.extend(b"bar\0");
+        bytes.extend(&[0x55, 0x66, 0x77, 0x88]);
+        bytes.extend(b"baz\0");
+        bytes.push(0x00); // trailing null
+
+        let mut r = Reader::new(&bytes);
+        let imports = parse_imports(&mut r).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].functions.len(), 1);
+        assert_eq!(imports[0].functions[0].name, "foo");
+        assert_eq!(imports[0].functions[0].signature, 0xAABB_CCDDu32 as i32);
+        assert_eq!(imports[1].functions.len(), 2);
+        assert_eq!(imports[1].functions[0].name, "bar");
+        assert_eq!(imports[1].functions[1].name, "baz");
+    }
+
+    /// Build a module buffer with custom header fields and empty sections,
+    /// so validation tests can target specific header invariants.
+    fn build_module_for_validation(
+        code_size: i32,
+        type_size: i32,
+        entry_pc: i32,
+        entry_type: i32,
+        runtime_flags: u32,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(encode_operand(XMAGIC));
+        bytes.extend(encode_operand(runtime_flags as i32));
+        bytes.extend(encode_operand(0)); // stack_extent
+        bytes.extend(encode_operand(code_size));
+        bytes.extend(encode_operand(0)); // data_size
+        bytes.extend(encode_operand(type_size));
+        bytes.extend(encode_operand(0)); // export_size
+        bytes.extend(encode_operand(entry_pc));
+        bytes.extend(encode_operand(entry_type));
+        for _ in 0..code_size {
+            bytes.push(Opcode::Exit as u8);
+            bytes.push(0x1B);
+        }
+        for _ in 0..type_size {
+            bytes.extend(encode_operand(0)); // id
+            bytes.extend(encode_operand(0)); // size
+            bytes.extend(encode_operand(0)); // map_in_bytes
+        }
+        bytes.push(0x00); // data terminator
+        bytes.extend(b"m\0"); // name
+        bytes
+    }
+
+    /// Entry PC outside the code range must fail validation. entry_pc == -1 is
+    /// the only valid out-of-range value (library modules).
+    #[test]
+    fn validate_rejects_entry_pc_beyond_code() {
+        let bytes = build_module_for_validation(2, 1, 5, 0, 0);
+        let mut r = Reader::new(&bytes);
+        let result = parse_module(&mut r);
+        match result {
+            Err(LoadError::ValidationError(msg)) => {
+                assert!(
+                    msg.contains("entry_pc"),
+                    "error should mention entry_pc, got: {msg}"
+                );
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
+    }
+
+    /// entry_pc == -1 is valid (library module with no entry function).
+    #[test]
+    fn validate_accepts_entry_pc_minus_one_for_library_modules() {
+        let bytes = build_module_for_validation(1, 1, -1, 0, 0);
+        let mut r = Reader::new(&bytes);
+        parse_module(&mut r).expect("entry_pc == -1 must be accepted");
+    }
+
+    /// Setting both MUST_COMPILE and DONT_COMPILE is contradictory.
+    #[test]
+    fn validate_rejects_conflicting_compile_flags() {
+        let flags = RuntimeFlags::MUST_COMPILE.0 | RuntimeFlags::DONT_COMPILE.0;
+        let bytes = build_module_for_validation(1, 1, 0, 0, flags);
+        let mut r = Reader::new(&bytes);
+        let result = parse_module(&mut r);
+        match result {
+            Err(LoadError::ValidationError(msg)) => {
+                assert!(
+                    msg.contains("MUST_COMPILE") && msg.contains("DONT_COMPILE"),
+                    "error should mention both flags, got: {msg}"
+                );
+            }
+            other => panic!("expected ValidationError, got {other:?}"),
+        }
     }
 }

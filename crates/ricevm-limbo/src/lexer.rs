@@ -680,4 +680,165 @@ include "sys.m";
             ]
         );
     }
+
+    #[test]
+    fn char_literal() {
+        let tokens = lex("'a' '\\n' '\\t'");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::CharLit(b'a' as i32),
+                TokenKind::CharLit(b'\n' as i32),
+                TokenKind::CharLit(b'\t' as i32),
+            ]
+        );
+    }
+
+    #[test]
+    fn string_escapes() {
+        let tokens = lex(r#""hello\tworld\n""#);
+        assert_eq!(
+            tokens,
+            vec![TokenKind::StringLit("hello\tworld\n".to_string())]
+        );
+    }
+
+    #[test]
+    fn radix_literal() {
+        let tokens = lex("8r77 2r1010");
+        assert_eq!(
+            tokens,
+            vec![TokenKind::IntLit(0o77), TokenKind::IntLit(0b1010)]
+        );
+    }
+
+    #[test]
+    fn assignment_operators() {
+        let tokens = lex("+= -= *= /= %= &= |= ^= <<= >>=");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::PlusEq,
+                TokenKind::MinusEq,
+                TokenKind::StarEq,
+                TokenKind::SlashEq,
+                TokenKind::PercentEq,
+                TokenKind::AmpEq,
+                TokenKind::PipeEq,
+                TokenKind::CaretEq,
+                TokenKind::LshiftEq,
+                TokenKind::RshiftEq,
+            ]
+        );
+    }
+
+    #[test]
+    fn comparison_operators() {
+        let tokens = lex("== != < > <= >=");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Eq,
+                TokenKind::Neq,
+                TokenKind::Lt,
+                TokenKind::Gt,
+                TokenKind::Leq,
+                TokenKind::Geq,
+            ]
+        );
+    }
+
+    #[test]
+    fn delimiters() {
+        let tokens = lex("( ) [ ] { }");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::LBracket,
+                TokenKind::RBracket,
+                TokenKind::LBrace,
+                TokenKind::RBrace,
+            ]
+        );
+    }
+
+    #[test]
+    fn punctuation() {
+        let tokens = lex(", . ; : :=");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::Comma,
+                TokenKind::Dot,
+                TokenKind::Semicolon,
+                TokenKind::Colon,
+                TokenKind::ColonEq,
+            ]
+        );
+    }
+
+    #[test]
+    fn increment_decrement() {
+        let tokens = lex("++ --");
+        assert_eq!(tokens, vec![TokenKind::Inc, TokenKind::Dec]);
+    }
+
+    #[test]
+    fn logical_operators() {
+        let tokens = lex("&& || ! ~");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::AndAnd,
+                TokenKind::OrOr,
+                TokenKind::Bang,
+                TokenKind::Tilde
+            ]
+        );
+    }
+
+    #[test]
+    fn trailing_dot_float() {
+        let tokens = lex("1000. 5.");
+        assert_eq!(
+            tokens,
+            vec![TokenKind::RealLit(1000.0), TokenKind::RealLit(5.0)]
+        );
+    }
+
+    #[test]
+    fn leading_dot_float() {
+        let tokens = lex(".5 .001");
+        assert_eq!(
+            tokens,
+            vec![TokenKind::RealLit(0.5), TokenKind::RealLit(0.001)]
+        );
+    }
+
+    #[test]
+    fn empty_string() {
+        let tokens = lex(r#""""#);
+        assert_eq!(tokens, vec![TokenKind::StringLit(String::new())]);
+    }
+
+    #[test]
+    fn consecutive_keywords() {
+        let tokens = lex("if else while for do case alt pick spawn");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::If,
+                TokenKind::Else,
+                TokenKind::While,
+                TokenKind::For,
+                TokenKind::Do,
+                TokenKind::Case,
+                TokenKind::Alt,
+                TokenKind::Pick,
+                TokenKind::Spawn,
+            ]
+        );
+    }
 }

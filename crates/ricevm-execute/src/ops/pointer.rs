@@ -729,4 +729,420 @@ mod tests {
             "error should mention negative: {err}"
         );
     }
+
+    #[test]
+    fn indx_returns_correct_element_offset() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Array of 4 elements, elem_size=4
+        let mut data = vec![0u8; 16];
+        for i in 0..4i32 {
+            memory::write_word(&mut data, i as usize * 4, (i + 1) * 100);
+        }
+        let arr_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data,
+                length: 4,
+            },
+        );
+
+        // Index element 2 (byte offset 8)
+        memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp + 8, 2);
+        vm.dst = AddrTarget::Frame(fp + 8);
+        vm.mid = AddrTarget::Frame(fp + 4);
+
+        op_indx(&mut vm).expect("indx should succeed");
+
+        let encoded = memory::read_word(&vm.frames.data, fp + 4);
+        assert!(encoded & crate::address::HEAP_REF_FLAG != 0);
+        let ref_idx = (encoded & !crate::address::HEAP_REF_FLAG) as usize;
+        let (ref_id, ref_offset) = vm.heap_refs[ref_idx];
+        assert_eq!(ref_id, arr_id);
+        assert_eq!(ref_offset, 8); // index 2 * elem_size 4
+    }
+
+    #[test]
+    fn indx_element_zero_offset() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let arr_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0u8; 20],
+                length: 5,
+            },
+        );
+
+        memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp + 8, 0);
+        vm.dst = AddrTarget::Frame(fp + 8);
+        vm.mid = AddrTarget::Frame(fp + 4);
+
+        op_indx(&mut vm).expect("indx at 0 should succeed");
+
+        let encoded = memory::read_word(&vm.frames.data, fp + 4);
+        let ref_idx = (encoded & !crate::address::HEAP_REF_FLAG) as usize;
+        let (ref_id, ref_offset) = vm.heap_refs[ref_idx];
+        assert_eq!(ref_id, arr_id);
+        assert_eq!(ref_offset, 0);
+    }
+
+    #[test]
+    fn indw_indb_indf_delegate_to_indx() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Array with elem_size=1 (byte array), 10 elements
+        let arr_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: vec![0u8; 10],
+                length: 10,
+            },
+        );
+
+        // Test op_indb
+        memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp + 8, 3);
+        vm.dst = AddrTarget::Frame(fp + 8);
+        vm.mid = AddrTarget::Frame(fp + 4);
+
+        op_indb(&mut vm).expect("indb should succeed");
+        let encoded = memory::read_word(&vm.frames.data, fp + 4);
+        let ref_idx = (encoded & !crate::address::HEAP_REF_FLAG) as usize;
+        let (_, ref_offset) = vm.heap_refs[ref_idx];
+        assert_eq!(ref_offset, 3); // index 3 * elem_size 1
+
+        // Test op_indw with elem_size=4
+        let arr_id2 = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0u8; 20],
+                length: 5,
+            },
+        );
+        memory::write_word(&mut vm.frames.data, fp, arr_id2 as i32);
+        vm.src = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp + 8, 2);
+        vm.dst = AddrTarget::Frame(fp + 8);
+        vm.mid = AddrTarget::Frame(fp + 4);
+
+        op_indw(&mut vm).expect("indw should succeed");
+        let encoded = memory::read_word(&vm.frames.data, fp + 4);
+        let ref_idx = (encoded & !crate::address::HEAP_REF_FLAG) as usize;
+        let (_, ref_offset) = vm.heap_refs[ref_idx];
+        assert_eq!(ref_offset, 8); // index 2 * elem_size 4
+
+        // Test op_indf with elem_size=8 (float/real)
+        let arr_id3 = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 8,
+                data: vec![0u8; 24],
+                length: 3,
+            },
+        );
+        memory::write_word(&mut vm.frames.data, fp, arr_id3 as i32);
+        vm.src = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp + 8, 1);
+        vm.dst = AddrTarget::Frame(fp + 8);
+        vm.mid = AddrTarget::Frame(fp + 4);
+
+        op_indf(&mut vm).expect("indf should succeed");
+        let encoded = memory::read_word(&vm.frames.data, fp + 4);
+        let ref_idx = (encoded & !crate::address::HEAP_REF_FLAG) as usize;
+        let (_, ref_offset) = vm.heap_refs[ref_idx];
+        assert_eq!(ref_offset, 8); // index 1 * elem_size 8
+    }
+
+    #[test]
+    fn lena_returns_correct_array_length() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let arr_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0u8; 28],
+                length: 7,
+            },
+        );
+
+        memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_lena(&mut vm).expect("lena should succeed");
+        let len = memory::read_word(&vm.frames.data, fp + 4);
+        assert_eq!(len, 7);
+    }
+
+    #[test]
+    fn lena_nil_returns_zero() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_lena(&mut vm).expect("lena on nil should succeed");
+        let len = memory::read_word(&vm.frames.data, fp + 4);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn lena_on_non_array_returns_zero() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let rec_id = vm.heap.alloc(0, HeapData::Record(vec![0; 8]));
+        memory::write_word(&mut vm.frames.data, fp, rec_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_lena(&mut vm).expect("lena on record should succeed");
+        let len = memory::read_word(&vm.frames.data, fp + 4);
+        assert_eq!(len, 0);
+    }
+
+    #[test]
+    fn slicea_out_of_bounds_fails() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let arr_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0u8; 12],
+                length: 3,
+            },
+        );
+
+        // end > length
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 0;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 4; // end=4 but length=3
+        memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+        vm.dst = AddrTarget::Frame(fp);
+
+        let err = op_slicea(&mut vm).expect_err("slice [0..4) on length 3 should fail");
+        assert!(err.to_string().contains("out of bounds"));
+    }
+
+    #[test]
+    fn slicea_start_greater_than_end_fails() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let arr_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0u8; 20],
+                length: 5,
+            },
+        );
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 3;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 1; // start > end
+        memory::write_word(&mut vm.frames.data, fp, arr_id as i32);
+        vm.dst = AddrTarget::Frame(fp);
+
+        let err = op_slicea(&mut vm).expect_err("slice [3..1) should fail");
+        assert!(err.to_string().contains("out of bounds"));
+    }
+
+    #[test]
+    fn indx_on_array_slice_resolves_to_parent() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Parent: 8 elements of size 4
+        let mut data = vec![0u8; 32];
+        for i in 0..8i32 {
+            memory::write_word(&mut data, i as usize * 4, i * 11);
+        }
+        let parent_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data,
+                length: 8,
+            },
+        );
+
+        // Slice [2..6) => byte_start=8, length=4
+        let slice_id = vm.heap.alloc(
+            0,
+            HeapData::ArraySlice {
+                parent_id,
+                byte_start: 8,
+                elem_type: 0,
+                elem_size: 4,
+                length: 4,
+            },
+        );
+
+        // indx(slice, index=2, mid) => should resolve to parent offset 8 + 2*4 = 16
+        memory::write_word(&mut vm.frames.data, fp, slice_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp + 8, 2);
+        vm.dst = AddrTarget::Frame(fp + 8);
+        vm.mid = AddrTarget::Frame(fp + 4);
+
+        op_indx(&mut vm).expect("indx on slice should succeed");
+
+        let encoded = memory::read_word(&vm.frames.data, fp + 4);
+        let ref_idx = (encoded & !crate::address::HEAP_REF_FLAG) as usize;
+        let (ref_id, ref_offset) = vm.heap_refs[ref_idx];
+        assert_eq!(ref_id, parent_id, "should resolve to parent");
+        assert_eq!(ref_offset, 16); // byte_start(8) + index(2) * elem_size(4)
+    }
+
+    #[test]
+    fn slicela_copies_elements_into_destination() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Source: [7, 8, 9]
+        let mut src_data = vec![0u8; 12];
+        memory::write_word(&mut src_data, 0, 7);
+        memory::write_word(&mut src_data, 4, 8);
+        memory::write_word(&mut src_data, 8, 9);
+        let src_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: src_data,
+                length: 3,
+            },
+        );
+
+        // Destination: [1, 2, 0, 0, 0] with room for 5
+        let mut dst_data = vec![0u8; 20];
+        memory::write_word(&mut dst_data, 0, 1);
+        memory::write_word(&mut dst_data, 4, 2);
+        let dst_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: dst_data,
+                length: 5,
+            },
+        );
+
+        // slicela(src, insert_pos=2, dst)
+        memory::write_word(&mut vm.frames.data, fp, src_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 2;
+        memory::write_word(&mut vm.frames.data, fp + 4, dst_id as i32);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_slicela(&mut vm).expect("slicela should succeed");
+
+        let obj = vm.heap.get(dst_id).unwrap();
+        match &obj.data {
+            HeapData::Array { data, length, .. } => {
+                assert_eq!(*length, 5);
+                assert_eq!(memory::read_word(data, 0), 1);
+                assert_eq!(memory::read_word(data, 4), 2);
+                assert_eq!(memory::read_word(data, 8), 7);
+                assert_eq!(memory::read_word(data, 12), 8);
+                assert_eq!(memory::read_word(data, 16), 9);
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn slicela_nil_source_is_noop() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let mut dst_data = vec![0u8; 8];
+        memory::write_word(&mut dst_data, 0, 42);
+        let dst_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: dst_data,
+                length: 2,
+            },
+        );
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        memory::write_word(&mut vm.frames.data, fp + 4, dst_id as i32);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_slicela(&mut vm).expect("slicela with nil src should be noop");
+
+        let obj = vm.heap.get(dst_id).unwrap();
+        match &obj.data {
+            HeapData::Array { data, .. } => {
+                assert_eq!(memory::read_word(data, 0), 42, "dst should be unchanged");
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn indx_on_non_array_fails() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let rec_id = vm.heap.alloc(0, HeapData::Record(vec![0; 16]));
+        memory::write_word(&mut vm.frames.data, fp, rec_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp + 8, 0);
+        vm.dst = AddrTarget::Frame(fp + 8);
+        vm.mid = AddrTarget::Frame(fp + 4);
+
+        let err = op_indx(&mut vm).expect_err("indx on Record should fail");
+        assert!(err.to_string().contains("non-array"));
+    }
 }

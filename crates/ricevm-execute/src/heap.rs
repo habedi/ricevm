@@ -490,4 +490,261 @@ mod tests {
         );
         assert_eq!(heap.get(id).unwrap().ref_count, 0);
     }
+
+    #[test]
+    fn alloc_string_and_retrieve() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(0, HeapData::Str("hello world".to_string()));
+        assert_ne!(id, NIL);
+        let obj = heap.get(id).unwrap();
+        assert_eq!(obj.ref_count, 1);
+        assert_eq!(obj.type_id, 0);
+        match &obj.data {
+            HeapData::Str(s) => assert_eq!(s, "hello world"),
+            _ => panic!("expected Str"),
+        }
+    }
+
+    #[test]
+    fn alloc_list_and_retrieve() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(
+            5,
+            HeapData::List {
+                head: vec![1, 2, 3, 4],
+                tail: NIL,
+            },
+        );
+        let obj = heap.get(id).unwrap();
+        assert_eq!(obj.type_id, 5);
+        match &obj.data {
+            HeapData::List { head, tail } => {
+                assert_eq!(head, &[1, 2, 3, 4]);
+                assert_eq!(*tail, NIL);
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn alloc_channel_and_retrieve() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let obj = heap.get(id).unwrap();
+        match &obj.data {
+            HeapData::Channel { elem_size, pending } => {
+                assert_eq!(*elem_size, 4);
+                assert!(pending.is_none());
+            }
+            _ => panic!("expected Channel"),
+        }
+    }
+
+    #[test]
+    fn inc_ref_increases_count() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(0, HeapData::Record(vec![0; 8]));
+        assert_eq!(heap.get(id).unwrap().ref_count, 1);
+        heap.inc_ref(id);
+        assert_eq!(heap.get(id).unwrap().ref_count, 2);
+        heap.inc_ref(id);
+        assert_eq!(heap.get(id).unwrap().ref_count, 3);
+    }
+
+    #[test]
+    fn dec_ref_decreases_count() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(0, HeapData::Record(vec![0; 8]));
+        heap.inc_ref(id);
+        heap.inc_ref(id);
+        assert_eq!(heap.get(id).unwrap().ref_count, 3);
+        heap.dec_ref(id);
+        assert_eq!(heap.get(id).unwrap().ref_count, 2);
+        heap.dec_ref(id);
+        assert_eq!(heap.get(id).unwrap().ref_count, 1);
+    }
+
+    #[test]
+    fn dec_ref_to_zero_frees_object() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(0, HeapData::Record(vec![0; 8]));
+        assert!(heap.contains(id));
+        heap.dec_ref(id);
+        assert!(!heap.contains(id));
+        assert!(heap.get(id).is_none());
+    }
+
+    #[test]
+    fn dec_ref_to_zero_frees_string() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(0, HeapData::Str("temp".to_string()));
+        heap.dec_ref(id);
+        assert!(!heap.contains(id));
+    }
+
+    #[test]
+    fn dec_ref_to_zero_frees_array() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0; 16],
+                length: 4,
+            },
+        );
+        heap.dec_ref(id);
+        assert!(!heap.contains(id));
+    }
+
+    #[test]
+    fn contains_returns_true_for_live_objects() {
+        let mut heap = Heap::new();
+        let id1 = heap.alloc(0, HeapData::Record(vec![0; 4]));
+        let id2 = heap.alloc(0, HeapData::Str("test".to_string()));
+        assert!(heap.contains(id1));
+        assert!(heap.contains(id2));
+    }
+
+    #[test]
+    fn contains_returns_false_for_nil_and_freed() {
+        let mut heap = Heap::new();
+        assert!(!heap.contains(NIL));
+        let id = heap.alloc(0, HeapData::Record(vec![0; 4]));
+        heap.dec_ref(id);
+        assert!(!heap.contains(id));
+        // Non-existent ID
+        assert!(!heap.contains(999));
+    }
+
+    #[test]
+    fn get_string_returns_none_for_non_string() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(0, HeapData::Record(vec![0; 8]));
+        assert_eq!(heap.get_string(id), None);
+    }
+
+    #[test]
+    fn get_string_returns_none_for_nil() {
+        let heap = Heap::new();
+        assert_eq!(heap.get_string(NIL), None);
+    }
+
+    #[test]
+    fn array_byte_len_for_array() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0; 20],
+                length: 5,
+            },
+        );
+        assert_eq!(heap.array_byte_len(id), Some(20));
+    }
+
+    #[test]
+    fn array_byte_len_for_array_slice() {
+        let mut heap = Heap::new();
+        let parent_id = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0; 40],
+                length: 10,
+            },
+        );
+        let slice_id = heap.alloc(
+            0,
+            HeapData::ArraySlice {
+                parent_id,
+                byte_start: 8,
+                elem_type: 0,
+                elem_size: 4,
+                length: 3,
+            },
+        );
+        // slice byte len = length * elem_size = 3 * 4 = 12
+        assert_eq!(heap.array_byte_len(slice_id), Some(12));
+    }
+
+    #[test]
+    fn array_byte_len_returns_none_for_non_array() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(0, HeapData::Record(vec![0; 8]));
+        assert_eq!(heap.array_byte_len(id), None);
+    }
+
+    #[test]
+    fn array_byte_len_returns_none_for_nil() {
+        let heap = Heap::new();
+        assert_eq!(heap.array_byte_len(NIL), None);
+    }
+
+    #[test]
+    fn loaded_module_not_freed_on_dec_ref() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(
+            0,
+            HeapData::LoadedModule {
+                module_idx: 0,
+                func_map: Vec::new(),
+            },
+        );
+        heap.dec_ref(id);
+        assert!(
+            heap.contains(id),
+            "LoadedModule should persist at ref_count 0"
+        );
+    }
+
+    #[test]
+    fn main_module_not_freed_on_dec_ref() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(
+            0,
+            HeapData::MainModule {
+                func_map: Vec::new(),
+            },
+        );
+        heap.dec_ref(id);
+        assert!(
+            heap.contains(id),
+            "MainModule should persist at ref_count 0"
+        );
+    }
+
+    #[test]
+    fn heap_len_tracks_live_objects() {
+        let mut heap = Heap::new();
+        assert_eq!(heap.len(), 0);
+        let id1 = heap.alloc(0, HeapData::Record(vec![0; 4]));
+        assert_eq!(heap.len(), 1);
+        let _id2 = heap.alloc(0, HeapData::Record(vec![0; 4]));
+        assert_eq!(heap.len(), 2);
+        heap.dec_ref(id1);
+        assert_eq!(heap.len(), 1);
+    }
+
+    #[test]
+    fn multiple_allocs_get_unique_ids() {
+        let mut heap = Heap::new();
+        let id1 = heap.alloc(0, HeapData::Record(vec![0; 4]));
+        let id2 = heap.alloc(0, HeapData::Record(vec![0; 4]));
+        let id3 = heap.alloc(0, HeapData::Str("x".to_string()));
+        assert_ne!(id1, id2);
+        assert_ne!(id2, id3);
+        assert_ne!(id1, id3);
+        assert_ne!(id1, NIL);
+    }
 }

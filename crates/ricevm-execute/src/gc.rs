@@ -242,4 +242,90 @@ mod tests {
             "GC should collect unreachable objects"
         );
     }
+
+    #[test]
+    fn gc_preserves_array_and_elements() {
+        let mut heap = Heap::new();
+        let str_id = heap.alloc(0, HeapData::Str("element".to_string()));
+        let mut arr_data = vec![0u8; 4];
+        memory::write_word(&mut arr_data, 0, str_id as i32);
+        let arr_id = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: arr_data,
+                length: 1,
+            },
+        );
+
+        let mut frames = FrameStack::new();
+        frames.push_entry(16, -1);
+        let off = frames.current_data_offset();
+        memory::write_word(&mut frames.data, off, arr_id as i32);
+
+        collect(
+            &mut heap,
+            &frames,
+            &[],
+            &[],
+            &std::collections::VecDeque::new(),
+            &[],
+        );
+
+        assert!(heap.get(arr_id).is_some(), "array should survive GC");
+        assert!(
+            heap.get(str_id).is_some(),
+            "array element should survive GC"
+        );
+    }
+
+    #[test]
+    fn gc_collects_multiple_unreachable() {
+        let mut heap = Heap::new();
+        let ids: Vec<u32> = (0..5)
+            .map(|i| heap.alloc(0, HeapData::Str(format!("orphan-{i}"))))
+            .collect();
+
+        let frames = FrameStack::new();
+        collect(
+            &mut heap,
+            &frames,
+            &[],
+            &[],
+            &std::collections::VecDeque::new(),
+            &[],
+        );
+
+        for id in ids {
+            assert!(
+                heap.get(id).is_none(),
+                "unreachable object {id} should be collected"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_preserves_mp_references() {
+        let mut heap = Heap::new();
+        let str_id = heap.alloc(0, HeapData::Str("mp-owned".to_string()));
+
+        let frames = FrameStack::new();
+        let mut mp = vec![0u8; 8];
+        memory::write_word(&mut mp, 0, str_id as i32);
+
+        collect(
+            &mut heap,
+            &frames,
+            &mp,
+            &[],
+            &std::collections::VecDeque::new(),
+            &[],
+        );
+
+        assert!(
+            heap.get(str_id).is_some(),
+            "MP-referenced object should survive GC"
+        );
+    }
 }

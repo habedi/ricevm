@@ -1013,6 +1013,209 @@ mod tests {
     /// Regression: spawn must increment ref counts for heap pointers in the
     /// cloned MP to prevent premature GC collection.
     #[test]
+    fn send_recv_empty_channel_then_fill() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let chan_id = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+
+        // Send a value
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 100;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = chan_id as i32;
+        op_send(&mut vm).expect("send should succeed");
+
+        // Channel should now have pending data
+        match vm.heap.get(chan_id).expect("channel").data {
+            HeapData::Channel { ref pending, .. } => {
+                assert!(pending.is_some(), "channel should have data after send");
+                let data = pending.as_ref().unwrap();
+                assert_eq!(i32::from_ne_bytes(data[..4].try_into().unwrap()), 100);
+            }
+            _ => panic!("expected channel"),
+        }
+    }
+
+    #[test]
+    fn recv_delivers_correct_multi_byte_value() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp_base = vm.frames.current_data_offset();
+
+        let chan_id = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: Some((-42_i32).to_ne_bytes().to_vec()),
+            },
+        );
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = chan_id as i32;
+        vm.dst = AddrTarget::Frame(fp_base);
+        op_recv(&mut vm).expect("recv should succeed");
+
+        assert_eq!(memory::read_word(&vm.frames.data, fp_base), -42);
+    }
+
+    #[test]
+    fn spawn_child_starts_at_correct_pc() {
+        let module = Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 3,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+            ],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "spawn_pc_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        };
+
+        let mut vm = VmState::new(&module).expect("vm init");
+        let pending_offset = vm.frames.alloc_pending(64).expect("alloc_pending");
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending_offset as i32;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = 2; // target PC = 2
+
+        op_spawn(&mut vm).expect("spawn should succeed");
+
+        assert_eq!(vm.thread_queue.len(), 1);
+        assert_eq!(vm.thread_queue[0].pc, 2, "child should have pc=2");
+        assert!(
+            vm.thread_queue[0].blocked_on.is_none(),
+            "child should not be blocked"
+        );
+    }
+
+    #[test]
+    fn nbalt_returns_count_when_nothing_ready() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+
+        // Two empty channels, both recv entries
+        let chan_a = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let chan_b = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        memory::write_word(&mut vm.frames.data, table_off, 0); // nsend = 0
+        memory::write_word(&mut vm.frames.data, table_off + 4, 2); // nrecv = 2
+        memory::write_word(&mut vm.frames.data, table_off + 8, chan_a as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 16, chan_b as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 20, (fp_base + 44) as i32);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+        op_nbalt(&mut vm).expect("nbalt should succeed");
+
+        // nbalt returns nsend+nrecv (total entry count) when nothing is ready
+        let selected = memory::read_word(&vm.frames.data, fp_base);
+        assert_eq!(
+            selected, 2,
+            "nbalt should return total entry count when nothing is ready"
+        );
+    }
+
+    #[test]
+    fn multiple_sends_and_recvs() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp_base = vm.frames.current_data_offset();
+
+        let chan_id = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+
+        // Send 77
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 77;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = chan_id as i32;
+        op_send(&mut vm).expect("first send");
+
+        // Recv 77
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = chan_id as i32;
+        vm.dst = AddrTarget::Frame(fp_base);
+        op_recv(&mut vm).expect("first recv");
+        assert_eq!(memory::read_word(&vm.frames.data, fp_base), 77);
+
+        // Send 88
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 88;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = chan_id as i32;
+        op_send(&mut vm).expect("second send");
+
+        // Recv 88
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = chan_id as i32;
+        vm.dst = AddrTarget::Frame(fp_base + 4);
+        op_recv(&mut vm).expect("second recv");
+        assert_eq!(memory::read_word(&vm.frames.data, fp_base + 4), 88);
+    }
+
+    #[test]
     fn spawn_increments_mp_heap_pointer_ref_counts() {
         let module = Module {
             header: Header {

@@ -2238,9 +2238,355 @@ test()
         let Decl::Func(f) = &file.decls[0] else {
             panic!("expected func");
         };
-        // a + (b * c), not (a + b) * c
         if let Stmt::Expr(Expr::Assign(_, rhs, _)) = &f.body.stmts[0] {
             assert!(matches!(rhs.as_ref(), Expr::Binary(_, BinOp::Add, _, _)));
+        }
+    }
+
+    #[test]
+    fn parse_do_while() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    do { x++; } while(x < 10);
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(f.body.stmts[0], Stmt::Do(_)));
+    }
+
+    #[test]
+    fn parse_channel_send() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    c <-= 42;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(f.body.stmts[0], Stmt::Expr(Expr::Send(_, _, _))));
+    }
+
+    #[test]
+    fn parse_spawn() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    spawn worker(c);
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(f.body.stmts[0], Stmt::Spawn(_, _)));
+    }
+
+    #[test]
+    fn parse_raise() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    raise "fail:error";
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(f.body.stmts[0], Stmt::Raise(Some(_), _)));
+    }
+
+    #[test]
+    fn parse_tuple_decl_assign() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    (a, b) := func();
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Expr(Expr::TupleDeclAssign(_, _, _))
+        ));
+    }
+
+    #[test]
+    fn parse_local_var_decl() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    x: int;
+    y: string = "hello";
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(f.body.stmts[0], Stmt::VarDecl(_)));
+        assert!(matches!(f.body.stmts[1], Stmt::VarDecl(_)));
+    }
+
+    #[test]
+    fn parse_label_statement() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    loop: for(;;) break;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(f.body.stmts[0], Stmt::Label(_, _)));
+    }
+
+    #[test]
+    fn parse_alt_statement() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    alt {
+        v := <-c1 =>
+            x = v;
+        * =>
+            x = 0;
+    }
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(f.body.stmts[0], Stmt::Alt(_)));
+    }
+
+    #[test]
+    fn parse_pick_statement() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    pick x := val {
+        A =>
+            y = 1;
+        B =>
+            y = 2;
+    }
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(f.body.stmts[0], Stmt::Pick(_)));
+    }
+
+    #[test]
+    fn parse_import_decl() {
+        let file = parse(
+            r#"implement T;
+    Iobuf: import bufio;
+"#,
+        );
+        assert!(matches!(file.decls[0], Decl::Import(_)));
+    }
+
+    #[test]
+    fn parse_exception_decl() {
+        let file = parse(
+            r#"implement T;
+    BadVal: exception;
+"#,
+        );
+        assert!(matches!(file.decls[0], Decl::Exception(_)));
+    }
+
+    #[test]
+    fn parse_adt_decl() {
+        let file = parse(
+            r#"implement T;
+Point: adt {
+    x: int;
+    y: int;
+};
+"#,
+        );
+        assert!(matches!(file.decls[0], Decl::Adt(_)));
+    }
+
+    #[test]
+    fn parse_const_decl() {
+        let file = parse(
+            r#"implement T;
+    MAX: con 100;
+"#,
+        );
+        assert!(matches!(file.decls[0], Decl::Const(_)));
+    }
+
+    #[test]
+    fn parse_qualified_func_def() {
+        let file = parse(
+            r#"implement T;
+Point.distance(p: ref Point): int
+{
+    return 0;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert_eq!(f.name.qualifier, Some("Point".to_string()));
+        assert_eq!(f.name.name, "distance");
+    }
+
+    #[test]
+    fn parse_multiple_functions() {
+        let file = parse(
+            r#"implement T;
+include "sys.m"; sys: Sys;
+include "draw.m";
+T: module { init: fn(nil: ref Draw->Context, nil: list of string); };
+helper(): int { return 42; }
+init(nil: ref Draw->Context, nil: list of string) { x := helper(); }
+"#,
+        );
+        let func_count = file
+            .decls
+            .iter()
+            .filter(|d| matches!(d, Decl::Func(_)))
+            .count();
+        assert_eq!(func_count, 2);
+    }
+
+    #[test]
+    fn parse_deref_expression() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    x = *p;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        if let Stmt::Expr(Expr::Assign(_, rhs, _)) = &f.body.stmts[0] {
+            assert!(matches!(rhs.as_ref(), Expr::Unary(_, _, _)));
+        }
+    }
+
+    #[test]
+    fn parse_list_cons() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    l := 1 :: 2 :: nil;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(matches!(
+            f.body.stmts[0],
+            Stmt::Expr(Expr::DeclAssign(_, _, _))
+        ));
+    }
+
+    #[test]
+    fn parse_chan_alloc() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    c := chan of int;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        if let Stmt::Expr(Expr::DeclAssign(_, rhs, _)) = &f.body.stmts[0] {
+            assert!(matches!(rhs.as_ref(), Expr::ChanAlloc(_, _)));
+        }
+    }
+
+    #[test]
+    fn parse_array_alloc() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    a := array[10] of int;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        if let Stmt::Expr(Expr::DeclAssign(_, rhs, _)) = &f.body.stmts[0] {
+            assert!(matches!(rhs.as_ref(), Expr::ArrayAlloc(_, _, _)));
+        }
+    }
+
+    #[test]
+    fn parse_hd_tl_len() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    x := hd l;
+    y := tl l;
+    n := len s;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert_eq!(f.body.stmts.len(), 3);
+    }
+
+    #[test]
+    fn parse_load_expression() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    sys = load Sys Sys->PATH;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        if let Stmt::Expr(Expr::Assign(_, rhs, _)) = &f.body.stmts[0] {
+            assert!(matches!(rhs.as_ref(), Expr::Load(_, _, _)));
         }
     }
 }

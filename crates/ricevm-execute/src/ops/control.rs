@@ -1100,6 +1100,147 @@ mod tests {
     }
 
     #[test]
+    fn op_exit_sets_halted() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        assert!(!vm.halted);
+        op_exit(&mut vm).expect("exit should succeed");
+        assert!(vm.halted, "exit should set halted flag");
+    }
+
+    #[test]
+    fn op_jmp_sets_next_pc() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = 42;
+        vm.next_pc = 0;
+
+        op_jmp(&mut vm).expect("jmp should succeed");
+        assert_eq!(vm.next_pc, 42, "jmp should set next_pc to dst value");
+    }
+
+    #[test]
+    fn op_jmp_to_zero() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = 0;
+        vm.next_pc = 100;
+
+        op_jmp(&mut vm).expect("jmp should succeed");
+        assert_eq!(vm.next_pc, 0, "jmp to 0 should work");
+    }
+
+    #[test]
+    fn op_call_and_ret_frame_push_pop() {
+        let module = Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 2,
+                data_size: 0,
+                type_size: 2,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+            ],
+            types: vec![
+                TypeDescriptor {
+                    id: 0,
+                    size: 128,
+                    pointer_map: PointerMap { bytes: vec![] },
+                    pointer_count: 0,
+                },
+                TypeDescriptor {
+                    id: 1,
+                    size: 32,
+                    pointer_map: PointerMap { bytes: vec![] },
+                    pointer_count: 0,
+                },
+            ],
+            data: vec![],
+            name: "call_ret_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        };
+
+        let mut vm = VmState::new(&module).expect("vm init");
+        let original_base = vm.frames.current_base;
+
+        // Allocate a pending frame
+        let pending_off = vm.frames.alloc_pending(32).expect("alloc_pending");
+        // Store type index in header
+        memory::write_word(&mut vm.frames.data, pending_off - 8, 1);
+
+        // Set up for call: src = frame pointer, dst = target PC
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending_off as i32;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = 1; // target PC
+        vm.next_pc = 0; // return address
+
+        op_call(&mut vm).expect("call should succeed");
+        assert_eq!(vm.next_pc, 1, "call should set next_pc to target");
+        assert_ne!(
+            vm.frames.current_base, original_base,
+            "call should push a new frame"
+        );
+
+        // Now ret
+        op_ret(&mut vm).expect("ret should succeed");
+        assert_eq!(
+            vm.frames.current_base, original_base,
+            "ret should restore the original frame"
+        );
+        assert_eq!(vm.next_pc, 0, "ret should restore return address");
+    }
+
+    #[test]
+    fn op_ret_from_entry_halts() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        // The entry frame has return PC = -1 (sentinel)
+        assert!(!vm.halted);
+        op_ret(&mut vm).expect("ret should succeed");
+        assert!(vm.halted, "ret from entry frame should halt");
+    }
+
+    #[test]
+    fn op_frame_allocates_pending_frame() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+
+        // type 0 has size 64
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 0; // type index
+        let fp = vm.frames.current_data_offset();
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_frame(&mut vm).expect("frame should succeed");
+
+        let pending_off = memory::read_word(&vm.frames.data, fp + 4);
+        assert!(pending_off > 0, "frame should write a valid pending offset");
+    }
+
+    #[test]
     fn builtin_mcall_writes_return_value_to_heap_record_field() {
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm init");

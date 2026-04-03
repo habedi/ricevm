@@ -808,4 +808,203 @@ mod tests {
         assert_eq!(n, data.len());
         assert_eq!(&buf[..n], data);
     }
+
+    #[test]
+    fn new_creates_stdin_stdout_stderr() {
+        let ft = FileTable::new();
+        assert!(ft.fildes(0), "stdin should exist");
+        assert!(ft.fildes(1), "stdout should exist");
+        assert!(ft.fildes(2), "stderr should exist");
+        assert!(!ft.fildes(99), "fd 99 should not exist");
+    }
+
+    #[test]
+    fn open_dev_null_reads_eof() {
+        let mut ft = FileTable::new();
+        let fd = ft
+            .open("/dev/null", 0)
+            .expect("open /dev/null should succeed");
+        assert!(fd >= 3, "virtual file fd should be >= 3");
+        let mut buf = [0u8; 16];
+        let n = ft.read(fd, &mut buf).expect("read should succeed");
+        assert_eq!(n, 0, "/dev/null should read as empty (EOF)");
+    }
+
+    #[test]
+    fn open_dev_sysctl_returns_ricevm() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/sysctl", 0).expect("open /dev/sysctl");
+        let mut buf = [0u8; 64];
+        let n = ft.read(fd, &mut buf).expect("read should succeed");
+        assert_eq!(&buf[..n], b"RiceVM");
+    }
+
+    #[test]
+    fn open_dev_sysname_returns_ricevm() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/sysname", 0).expect("open /dev/sysname");
+        let mut buf = [0u8; 64];
+        let n = ft.read(fd, &mut buf).expect("read should succeed");
+        assert_eq!(&buf[..n], b"ricevm");
+    }
+
+    #[test]
+    fn open_dev_user_returns_nonempty() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/user", 0).expect("open /dev/user");
+        let mut buf = [0u8; 256];
+        let n = ft.read(fd, &mut buf).expect("read should succeed");
+        assert!(n > 0, "/dev/user should return a non-empty username");
+    }
+
+    #[test]
+    fn open_dev_time_returns_digits() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/time", 0).expect("open /dev/time");
+        let mut buf = [0u8; 64];
+        let n = ft.read(fd, &mut buf).expect("read should succeed");
+        let time_str = std::str::from_utf8(&buf[..n]).expect("should be utf8");
+        assert!(
+            time_str.chars().all(|c| c.is_ascii_digit()),
+            "time should be all digits, got: {time_str}"
+        );
+        assert!(n > 10, "nanosecond timestamp should be long");
+    }
+
+    #[test]
+    fn resolve_path_no_root() {
+        let ft = FileTable::new();
+        assert_eq!(ft.resolve_path("/foo/bar"), "/foo/bar");
+        assert_eq!(ft.resolve_path("relative"), "relative");
+    }
+
+    #[test]
+    fn resolve_path_with_root() {
+        let ft = FileTable::with_root("/host/inferno".to_string());
+        assert_eq!(ft.resolve_path("/foo/bar"), "/host/inferno/foo/bar");
+        assert_eq!(
+            ft.resolve_path("relative"),
+            "relative",
+            "relative paths should not be prefixed"
+        );
+    }
+
+    #[test]
+    fn regular_file_read_write_seek() {
+        let path = std::env::temp_dir().join(format!(
+            "ricevm_ft_test_{}.tmp",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"abcdef").expect("write temp file");
+
+        let mut ft = FileTable::new();
+        let fd = ft
+            .open(path.to_str().unwrap(), 2) // ORDWR
+            .expect("open should succeed");
+
+        // Read first 3 bytes
+        let mut buf = [0u8; 3];
+        let n = ft.read(fd, &mut buf).expect("read");
+        assert_eq!(n, 3);
+        assert_eq!(&buf, b"abc");
+
+        // Seek back to start
+        let pos = ft.seek(fd, 0, 0).expect("seek start");
+        assert_eq!(pos, 0);
+
+        // Read again
+        let n = ft.read(fd, &mut buf).expect("read after seek");
+        assert_eq!(n, 3);
+        assert_eq!(&buf, b"abc");
+
+        // Seek to offset 2 from start
+        ft.seek(fd, 2, 0).expect("seek to 2");
+        let n = ft.read(fd, &mut buf).expect("read from offset 2");
+        assert_eq!(n, 3);
+        assert_eq!(&buf, b"cde");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn close_removes_fd() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/null", 0).expect("open /dev/null");
+        assert!(ft.fildes(fd));
+        ft.close(fd);
+        assert!(!ft.fildes(fd), "fd should be gone after close");
+    }
+
+    #[test]
+    fn close_does_not_remove_stdio() {
+        let mut ft = FileTable::new();
+        ft.close(0);
+        ft.close(1);
+        ft.close(2);
+        assert!(ft.fildes(0), "stdin should not be closeable");
+        assert!(ft.fildes(1), "stdout should not be closeable");
+        assert!(ft.fildes(2), "stderr should not be closeable");
+    }
+
+    #[test]
+    fn get_path_for_stdio() {
+        let ft = FileTable::new();
+        assert_eq!(ft.get_path(0), Some("/dev/stdin"));
+        assert_eq!(ft.get_path(1), Some("/dev/stdout"));
+        assert_eq!(ft.get_path(2), Some("/dev/stderr"));
+        assert_eq!(ft.get_path(99), None);
+    }
+
+    #[test]
+    fn open_dev_cons_read_returns_stdin() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/cons", 0).expect("open /dev/cons OREAD");
+        assert_eq!(fd, 0, "/dev/cons OREAD should alias stdin");
+    }
+
+    #[test]
+    fn open_dev_cons_write_returns_stdout() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/cons", 1).expect("open /dev/cons OWRITE");
+        assert_eq!(fd, 1, "/dev/cons OWRITE should alias stdout");
+    }
+
+    #[test]
+    fn create_file_and_write() {
+        let path = std::env::temp_dir().join(format!(
+            "ricevm_create_test_{}.tmp",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let mut ft = FileTable::new();
+        let fd = ft.create(path.to_str().unwrap()).expect("create");
+        let n = ft.write(fd, b"hello").expect("write");
+        assert_eq!(n, 5);
+        ft.close(fd);
+
+        let contents = std::fs::read(&path).expect("read back");
+        assert_eq!(&contents, b"hello");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_bad_fd_returns_error() {
+        let mut ft = FileTable::new();
+        let result = ft.read(999, &mut [0u8; 4]);
+        assert!(result.is_err(), "reading from bad fd should error");
+    }
+
+    #[test]
+    fn write_bad_fd_returns_error() {
+        let mut ft = FileTable::new();
+        let result = ft.write(999, b"data");
+        assert!(result.is_err(), "writing to bad fd should error");
+    }
 }

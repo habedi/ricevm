@@ -37,7 +37,7 @@ jobs:
         rust-version: [ "1.92.0", "stable" ]
 
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -48,11 +48,11 @@ jobs:
         with:
           toolchain: ${{ matrix.rust-version }}
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang curl pkg-config libssl-dev make
           make install-deps
 
-      - name: Run Linters
+      - name: Run linters
         run: make lint

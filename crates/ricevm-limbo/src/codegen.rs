@@ -1373,10 +1373,12 @@ impl CodeGen {
             BinOp::Power => Opcode::Expw,
             _ => Opcode::Movw,
         };
-        self.emit(opcode, op_fp(l), mid_unused(), op_fp(r));
-        if r != dst {
-            self.emit(Opcode::Movw, op_fp(r), mid_unused(), op_fp(dst));
-        }
+        // The 3-operand form computes `dst = mid OP src` for Sub/Div/Mod/Shl/
+        // Shr/Exp in the reference Dis VM (xec.c), so place lhs in mid and rhs
+        // in src. Commutative ops (Add/Mul/And/Or/Xor) are unaffected by the
+        // order. Using the 3-op form also lets us write straight into `dst`
+        // without a trailing Movw.
+        self.emit(opcode, op_fp(r), mid_fp(l), op_fp(dst));
         Ok(())
     }
 

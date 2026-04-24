@@ -268,6 +268,327 @@ fn compile_and_run_hello_world() {
     );
 }
 
+/// Locate a file by walking up from the current working directory. Tests run
+/// with CWD set to the crate dir, but `cargo test` from the workspace root
+/// or a subcrate behaves differently; try common relative prefixes.
+fn find_asset(rel: &str) -> Option<std::path::PathBuf> {
+    for prefix in ["", "../", "../../", "../../../"] {
+        let candidate = std::path::PathBuf::from(format!("{prefix}{rel}"));
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Invoke the compiled ricevm-cli binary as a subprocess and return its output.
+/// Uses `CARGO_BIN_EXE_*` which Cargo sets for integration tests of the
+/// current crate's binaries. Sets `RUST_LOG=error` so tracing's INFO-level
+/// "Executing module..." lines don't contaminate captured stdout.
+fn run_cli(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ricevm-cli"))
+        .env("RUST_LOG", "error")
+        .args(args)
+        .output()
+        .expect("failed to spawn ricevm-cli")
+}
+
+/// Running echo.dis with arguments must print those arguments on stdout.
+/// This is the acid test for the whole pipeline: loader, Sys builtin dispatch,
+/// argv passing, Sys->print formatting, and stdout flushing.
+#[test]
+fn cli_echo_prints_arguments() {
+    let Some(echo) = find_asset("external/inferno-os/dis/echo.dis") else {
+        eprintln!("echo.dis not found, skipping (run git submodule update --init)");
+        return;
+    };
+    let out = run_cli(&[
+        "run",
+        echo.to_str().expect("echo path utf8"),
+        "--",
+        "hello",
+        "world",
+    ]);
+    assert!(
+        out.status.success(),
+        "ricevm-cli run echo.dis failed: status={:?}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.trim_end(),
+        "hello world",
+        "echo should print its argv joined by spaces, got {stdout:?}"
+    );
+}
+
+/// Running a nonexistent .dis file must fail with a nonzero exit and surface
+/// the error on stderr, not silently succeed.
+#[test]
+fn cli_run_missing_file_fails_with_diagnostic() {
+    let out = run_cli(&["run", "/definitely/does/not/exist.dis"]);
+    assert!(
+        !out.status.success(),
+        "missing file should fail, got status={:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_lowercase().contains("error") || stderr.contains("failed"),
+        "stderr should explain the failure, got: {stderr}"
+    );
+}
+
+/// The `dis` subcommand must emit a disassembly that at least names the module
+/// and lists its instructions. Catches regressions in the disassembler wiring.
+#[test]
+fn cli_dis_emits_disassembly_header() {
+    let Some(echo) = find_asset("external/inferno-os/dis/echo.dis") else {
+        eprintln!("echo.dis not found, skipping");
+        return;
+    };
+    let out = run_cli(&["dis", echo.to_str().expect("echo path utf8")]);
+    assert!(
+        out.status.success(),
+        "dis subcommand failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Echo"),
+        "disassembly should name the Echo module, got: {stdout}"
+    );
+    assert!(
+        stdout.lines().count() > 5,
+        "disassembly should produce multiple lines, got {} line(s)",
+        stdout.lines().count()
+    );
+}
+
+/// Running with no arguments must fail and print clap's usage message to
+/// stderr, rather than succeeding silently.
+#[test]
+fn cli_no_args_prints_usage() {
+    let out = run_cli(&[]);
+    assert!(!out.status.success(), "no-args invocation should fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Usage") || stderr.contains("USAGE") || stderr.contains("ricevm"),
+        "stderr should carry usage info, got: {stderr}"
+    );
+}
+
+/// Regression/acceptance test for the big/real opcode-family gap in the Limbo
+/// compiler (`gen_binary` only emits Word opcodes).
+///
+/// Currently ignored: fixing this requires tracking numeric kind (Word/Big/
+/// Real) alongside ValType, widening temp and local allocations to 8 bytes for
+/// 64-bit operands, and selecting Addl/Addf opcode families in gen_binary.
+/// When that refactor lands, remove `#[ignore]` — this test will then pass
+/// and guard against regressions.
+///
+/// What it asserts: `big` arithmetic on a value that does not fit in i32 must
+/// not truncate. `0x1_0000_0000 + 1 == 0x1_0000_0001`, which `%bd` prints as
+/// the full 64-bit decimal.
+#[test]
+#[ignore = "requires big/real opcode-family support in gen_binary"]
+fn cli_compile_big_arithmetic_not_truncated() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-big-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Big.b");
+    let out_dis = tmp.join("Big.dis");
+    std::fs::write(
+        &src,
+        r#"implement Big;
+include "sys.m";
+    sys: Sys;
+Big: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    a : big = big 16r100000000;
+    b : big = big 1;
+    sys->print("sum=%bd\n", a + b);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "compile failed: stderr={}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert!(
+        run_out.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "sum=4294967297",
+        "big addition must not truncate to 32 bits"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression for gen_binary operand order: compile a Limbo program that
+/// exercises every non-commutative binary op with asymmetric operands (so a
+/// swapped order produces a different, wrong answer), run it, and assert the
+/// output. An earlier 2-op emission computed `rhs OP lhs` instead of
+/// `lhs OP rhs`, so e.g. `10 - 3` produced `-7`.
+#[test]
+fn cli_compile_noncommutative_arithmetic() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-noncomm-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("NonComm.b");
+    let out_dis = tmp.join("NonComm.dis");
+    std::fs::write(
+        &src,
+        r#"implement NonComm;
+include "sys.m";
+    sys: Sys;
+NonComm: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    a := 20;
+    b := 4;
+    sys->print("sub=%d div=%d mod=%d shl=%d shr=%d\n",
+        a - b, a / b, a % b, 1 << 3, 64 >> 2);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "compile failed: stderr={}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert!(
+        run_out.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert_eq!(
+        stdout.trim_end(),
+        "sub=16 div=5 mod=0 shl=8 shr=16",
+        "non-commutative arithmetic produced wrong values: {stdout:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// End-to-end: compile a Limbo source file via `ricevm-cli compile`, then run
+/// the produced .dis and assert on its stdout. This exercises the whole stack
+/// (lexer, parser, codegen, writer, loader, executor, Sys builtin) as a unit.
+#[test]
+fn cli_compile_then_run_prints_expected_output() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+
+    let tmp = std::env::temp_dir().join(format!("ricevm-it-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Greet.b");
+    let out_dis = tmp.join("Greet.dis");
+    std::fs::write(
+        &src,
+        r#"implement Greet;
+include "sys.m";
+    sys: Sys;
+Greet: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    a := 2;
+    b := 3;
+    sys->print("sum=%d hi\n", a + b);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "compile failed: stderr={}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    assert!(out_dis.exists(), "compile did not produce {out_dis:?}");
+
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert!(
+        run_out.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert_eq!(
+        stdout.trim_end(),
+        "sum=5 hi",
+        "compiled Greet.b should print sum=5 hi, got {stdout:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Integration test: Load multiple different .dis files and verify they all
 /// parse into valid modules with expected properties.
 #[test]

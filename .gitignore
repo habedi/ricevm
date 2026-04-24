@@ -88,3 +88,4 @@ tests/testdata/*.parquet
 NOTES.md
 site/
 .codex
+*.dis

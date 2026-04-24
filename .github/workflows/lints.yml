@@ -31,6 +31,11 @@ jobs:
   lints:
     runs-on: ubuntu-latest
 
+    strategy:
+      matrix:
+        # Define the Rust versions for linting against
+        rust-version: [ "1.92.0", "stable" ]
+
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -38,10 +43,10 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
-      - name: Set up Rust
+      - name: Set up Rust ${{ matrix.rust-version }}
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          toolchain: ${{ matrix.rust-version }}
 
       - name: Install Dependencies
         run: |

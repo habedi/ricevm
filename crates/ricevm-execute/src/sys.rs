@@ -42,10 +42,8 @@ fn write_ret_word(vm: &mut VmState<'_>, frame_base: usize, field_offset: usize, 
             crate::address::AddrTarget::Frame(off) => {
                 memory::write_word(&mut vm.frames.data, off + field_offset, val);
             }
-            crate::address::AddrTarget::Mp(off) => {
-                if off + field_offset + 4 <= vm.mp.len() {
-                    memory::write_word(&mut vm.mp, off + field_offset, val);
-                }
+            crate::address::AddrTarget::Mp(off) if off + field_offset + 4 <= vm.mp.len() => {
+                memory::write_word(&mut vm.mp, off + field_offset, val);
             }
             _ => {}
         }
@@ -1385,13 +1383,7 @@ fn get_fd_num(vm: &VmState<'_>, fd_id: HeapId) -> i32 {
     }
     match vm.heap.get(fd_id) {
         Some(obj) => match &obj.data {
-            HeapData::Record(data) => {
-                if data.len() >= 4 {
-                    memory::read_word(data, 0)
-                } else {
-                    -1
-                }
-            }
+            HeapData::Record(data) if data.len() >= 4 => memory::read_word(data, 0),
             _ => -1,
         },
         None => -1,

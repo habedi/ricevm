@@ -822,10 +822,10 @@ impl<'m> VmState<'m> {
             match &mut obj.data {
                 heap::HeapData::Array { data, .. }
                 | heap::HeapData::Record(data)
-                | heap::HeapData::Adt { data, .. } => {
-                    if offset + bytes.len() <= data.len() {
-                        data[offset..offset + bytes.len()].copy_from_slice(bytes);
-                    }
+                | heap::HeapData::Adt { data, .. }
+                    if offset + bytes.len() <= data.len() =>
+                {
+                    data[offset..offset + bytes.len()].copy_from_slice(bytes);
                 }
                 _ => {}
             }

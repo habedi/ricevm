@@ -379,28 +379,21 @@ fn cli_no_args_prints_usage() {
     );
 }
 
-/// Regression/acceptance test for the big/real opcode-family gap in the Limbo
-/// compiler (`gen_binary` only emits Word opcodes).
-///
-/// Currently ignored: fixing this requires tracking numeric kind (Word/Big/
-/// Real) alongside ValType, widening temp and local allocations to 8 bytes for
-/// 64-bit operands, and selecting Addl/Addf opcode families in gen_binary.
-/// When that refactor lands, remove `#[ignore]` — this test will then pass
-/// and guard against regressions.
-///
-/// What it asserts: `big` arithmetic on a value that does not fit in i32 must
-/// not truncate. `0x1_0000_0000 + 1 == 0x1_0000_0001`, which `%bd` prints as
-/// the full 64-bit decimal.
+/// Regression for parser prefix-binding-power: prefix operators (unary `-`,
+/// type casts like `big`, `int`) must bind tighter than every infix operator.
+/// Before the fix, prefix's recursive `parse_expr_bp(14)` was below the bp of
+/// `*`, `/`, `%`, `<`, `>`, etc., so `-a - b` parsed as `-(a - b)` and
+/// `big lv % big rv` parsed as `Cast(Big, lv % big rv)` — producing wrong
+/// values or compile errors when the inferred kind didn't match the operator.
 #[test]
-#[ignore = "requires big/real opcode-family support in gen_binary"]
-fn cli_compile_big_arithmetic_not_truncated() {
+fn cli_compile_prefix_binds_tighter_than_infix() {
     let Some(module_dir) = find_asset("external/inferno-os/module") else {
         eprintln!("inferno module dir not found, skipping");
         return;
     };
 
     let tmp = std::env::temp_dir().join(format!(
-        "ricevm-big-{}-{}",
+        "ricevm-prec-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -408,20 +401,103 @@ fn cli_compile_big_arithmetic_not_truncated() {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&tmp).expect("create temp dir");
-    let src = tmp.join("Big.b");
-    let out_dis = tmp.join("Big.dis");
+    let src = tmp.join("Prec.b");
+    let out_dis = tmp.join("Prec.dis");
     std::fs::write(
         &src,
-        r#"implement Big;
+        r#"implement Prec;
 include "sys.m";
     sys: Sys;
-Big: module { init: fn(nil: ref Draw->Context, args: list of string); };
+Prec: module { init: fn(nil: ref Draw->Context, args: list of string); };
 init(nil: ref Draw->Context, args: list of string)
 {
     sys = load Sys Sys->PATH;
-    a : big = big 16r100000000;
-    b : big = big 1;
-    sys->print("sum=%bd\n", a + b);
+    a := 5;
+    b := 3;
+    # Each expression below would parse incorrectly under the old prefix bp
+    # (14): `-a-b` → `-(a-b)=-2`, `-a/b` → `-(a/b)=-1`. The right answers
+    # are (-5)-3=-8 and (-5)/3=-1 (wrapping div, but happens to match here).
+    sys->print("neg_sub=%d neg_mul=%d neg_mod=%d\n", -a - b, -a * b, -a % b);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "compile failed: stderr={}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert!(
+        run_out.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    // -a - b = (-5) - 3 = -8;  -a * b = (-5) * 3 = -15;  -a % b = (-5) % 3 = -2.
+    // Wrong answers under the old precedence: -(a-b)=-2, -(a*b)=-15 (same!),
+    // -(a%b)=-2 (same!). The neg_sub case is the discriminator.
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "neg_sub=-8 neg_mul=-15 neg_mod=-2",
+        "prefix unary must bind tighter than - * %"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression: real arithmetic must use the f64 opcode family. Before the
+/// gen_binary fix, `1.5 + 2.5` would have compiled to Addw on truncated 32-bit
+/// representations, producing garbage. Asserting via `int (...)` since `%f`
+/// formatting through call-arg packing has the same 4-byte-slot issue as %bd.
+#[test]
+fn cli_compile_real_arithmetic_uses_addf() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-real-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Real.b");
+    let out_dis = tmp.join("Real.dis");
+    // Pick literals whose results round-trip cleanly through `int(real)`.
+    // Cvtfw rounds (±0.5), per AGENTS.md, so the chosen values are exact
+    // integers in real arithmetic to keep the int-cast deterministic.
+    //   sum = 2.0 + 1.0 = 3.0 → int 3
+    //   prod = 1.5 * 6.0 = 9.0 → int 9
+    //   quot = 8.0 / 2.0 = 4.0 → int 4
+    std::fs::write(
+        &src,
+        r#"implement Real;
+include "sys.m";
+    sys: Sys;
+Real: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    a : real = 2.0;
+    b : real = 1.0;
+    sum : real = a + b;
+    prod : real = 1.5 * 6.0;
+    quot : real = 8.0 / 2.0;
+    sys->print("sum=%d prod=%d quot=%d\n", int sum, int prod, int quot);
 }
 "#,
     )
@@ -449,8 +525,87 @@ init(nil: ref Draw->Context, args: list of string)
     );
     assert_eq!(
         String::from_utf8_lossy(&run_out.stdout).trim_end(),
-        "sum=4294967297",
-        "big addition must not truncate to 32 bits"
+        "sum=3 prod=9 quot=4",
+        "real arithmetic should evaluate via Addf/Mulf/Divf"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression for the big/real opcode-family gap in the Limbo compiler.
+///
+/// Asserts that `big` arithmetic on a value that does not fit in i32 keeps
+/// the full 64-bit precision: `0x1_0000_0000 + 1 == 0x1_0000_0001`. The
+/// assertion uses `int c` and `int (c >> 32)` rather than `%bd` because the
+/// `sys->print` call-arg packing is a separate codepath that still passes
+/// 4-byte slots per argument; that's a known limitation, not what this test
+/// is guarding.
+///
+/// Before the fix: `gen_binary` always emitted Word (32-bit) opcodes, so
+/// `a + b` wrapped to 1, giving `lo=1 hi=0`.
+#[test]
+fn cli_compile_big_arithmetic_keeps_full_precision() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-big-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Big.b");
+    let out_dis = tmp.join("Big.dis");
+    std::fs::write(
+        &src,
+        r#"implement Big;
+include "sys.m";
+    sys: Sys;
+Big: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    a : big = big 16r100000000;
+    b : big = big 1;
+    c : big = a + b;
+    lo := int c;
+    hi := int (c >> 32);
+    sys->print("lo=%d hi=%d\n", lo, hi);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "compile failed: stderr={}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert!(
+        run_out.status.success(),
+        "run failed: stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "lo=1 hi=1",
+        "big arithmetic must preserve all 64 bits: 0x1_0000_0001 should split \
+         into low=1 and high=1"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

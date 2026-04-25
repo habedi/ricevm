@@ -455,6 +455,248 @@ init(nil: ref Draw->Context, args: list of string)
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Regression for `sys->print("%bd", ...)` arg-packing: the call-arg slot
+/// for a `big` argument must be 8 bytes wide, packed at the cumulative
+/// offset of preceding args. Before the fix, every arg got a fixed 4-byte
+/// slot, so the formatter read low-32 + adjacent garbage.
+#[test]
+fn cli_compile_sys_print_bd_packs_eight_bytes() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-bd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Bd.b");
+    let out_dis = tmp.join("Bd.dis");
+    std::fs::write(
+        &src,
+        r#"implement Bd;
+include "sys.m"; sys: Sys;
+Bd: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    a : big = big 16r100000000;
+    b : big = big 1;
+    sys->print("sum=%bd\n", a + b);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "sum=4294967297",
+        "%bd must read all 8 bytes of the big argument"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression for big-typed function return values. The callee's `Movl`
+/// through the return pointer at `frame[16]` writes 8 bytes; the caller's
+/// `ret_tmp` slot must be 8 bytes wide, and the post-call copy must use
+/// `Movl` not `Movw`. Mixed-kind args also exercise `gen_expr_to_kind`
+/// (the `int n` parameter widened to `big` inside the function body).
+#[test]
+fn cli_compile_big_function_return_and_args() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-bigfn-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("BigFn.b");
+    let out_dis = tmp.join("BigFn.dis");
+    std::fs::write(
+        &src,
+        r#"implement BigFn;
+include "sys.m"; sys: Sys;
+BigFn: module { init: fn(nil: ref Draw->Context, args: list of string); };
+
+make_big(n: int): big
+{
+    return big n + big 16r100000000;
+}
+
+double_big(x: big): big
+{
+    return x * big 2;
+}
+
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    a : big = make_big(5);
+    b : big = double_big(a);
+    sys->print("a=%bd b=%bd\n", a, b);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "a=4294967301 b=8589934602",
+        "big function return + big arg + mixed-kind arith must all preserve 64 bits"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression for big compound assignment (`x += y`, `x -= y`) with big
+/// lvalues. Before the fix, compound assign always used Word opcodes
+/// regardless of the lvalue's declared kind.
+#[test]
+fn cli_compile_big_compound_assign() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-bigca-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("BigCa.b");
+    let out_dis = tmp.join("BigCa.dis");
+    std::fs::write(
+        &src,
+        r#"implement BigCa;
+include "sys.m"; sys: Sys;
+BigCa: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    c : big = big 100;
+    c += big 1000000000000;
+    c -= big 500;
+    sys->print("c=%bd\n", c);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "c=999999999600",
+        "big += and big -= must use Addl/Subl not Addw/Subw"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression for big comparisons. Before the fix, `<`, `>`, `==` etc.
+/// always used Beqw/Bltw on 4-byte temps even when both operands were big,
+/// so any comparison whose result depended on bits 32-63 came out wrong.
+#[test]
+fn cli_compile_big_comparisons() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-bigcmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("BigCmp.b");
+    let out_dis = tmp.join("BigCmp.dis");
+    // Construct two values whose low-32 bits compare opposite to their full
+    // 64-bit comparison: a = 0x1_00000000 (lo=0), b = 0x0_FFFFFFFF (lo=-1).
+    // Truncating to word: lo(a)=0, lo(b)=-1, so a>b in 32-bit. But a > b
+    // as 64-bit too: 0x1_00000000 > 0xFFFFFFFF. Use a different pair where
+    // signs flip: a = 0x1_00000001 (lo=1), b = 0x0_7FFFFFFF (lo positive
+    // and large). 32-bit compare lo(a)=1 < lo(b), but a as 64-bit > b.
+    std::fs::write(
+        &src,
+        r#"implement BigCmp;
+include "sys.m"; sys: Sys;
+BigCmp: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    a : big = big 16r100000001;
+    b : big = big 16r7FFFFFFF;
+    if (a > b) sys->print("a>b yes\n"); else sys->print("a>b no\n");
+    if (a == a) sys->print("eq yes\n"); else sys->print("eq no\n");
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "a>b yes\neq yes",
+        "big comparisons must use Bltl/Beql, not the truncating Bltw/Beqw"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Regression: real arithmetic must use the f64 opcode family. Before the
 /// gen_binary fix, `1.5 + 2.5` would have compiled to Addw on truncated 32-bit
 /// representations, producing garbage. Asserting via `int (...)` since `%f`

@@ -636,6 +636,63 @@ init(nil: ref Draw->Context, args: list of string)
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Regression for `x++` / `x--` on big locals. Before the fix, post-inc
+/// emitted `Addw imm(1), x` which only touched the low 4 bytes of the slot;
+/// any increment that crossed the 32-bit boundary lost the carry. Picking
+/// `0xFFFFFFFF` makes the bug visible: `++` should yield `0x1_00000000`.
+#[test]
+fn cli_compile_big_inc_dec_carry_propagates() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-incdec-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("IncDec.b");
+    let out_dis = tmp.join("IncDec.dis");
+    std::fs::write(
+        &src,
+        r#"implement IncDec;
+include "sys.m"; sys: Sys;
+IncDec: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    x : big = big 16rFFFFFFFF;
+    x++;
+    y : big = big 16r100000000;
+    y--;
+    sys->print("x=%bd y=%bd\n", x, y);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "x=4294967296 y=4294967295",
+        "++ and -- on big locals must propagate carry across the 32-bit boundary"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Regression for big comparisons. Before the fix, `<`, `>`, `==` etc.
 /// always used Beqw/Bltw on 4-byte temps even when both operands were big,
 /// so any comparison whose result depended on bits 32-63 came out wrong.

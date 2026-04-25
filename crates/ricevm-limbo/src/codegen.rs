@@ -1082,7 +1082,7 @@ impl CodeGen {
                 if let Expr::Ident(name, _) = inner.as_ref()
                     && let Some((off, _)) = self.get_local(name)
                 {
-                    self.emit(Opcode::Addw, op_imm(1), mid_unused(), op_fp(off));
+                    self.emit_inc_dec(off, self.local_num_kind(name), true);
                 }
                 Ok(())
             }
@@ -1090,7 +1090,7 @@ impl CodeGen {
                 if let Expr::Ident(name, _) = inner.as_ref()
                     && let Some((off, _)) = self.get_local(name)
                 {
-                    self.emit(Opcode::Subw, op_imm(1), mid_unused(), op_fp(off));
+                    self.emit_inc_dec(off, self.local_num_kind(name), false);
                 }
                 Ok(())
             }
@@ -2020,6 +2020,37 @@ impl CodeGen {
             middle: mid,
             destination: dst,
         });
+    }
+
+    /// Emit an in-place increment or decrement of a local at `off`. Picks
+    /// the opcode family by `kind`: Word uses Addw/Subw with an immediate;
+    /// Big and Real materialize a kind-sized `1` in a wide temp via Cvt and
+    /// use Addl/Subl or Addf/Subf so the carry/precision of the high bytes
+    /// is preserved.
+    fn emit_inc_dec(&mut self, off: i32, kind: NumKind, inc: bool) {
+        match kind {
+            NumKind::Word => {
+                let opc = if inc { Opcode::Addw } else { Opcode::Subw };
+                self.emit(opc, op_imm(1), mid_unused(), op_fp(off));
+            }
+            NumKind::Big => {
+                let z = self.alloc_temp_for(NumKind::Word);
+                let one = self.alloc_temp_for(NumKind::Big);
+                self.emit(Opcode::Movw, op_imm(1), mid_unused(), op_fp(z));
+                self.emit(Opcode::Cvtwl, op_fp(z), mid_unused(), op_fp(one));
+                let opc = if inc { Opcode::Addl } else { Opcode::Subl };
+                // 2-op form: dst = dst OP src, so off += one (or off -= one).
+                self.emit(opc, op_fp(one), mid_unused(), op_fp(off));
+            }
+            NumKind::Real => {
+                let z = self.alloc_temp_for(NumKind::Word);
+                let one = self.alloc_temp_for(NumKind::Real);
+                self.emit(Opcode::Movw, op_imm(1), mid_unused(), op_fp(z));
+                self.emit(Opcode::Cvtwf, op_fp(z), mid_unused(), op_fp(one));
+                let opc = if inc { Opcode::Addf } else { Opcode::Subf };
+                self.emit(opc, op_fp(one), mid_unused(), op_fp(off));
+            }
+        }
     }
 }
 

@@ -51,6 +51,58 @@ fn type_num_kind(ty: &Type) -> NumKind {
 /// Return the numeric kind of the value produced by a known `$Sys` builtin.
 /// Default Word covers everything not in the lookup; the kind is used to
 /// pick the right Mov/Cvt opcode when copying the return value out.
+/// Extract the array element BasicType from a VarDecl, if any. Looks at the
+/// explicit type annotation first, then the init expression's array forms
+/// (`array[N] of T`, `array[] of {...}`, `array of byte stringExpr`).
+fn decl_array_elem_basic(v: &VarDecl) -> Option<BasicType> {
+    if let Some(Type::Array(elem)) = &v.ty
+        && let Type::Basic(b) = elem.as_ref()
+    {
+        return Some(*b);
+    }
+    match v.init.as_ref()? {
+        Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) => match ty.as_ref() {
+            Type::Basic(b) => Some(*b),
+            _ => None,
+        },
+        Expr::Cast(ty, _, _) => match ty.as_ref() {
+            Type::Array(elem) => match elem.as_ref() {
+                Type::Basic(b) => Some(*b),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Extract the channel element BasicType from a VarDecl, if any.
+fn decl_chan_elem_basic(v: &VarDecl) -> Option<BasicType> {
+    if let Some(Type::Chan(elem)) = &v.ty
+        && let Type::Basic(b) = elem.as_ref()
+    {
+        return Some(*b);
+    }
+    if let Some(Expr::ChanAlloc(ty, _)) = v.init.as_ref()
+        && let Type::Basic(b) = ty.as_ref()
+    {
+        return Some(*b);
+    }
+    None
+}
+
+/// Pick the Newc* opcode for a channel of the given element BasicType.
+fn newc_opcode(basic: Option<BasicType>) -> Opcode {
+    match basic {
+        Some(BasicType::Byte) => Opcode::Newcb,
+        Some(BasicType::Big) => Opcode::Newcl,
+        Some(BasicType::Real) => Opcode::Newcf,
+        Some(BasicType::String) => Opcode::Newcp,
+        // int and unknown default to a 4-byte word channel.
+        _ => Opcode::Newcw,
+    }
+}
+
 fn sys_return_kind(name: &str) -> NumKind {
     match name {
         // big-returning sys builtins (per sys.m signatures)
@@ -83,6 +135,19 @@ pub struct CodeGen {
     /// The return kind picks the right Mov/Cvt opcode when copying the
     /// callee's return value into the caller's slot.
     func_table: Vec<(String, i32, i32, NumKind)>,
+    /// Sidecar map for array locals: name -> element BasicType.
+    /// Populated by VarDecl/Param when the declared type is `array of T`.
+    /// Used by Expr::Index and Expr::Assign(Index, _) to pick Indw/Indl/
+    /// Indf/Indb and Movw/Movl/Movf/Movb based on the element width.
+    local_array_elem: std::collections::HashMap<String, BasicType>,
+    /// Sidecar map for channel locals: name -> element BasicType. Lets
+    /// Send/Recv size the data temp by the channel's element width and
+    /// pick the right Newc* opcode at allocation time.
+    local_chan_elem: std::collections::HashMap<String, BasicType>,
+    /// Sidecar map for function return tuple shapes: name -> field Types.
+    /// Lets `(a, b, c) := func()` allocate per-field locals at correct
+    /// offsets and use kind-matched Mov for each field.
+    func_tuple_ret: std::collections::HashMap<String, Vec<Type>>,
     /// Frame sizes for each compiled function, in order.
     func_frames: Vec<i32>,
     /// Exception handlers for the module.
@@ -114,6 +179,9 @@ impl CodeGen {
             sys_funcs: Vec::new(),
             func_table: Vec::new(),
             func_frames: Vec::new(),
+            local_array_elem: std::collections::HashMap::new(),
+            local_chan_elem: std::collections::HashMap::new(),
+            func_tuple_ret: std::collections::HashMap::new(),
             handlers: Vec::new(),
         }
     }
@@ -407,6 +475,20 @@ impl CodeGen {
                 let kind = type_num_kind(&param.ty);
                 if name != "nil" {
                     self.locals.push((name.clone(), param_off, ty, kind));
+                    // Track array params' element BasicType so indexing into
+                    // them later picks the right Ind/Mov opcode pair.
+                    if let Type::Array(elem) = &param.ty
+                        && let Type::Basic(b) = elem.as_ref()
+                    {
+                        self.local_array_elem.insert(name.clone(), *b);
+                    }
+                    // Same for chan params so Send/Recv on them know the
+                    // element width.
+                    if let Type::Chan(elem) = &param.ty
+                        && let Type::Basic(b) = elem.as_ref()
+                    {
+                        self.local_chan_elem.insert(name.clone(), *b);
+                    }
                 }
                 // Frame param slots are 4-byte aligned in the reference ABI;
                 // big/real params occupy two adjacent slots. This keeps the
@@ -441,6 +523,12 @@ impl CodeGen {
             .as_ref()
             .map(type_num_kind)
             .unwrap_or(NumKind::Word);
+        // Record tuple-return field shape so callers unpacking via
+        // `(a, b) := f()` can pick the correct Mov{w/l/f/b} per field.
+        if let Some(Type::Tuple(fields)) = &func.sig.ret {
+            self.func_tuple_ret
+                .insert(full_name.clone(), fields.clone());
+        }
         self.func_table
             .push((full_name, entry_pc as i32, self.frame_size, ret_kind));
         self.func_frames.push(self.frame_size);
@@ -464,7 +552,38 @@ impl CodeGen {
             | Type::Basic(BasicType::Byte)
             | Type::Basic(BasicType::Big)
             | Type::Basic(BasicType::Real) => ValType::Word,
+            // Arrays carry their own ValType so call sites and Index handlers
+            // can pick array-specific opcodes (Indw/Indl/Movw/Movl/...).
+            Type::Array(_) => ValType::Array,
             _ => ValType::Ptr,
+        }
+    }
+
+    /// Look up an array local's element BasicType. Returns None for locals
+    /// that aren't recorded as arrays (or don't exist at all).
+    fn array_elem_basic(&self, name: &str) -> Option<BasicType> {
+        self.local_array_elem.get(name).copied()
+    }
+
+    /// Resolve the array element BasicType for an arr expression. Currently
+    /// only handles `Ident` (lookup in sidecar); other forms (e.g.,
+    /// `f()[i]`) fall back to None so the caller can default to Word width.
+    fn array_elem_basic_for_expr(&self, expr: &Expr) -> Option<BasicType> {
+        match expr {
+            Expr::Ident(name, _) => self.array_elem_basic(name),
+            _ => None,
+        }
+    }
+
+    /// Pick the (Ind*, Mov*) opcode pair for an array element of the given
+    /// BasicType. Defaults (None or non-numeric BasicType::String) treat
+    /// the element as a 4-byte word (the common case for ADT/pointer arrays).
+    fn array_elem_opcodes(basic: Option<BasicType>) -> (Opcode, Opcode) {
+        match basic {
+            Some(BasicType::Byte) => (Opcode::Indb, Opcode::Movb),
+            Some(BasicType::Big) => (Opcode::Indl, Opcode::Movl),
+            Some(BasicType::Real) => (Opcode::Indf, Opcode::Movf),
+            _ => (Opcode::Indw, Opcode::Movw),
         }
     }
 
@@ -476,8 +595,18 @@ impl CodeGen {
             Stmt::VarDecl(v) => {
                 let ty = self.infer_decl_type(v);
                 let kind = self.decl_num_kind(v);
+                // If the declared (or inferred) Limbo type is an array of a
+                // basic element, record that for later Indexing.
+                let elem_basic = decl_array_elem_basic(v);
+                let chan_elem_basic = decl_chan_elem_basic(v);
                 for name in &v.names {
                     self.alloc_local(name, ty, kind);
+                    if let Some(b) = elem_basic {
+                        self.local_array_elem.insert(name.clone(), b);
+                    }
+                    if let Some(b) = chan_elem_basic {
+                        self.local_chan_elem.insert(name.clone(), b);
+                    }
                 }
                 if let Some(init) = &v.init {
                     let name = v.names.first().map(|s| s.as_str()).unwrap_or("");
@@ -488,20 +617,39 @@ impl CodeGen {
             }
             Stmt::Return(expr, _) => {
                 if let Some(e) = expr {
-                    // Write return value through the return pointer at 16(fp).
-                    // Numeric returns use the kind-matched opcode (Movw/Movl/
-                    // Movf); pointer-typed returns use Movp.
-                    let ty = self.infer_expr_type(e);
-                    let kind = self.infer_num_kind(e);
-                    let val_tmp = self.alloc_temp_for(kind);
-                    self.gen_expr_to(e, val_tmp)?;
-                    let op = match (ty, kind) {
-                        (_, NumKind::Big) => Opcode::Movl,
-                        (_, NumKind::Real) => Opcode::Movf,
-                        (ValType::Word, NumKind::Word) => Opcode::Movw,
-                        _ => Opcode::Movp,
-                    };
-                    self.emit(op, op_fp(val_tmp), mid_unused(), op_fp_ind(16, 0));
+                    // Tuple return: write each field through the return
+                    // pointer at the appropriate cumulative offset, sized
+                    // by each field's NumKind.
+                    if let Expr::Tuple(fields, _) = e {
+                        let mut field_off = 0i32;
+                        for field in fields {
+                            let ty = self.infer_expr_type(field);
+                            let kind = self.infer_num_kind(field);
+                            let tmp = self.alloc_temp_for(kind);
+                            self.gen_expr_to(field, tmp)?;
+                            let op = match (ty, kind) {
+                                (_, NumKind::Big) => Opcode::Movl,
+                                (_, NumKind::Real) => Opcode::Movf,
+                                (ValType::Word, NumKind::Word) => Opcode::Movw,
+                                _ => Opcode::Movp,
+                            };
+                            self.emit(op, op_fp(tmp), mid_unused(), op_fp_ind(16, field_off));
+                            field_off += kind.byte_size();
+                        }
+                    } else {
+                        // Single value: kind-matched opcode through return ptr.
+                        let ty = self.infer_expr_type(e);
+                        let kind = self.infer_num_kind(e);
+                        let val_tmp = self.alloc_temp_for(kind);
+                        self.gen_expr_to(e, val_tmp)?;
+                        let op = match (ty, kind) {
+                            (_, NumKind::Big) => Opcode::Movl,
+                            (_, NumKind::Real) => Opcode::Movf,
+                            (ValType::Word, NumKind::Word) => Opcode::Movw,
+                            _ => Opcode::Movp,
+                        };
+                        self.emit(op, op_fp(val_tmp), mid_unused(), op_fp_ind(16, 0));
+                    }
                 }
                 self.emit(Opcode::Ret, op_unused(), mid_unused(), op_unused());
                 Ok(())
@@ -660,6 +808,26 @@ impl CodeGen {
                         .unwrap_or(NumKind::Word)
                 } else if let Expr::ModQual(_, name, _) = callee.as_ref() {
                     sys_return_kind(name)
+                } else {
+                    NumKind::Word
+                }
+            }
+            // Array element access inherits the element's NumKind so callers
+            // (Cast, gen_expr_to_kind, sys-print arg packing) treat `a[i]`
+            // as Big/Real when the array's element type is.
+            Expr::Index(arr, _, _) => {
+                if let Some(b) = self.array_elem_basic_for_expr(arr) {
+                    type_num_kind(&Type::Basic(b))
+                } else {
+                    NumKind::Word
+                }
+            }
+            // `<-chan` returns the channel's element kind.
+            Expr::Recv(chan_expr, _) => {
+                if let Expr::Ident(name, _) = chan_expr.as_ref()
+                    && let Some(b) = self.local_chan_elem.get(name)
+                {
+                    type_num_kind(&Type::Basic(*b))
                 } else {
                     NumKind::Word
                 }
@@ -954,20 +1122,41 @@ impl CodeGen {
                         .unwrap_or_else(|| self.alloc_local(name, ty, NumKind::Word));
                     self.gen_expr_to(rhs, off)
                 } else if let Expr::Index(arr_expr, idx_expr, _) = lhs.as_ref() {
-                    // s[i] = val → Insc val, idx, str
-                    let val_tmp = self.alloc_temp();
+                    // Distinguish array-element write from string-character
+                    // insert by the lvalue's ValType. Strings are Ptr; arrays
+                    // are Array (set by infer_param_type / infer_decl_type).
+                    let arr_ty = self.infer_expr_type(arr_expr);
                     let idx_tmp = self.alloc_temp();
                     let arr_tmp = self.alloc_temp();
-                    self.gen_expr_to(rhs, val_tmp)?;
-                    self.gen_expr_to(idx_expr, idx_tmp)?;
-                    self.gen_expr_to(arr_expr, arr_tmp)?;
-                    // Insc src, mid, dst: dst[mid] = src
-                    self.emit(
-                        Opcode::Insc,
-                        op_fp(val_tmp),
-                        mid_fp(idx_tmp),
-                        op_fp(arr_tmp),
-                    );
+                    if arr_ty == ValType::Array {
+                        // Array element write:
+                        //   Ind* arr, ref, idx — install heap_ref at ref slot
+                        //   Mov* val, *(ref)  — write through ref
+                        let elem = self.array_elem_basic_for_expr(arr_expr);
+                        let elem_kind = elem
+                            .map(|b| type_num_kind(&Type::Basic(b)))
+                            .unwrap_or(NumKind::Word);
+                        let val_tmp = self.alloc_temp_for(elem_kind);
+                        self.gen_expr_to(rhs, val_tmp)?;
+                        self.gen_expr_to(idx_expr, idx_tmp)?;
+                        self.gen_expr_to(arr_expr, arr_tmp)?;
+                        let ref_tmp = self.alloc_temp();
+                        let (ind_op, mov_op) = Self::array_elem_opcodes(elem);
+                        self.emit(ind_op, op_fp(arr_tmp), mid_fp(ref_tmp), op_fp(idx_tmp));
+                        self.emit(mov_op, op_fp(val_tmp), mid_unused(), op_fp_ind(ref_tmp, 0));
+                    } else {
+                        // String char insert: s[i] = c.
+                        let val_tmp = self.alloc_temp();
+                        self.gen_expr_to(rhs, val_tmp)?;
+                        self.gen_expr_to(idx_expr, idx_tmp)?;
+                        self.gen_expr_to(arr_expr, arr_tmp)?;
+                        self.emit(
+                            Opcode::Insc,
+                            op_fp(val_tmp),
+                            mid_fp(idx_tmp),
+                            op_fp(arr_tmp),
+                        );
+                    }
                     Ok(())
                 } else if let Expr::Slice(arr_expr, lo, _, _) = lhs.as_ref() {
                     // a[lo:] = rhs → Slicela rhs, lo, a
@@ -1058,23 +1247,79 @@ impl CodeGen {
             }
             Expr::DeclAssign(names, rhs, _) => {
                 let ty = self.infer_expr_type(rhs);
+                let kind = self.infer_num_kind(rhs);
                 let name = names.first().map(|s| s.as_str()).unwrap_or("_");
-                let off = self.alloc_local(name, ty, NumKind::Word);
+                let off = self.alloc_local(name, ty, kind);
+                // Capture array element type when the rhs is `array[N] of T`
+                // so subsequent indexing picks the right opcode pair.
+                if let Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) = rhs.as_ref()
+                    && let Type::Basic(b) = ty.as_ref()
+                {
+                    self.local_array_elem.insert(name.to_string(), *b);
+                }
+                // Same for `chan of T` so Send/Recv can pick the right width.
+                if let Expr::ChanAlloc(ty, _) = rhs.as_ref()
+                    && let Type::Basic(b) = ty.as_ref()
+                {
+                    self.local_chan_elem.insert(name.to_string(), *b);
+                }
                 self.gen_expr_to(rhs, off)
             }
             Expr::TupleDeclAssign(names, rhs, _) => {
-                // Generate call, then extract tuple fields
-                let ret_tmp = self.alloc_temp();
+                // For function-call rhs with a known tuple return shape, lay
+                // out per-field offsets using each field's actual width.
+                // Otherwise fall back to a 4-byte stride (the historical
+                // behavior, accurate for word-only tuples).
+                let field_types: Option<Vec<Type>> = if let Expr::Call(callee, _, _) = rhs.as_ref()
+                {
+                    let cname = match callee.as_ref() {
+                        Expr::Ident(n, _) => Some(n.clone()),
+                        _ => None,
+                    };
+                    cname.and_then(|n| self.func_tuple_ret.get(&n).cloned())
+                } else {
+                    None
+                };
+                let kinds: Vec<NumKind> = if let Some(types) = &field_types {
+                    types.iter().map(type_num_kind).collect()
+                } else {
+                    names.iter().map(|_| NumKind::Word).collect()
+                };
+                // Allocate ret_tmp wide enough to hold the whole tuple by
+                // summing field widths. Without this, big/real fields would
+                // overflow into adjacent temps.
+                let total: i32 = kinds.iter().map(|k| k.byte_size()).sum();
+                let ret_tmp = self.next_local;
+                self.next_local += total.max(4);
+                self.grow_frame();
                 self.gen_expr_to(rhs, ret_tmp)?;
+                let mut field_off = ret_tmp;
                 for (i, name) in names.iter().enumerate() {
+                    let kind = kinds.get(i).copied().unwrap_or(NumKind::Word);
+                    let ty = field_types
+                        .as_ref()
+                        .and_then(|t| t.get(i))
+                        .map(|t| match t {
+                            Type::Basic(BasicType::Int)
+                            | Type::Basic(BasicType::Byte)
+                            | Type::Basic(BasicType::Big)
+                            | Type::Basic(BasicType::Real) => ValType::Word,
+                            _ => ValType::Ptr,
+                        })
+                        .unwrap_or(ValType::Word);
                     if name != "nil" {
-                        let off = self.alloc_local(name, ValType::Word, NumKind::Word);
-                        // Tuple fields at ret_tmp + i*4
-                        let field_off = ret_tmp + (i as i32) * 4;
+                        let off = self.alloc_local(name, ty, kind);
                         if field_off != off {
-                            self.emit(Opcode::Movw, op_fp(field_off), mid_unused(), op_fp(off));
+                            let op = match kind {
+                                NumKind::Big => Opcode::Movl,
+                                NumKind::Real => Opcode::Movf,
+                                NumKind::Word if ty == ValType::Ptr => Opcode::Movp,
+                                NumKind::Word => Opcode::Movw,
+                            };
+                            self.emit(op, op_fp(field_off), mid_unused(), op_fp(off));
                         }
                     }
+                    field_off += kind.byte_size();
                 }
                 Ok(())
             }
@@ -1096,10 +1341,21 @@ impl CodeGen {
             }
             Expr::Call(_, _, _) => self.gen_call_expr(expr),
             Expr::Send(chan_expr, val_expr, _) => {
+                // Size the value temp by the channel's element kind so the
+                // VM's op_send (which reads `elem_size` bytes from the val
+                // slot) doesn't truncate big/real messages.
+                let chan_elem = if let Expr::Ident(name, _) = chan_expr.as_ref() {
+                    self.local_chan_elem.get(name).copied()
+                } else {
+                    None
+                };
+                let val_kind = chan_elem
+                    .map(|b| type_num_kind(&Type::Basic(b)))
+                    .unwrap_or_else(|| self.infer_num_kind(val_expr));
                 let chan_tmp = self.alloc_temp();
-                let val_tmp = self.alloc_temp();
+                let val_tmp = self.alloc_temp_for(val_kind);
                 self.gen_expr_to(chan_expr, chan_tmp)?;
-                self.gen_expr_to(val_expr, val_tmp)?;
+                self.gen_expr_to_kind(val_expr, val_tmp, val_kind)?;
                 self.emit(Opcode::Send, op_fp(val_tmp), mid_unused(), op_fp(chan_tmp));
                 Ok(())
             }
@@ -1189,17 +1445,27 @@ impl CodeGen {
                 self.gen_binary(lhs, *op, rhs, dst)
             }
             Expr::Index(arr, idx, _) => {
-                let arr_tmp = self.alloc_temp();
-                let idx_tmp = self.alloc_temp();
-                self.gen_expr_to(arr, arr_tmp)?;
-                self.gen_expr_to(idx, idx_tmp)?;
                 let arr_ty = self.infer_expr_type(arr);
                 if arr_ty == ValType::Ptr {
-                    // String indexing: Indc src, mid, dst → dst = src[mid]
+                    // String character read: Indc arr, idx, dst.
+                    let arr_tmp = self.alloc_temp();
+                    let idx_tmp = self.alloc_temp();
+                    self.gen_expr_to(arr, arr_tmp)?;
+                    self.gen_expr_to(idx, idx_tmp)?;
                     self.emit(Opcode::Indc, op_fp(arr_tmp), mid_fp(idx_tmp), op_fp(dst));
                 } else {
-                    // Array indexing: Indw
-                    self.emit(Opcode::Indw, op_fp(arr_tmp), mid_unused(), op_fp(dst));
+                    // Array element read:
+                    //   Ind* arr, ref, idx — install heap_ref at ref slot
+                    //   Mov* *(ref), dst   — read through ref
+                    let elem = self.array_elem_basic_for_expr(arr);
+                    let arr_tmp = self.alloc_temp();
+                    let idx_tmp = self.alloc_temp();
+                    self.gen_expr_to(arr, arr_tmp)?;
+                    self.gen_expr_to(idx, idx_tmp)?;
+                    let ref_tmp = self.alloc_temp();
+                    let (ind_op, mov_op) = Self::array_elem_opcodes(elem);
+                    self.emit(ind_op, op_fp(arr_tmp), mid_fp(ref_tmp), op_fp(idx_tmp));
+                    self.emit(mov_op, op_fp_ind(ref_tmp, 0), mid_unused(), op_fp(dst));
                 }
                 Ok(())
             }
@@ -1487,13 +1753,22 @@ impl CodeGen {
                 );
                 Ok(())
             }
-            Expr::ChanAlloc(_, _) => {
-                // chan of type → Newcw $0, dst
-                self.emit(Opcode::Newcw, op_unused(), mid_imm(0), op_fp(dst));
+            Expr::ChanAlloc(ty, _) => {
+                // chan of T → Newc{w/b/l/f/p} $0, dst, picking the opcode
+                // by element width so Send/Recv copy the right number of
+                // bytes per message.
+                let elem = match ty.as_ref() {
+                    Type::Basic(b) => Some(*b),
+                    _ => None,
+                };
+                self.emit(newc_opcode(elem), op_unused(), mid_imm(0), op_fp(dst));
                 Ok(())
             }
             Expr::Recv(chan_expr, _) => {
-                // <-chan → Recv chan, dst
+                // <-chan → Recv chan, dst. The dst slot is the receiver's
+                // local; its size is set by the surrounding kind-aware
+                // alloc, so the channel's elem_size and dst's slot size
+                // align as long as the Limbo program is type-clean.
                 let chan_tmp = self.alloc_temp();
                 self.gen_expr_to(chan_expr, chan_tmp)?;
                 self.emit(Opcode::Recv, op_fp(chan_tmp), mid_unused(), op_fp(dst));
@@ -1880,9 +2155,16 @@ impl CodeGen {
                 arg_off += kind.byte_size();
             }
 
+            // When the caller wants the result, install dst directly as the
+            // return target. This skips an intermediate ret_tmp + Mov pair,
+            // and matters for tuple returns whose total width can exceed 8
+            // bytes — a single Mov{w/l/f} couldn't copy the whole tuple.
+            // The caller (e.g., TupleDeclAssign) is responsible for sizing
+            // `dst` to fit the full return shape.
+            let return_target = result_dst.unwrap_or(ret_tmp);
             self.emit(
                 Opcode::Lea,
-                op_fp(ret_tmp),
+                op_fp(return_target),
                 mid_unused(),
                 op_fp_ind(frame_tmp, 16),
             );
@@ -1892,15 +2174,8 @@ impl CodeGen {
                 mid_unused(),
                 op_imm(func_pc),
             );
-
-            if let Some(dst) = result_dst {
-                let op = match ret_kind {
-                    NumKind::Word => Opcode::Movw,
-                    NumKind::Big => Opcode::Movl,
-                    NumKind::Real => Opcode::Movf,
-                };
-                self.emit(op, op_fp(ret_tmp), mid_unused(), op_fp(dst));
-            }
+            // Suppress unused-variable warning when result_dst is None.
+            let _ = ret_kind;
         }
         Ok(())
     }
@@ -1955,9 +2230,12 @@ impl CodeGen {
             arg_off += kind.byte_size();
         }
 
+        // Same direct-return-target trick as gen_local_call: skip the
+        // intermediate ret_tmp when the caller provides a destination.
+        let return_target = result_dst.unwrap_or(ret_tmp);
         self.emit(
             Opcode::Lea,
-            op_fp(ret_tmp),
+            op_fp(return_target),
             mid_unused(),
             op_fp_ind(frame_tmp, 16),
         );
@@ -1967,23 +2245,6 @@ impl CodeGen {
             mid_imm(func_idx as i32),
             op_mp(self.sys_mp_ref),
         );
-
-        if let Some(dst) = result_dst {
-            let ret_is_ptr = matches!(
-                func_name,
-                "fildes" | "open" | "create" | "fstat" | "stat" | "sprint" | "aprint"
-            );
-            let op = if ret_is_ptr {
-                Opcode::Movp
-            } else {
-                match sys_return_kind(func_name) {
-                    NumKind::Big => Opcode::Movl,
-                    NumKind::Real => Opcode::Movf,
-                    NumKind::Word => Opcode::Movw,
-                }
-            };
-            self.emit(op, op_fp(ret_tmp), mid_unused(), op_fp(dst));
-        }
         Ok(())
     }
 

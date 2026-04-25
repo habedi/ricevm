@@ -636,6 +636,192 @@ init(nil: ref Draw->Context, args: list of string)
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Regression for array element read/write. Before the fix, `arr[i] = val`
+/// emitted `Insc` (string char insert) for ALL arrays — even int arrays —
+/// causing `insc on non-string` at runtime. The new path uses Indw/Movw
+/// (Indl/Movl etc.) through a heap-ref slot.
+#[test]
+fn cli_compile_array_element_read_write() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-arr-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Arr.b");
+    let out_dis = tmp.join("Arr.dis");
+    std::fs::write(
+        &src,
+        r#"implement Arr;
+include "sys.m"; sys: Sys;
+Arr: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    ai := array[3] of int;
+    ai[0] = 10; ai[1] = 20; ai[2] = 30;
+    ab := array[3] of big;
+    ab[0] = big 16r100000000;
+    ab[1] = big 16r200000000;
+    ab[2] = big 16r300000000;
+    sys->print("ai=%d,%d,%d ab=%bd,%bd,%bd\n",
+        ai[0], ai[1], ai[2], ab[0], ab[1], ab[2]);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert!(
+        run_out.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "ai=10,20,30 ab=4294967296,8589934592,12884901888",
+        "array element read/write must dispatch by element type"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression: `chan of big` must allocate via `Newcl` (8-byte element)
+/// and Send must read 8 bytes from the value temp. Before the fix,
+/// `Newcw` was emitted unconditionally and the Send temp was 4 bytes wide,
+/// truncating big messages to 0.
+#[test]
+fn cli_compile_channel_of_big() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-chan-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Chan.b");
+    let out_dis = tmp.join("Chan.dis");
+    // sender comes before init so the codegen has the function in scope
+    // when it emits Spawn (a separate pre-existing forward-reference gap).
+    std::fs::write(
+        &src,
+        r#"implement Chan;
+include "sys.m"; sys: Sys;
+Chan: module { init: fn(nil: ref Draw->Context, args: list of string); };
+sender(c: chan of big)
+{
+    c <-= big 16r100000000;
+}
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    c := chan of big;
+    spawn sender(c);
+    v := <-c;
+    sys->print("v=%bd\n", v);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "v=4294967296",
+        "chan of big must use Newcl and 8-byte Send/Recv"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression for tuple unpack with mixed-kind fields. Before the fix,
+/// `(a, b) := pair()` always allocated a 4-byte ret_tmp and copied each
+/// field with a 4-byte stride — corrupting big/real fields and
+/// misaligning subsequent ones.
+#[test]
+fn cli_compile_tuple_unpack_with_big_field() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-tup-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Tup.b");
+    let out_dis = tmp.join("Tup.dis");
+    std::fs::write(
+        &src,
+        r#"implement Tup;
+include "sys.m"; sys: Sys;
+Tup: module { init: fn(nil: ref Draw->Context, args: list of string); };
+pair(): (big, int) { return (big 16r100000000, 42); }
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    (a, b) := pair();
+    sys->print("a=%bd b=%d\n", a, b);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "a=4294967296 b=42",
+        "(big, int) tuple unpack must size and place each field by its kind"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Regression for `x++` / `x--` on big locals. Before the fix, post-inc
 /// emitted `Addw imm(1), x` which only touched the low 4 bytes of the slot;
 /// any increment that crossed the 32-bit boundary lost the carry. Picking

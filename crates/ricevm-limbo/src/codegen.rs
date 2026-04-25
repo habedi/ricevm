@@ -1012,6 +1012,14 @@ impl CodeGen {
                     NumKind::Word
                 }
             }
+            // ADT field access propagates the field's NumKind so big/real
+            // fields read as Big/Real (and arg packing/comparisons size
+            // their slots correctly).
+            Expr::Dot(inner, field, _) => self
+                .adt_name_for_expr(inner)
+                .and_then(|a| self.adt_field_info(&a, field))
+                .map(|(_, t)| type_num_kind(&t))
+                .unwrap_or(NumKind::Word),
             _ => NumKind::Word,
         }
     }
@@ -1072,6 +1080,18 @@ impl CodeGen {
             Expr::Hd(_, _) => ValType::Ptr,
             Expr::Tl(_, _) => ValType::Ptr,
             Expr::Len(_, _) => ValType::Word,
+            // ADT field access mirrors the field's declared type.
+            Expr::Dot(inner, field, _) => {
+                match self
+                    .adt_name_for_expr(inner)
+                    .and_then(|a| self.adt_field_info(&a, field))
+                {
+                    Some((_, Type::Basic(_))) => ValType::Word,
+                    Some((_, Type::Array(_))) => ValType::Array,
+                    Some((_, _)) => ValType::Ptr,
+                    None => ValType::Word,
+                }
+            }
             Expr::Index(arr, _, _) => {
                 // Element type drives the resulting ValType: word/byte/big/
                 // real → Word; nested arrays → Array; everything else (string,
@@ -1512,12 +1532,24 @@ impl CodeGen {
                 {
                     self.local_chan_elem.insert(name.to_string(), *b);
                 }
-                // ADT inference: `p := ref Foo(...)` carries the ADT name
-                // through the RefAlloc's Type. Cast(Foo, ...) and a Limbo
-                // type annotation (`p: ref Foo = ...`) handled elsewhere.
-                if let Expr::RefAlloc(ty, _, _) = rhs.as_ref()
-                    && let Some(a) = Self::adt_name_for_type(ty)
-                {
+                // ADT inference: the parser emits `ref Foo(...)` as
+                // `Unary(Ref, Call(Ident(Foo), args))`, not RefAlloc. Detect
+                // both shapes so DeclAssign records the ADT name.
+                let adt_from_rhs = match rhs.as_ref() {
+                    Expr::RefAlloc(ty, _, _) => Self::adt_name_for_type(ty),
+                    Expr::Unary(UnaryOp::Ref, inner, _) => {
+                        if let Expr::Call(callee, _, _) = inner.as_ref()
+                            && let Expr::Ident(n, _) = callee.as_ref()
+                            && self.adt_layouts.contains_key(n)
+                        {
+                            Some(n.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(a) = adt_from_rhs {
                     self.local_adt_type.insert(name.to_string(), a);
                 }
                 self.gen_expr_to(rhs, off)
@@ -2334,7 +2366,46 @@ impl CodeGen {
                 }
             }
             UnaryOp::Ref => {
-                self.gen_expr_to(inner, dst)?;
+                // The parser emits `ref TypeName(args)` as
+                // `Unary(Ref, Call(Ident(TypeName), args))`. If the callee
+                // resolves to a known ADT (not a function), treat it as
+                // record allocation: New + per-field init at the ADT's
+                // actual layout offsets with kind-aware Mov.
+                if let Expr::Call(callee, args, _) = inner
+                    && let Expr::Ident(name, _) = callee.as_ref()
+                    && self.adt_layouts.contains_key(name)
+                {
+                    self.emit(Opcode::New, op_imm(1), mid_unused(), op_fp(dst));
+                    let layout = self.adt_layouts.get(name).cloned();
+                    for (i, arg) in args.iter().enumerate() {
+                        let (field_off, field_ty) = match layout.as_ref().and_then(|l| l.get(i)) {
+                            Some((_, t, off)) => (*off, Some(t.clone())),
+                            None => ((i as i32) * 4, None),
+                        };
+                        let kind = field_ty
+                            .as_ref()
+                            .map(type_num_kind)
+                            .unwrap_or(NumKind::Word);
+                        let arg_tmp = self.alloc_temp_for(kind);
+                        self.gen_expr_to_kind(arg, arg_tmp, kind)?;
+                        let op = match field_ty.as_ref() {
+                            Some(Type::Basic(BasicType::Big)) => Opcode::Movl,
+                            Some(Type::Basic(BasicType::Real)) => Opcode::Movf,
+                            Some(Type::Basic(_)) => Opcode::Movw,
+                            Some(_) => Opcode::Movp,
+                            None => {
+                                if self.infer_expr_type(arg) != ValType::Word {
+                                    Opcode::Movp
+                                } else {
+                                    Opcode::Movw
+                                }
+                            }
+                        };
+                        self.emit(op, op_fp(arg_tmp), mid_unused(), op_fp_ind(dst, field_off));
+                    }
+                } else {
+                    self.gen_expr_to(inner, dst)?;
+                }
             }
         }
         Ok(())

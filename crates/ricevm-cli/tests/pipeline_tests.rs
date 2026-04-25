@@ -705,6 +705,250 @@ init(nil: ref Draw->Context, args: list of string)
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Regression: `arr[i] += val` (and `-=`, `*=`, etc.) must use the
+/// element's kind-aware opcode pair through a heap-ref slot. Before the
+/// fix, CompoundAssign only handled Ident lvalues; Index lvalues fell
+/// through silently with no codegen.
+#[test]
+fn cli_compile_array_compound_assign() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-aceq-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("AcEq.b");
+    let out_dis = tmp.join("AcEq.dis");
+    std::fs::write(
+        &src,
+        r#"implement AcEq;
+include "sys.m"; sys: Sys;
+AcEq: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    a := array[2] of int;
+    a[0] = 10;
+    a[0] += 5;
+    a[1] = 100;
+    a[1] -= 30;
+    ab := array[1] of big;
+    ab[0] = big 16r100000000;
+    ab[0] += big 7;
+    sys->print("a=%d %d ab=%bd\n", a[0], a[1], ab[0]);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "a=15 70 ab=4294967303",
+        "arr[i] op= val must dispatch by element kind"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression: nested array types (`array of array of T`) must peel one
+/// `Type::Array` layer per `Index` so the inner indexing picks the correct
+/// element-width opcode pair.
+#[test]
+fn cli_compile_nested_array_of_big() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-nest-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Nest.b");
+    let out_dis = tmp.join("Nest.dis");
+    std::fs::write(
+        &src,
+        r#"implement Nest;
+include "sys.m"; sys: Sys;
+Nest: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    aa := array[2] of array of big;
+    aa[0] = array[2] of big;
+    aa[0][0] = big 16r100000000;
+    aa[0][1] = big 16r200000000;
+    sys->print("%bd %bd\n", aa[0][0], aa[0][1]);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "4294967296 8589934592",
+        "nested array indexing must descend through Type::Array layers"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression: `spawn func()` and `func()` must work even when `func` is
+/// defined later in the source. Pre-pass populates the func_table; a fixup
+/// pass patches the Call/Spawn destinations after every body is emitted.
+#[test]
+fn cli_compile_forward_reference_spawn() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-fwd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Fwd.b");
+    let out_dis = tmp.join("Fwd.dis");
+    // `init` calls / spawns functions defined AFTER it. With the fix, both
+    // forms resolve to the right entry PC after a post-pass fixup.
+    std::fs::write(
+        &src,
+        r#"implement Fwd;
+include "sys.m"; sys: Sys;
+Fwd: module { init: fn(nil: ref Draw->Context, args: list of string); };
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    c := chan of big;
+    spawn sender(c);
+    v := <-c;
+    sys->print("v=%bd direct=%d\n", v, direct());
+}
+sender(c: chan of big)
+{
+    c <-= big 16r100000000;
+}
+direct(): int { return 42; }
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "v=4294967296 direct=42",
+        "forward-referenced spawn and call must both resolve correctly"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Regression: ADT field access for big/real fields must use the field's
+/// real offset (computed from the layout) and the kind-matched Mov opcode.
+/// The pre-fix heuristic mapped field names to fixed offsets and always
+/// emitted Movw, mangling any ADT with non-word fields.
+#[test]
+fn cli_compile_adt_field_access_with_big_and_real() {
+    let Some(module_dir) = find_asset("external/inferno-os/module") else {
+        eprintln!("inferno module dir not found, skipping");
+        return;
+    };
+    let tmp = std::env::temp_dir().join(format!(
+        "ricevm-adt-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let src = tmp.join("Adt.b");
+    let out_dis = tmp.join("Adt.dis");
+    std::fs::write(
+        &src,
+        r#"implement Adt;
+include "sys.m"; sys: Sys;
+Adt: module {
+    init: fn(nil: ref Draw->Context, args: list of string);
+    Foo: adt {
+        x: int;
+        y: big;
+        z: real;
+        n: int;
+    };
+};
+init(nil: ref Draw->Context, args: list of string)
+{
+    sys = load Sys Sys->PATH;
+    p := ref Foo(10, big 16r100000000, 3.0, 99);
+    sys->print("x=%d y=%bd n=%d\n", p.x, p.y, p.n);
+    p.y = big 16r200000000;
+    p.n = 77;
+    sys->print("y=%bd n=%d\n", p.y, p.n);
+}
+"#,
+    )
+    .expect("write source");
+
+    let compile_out = run_cli(&[
+        "compile",
+        src.to_str().expect("src utf8"),
+        "-I",
+        module_dir.to_str().expect("module dir utf8"),
+        "-o",
+        out_dis.to_str().expect("out utf8"),
+    ]);
+    assert!(compile_out.status.success());
+    let run_out = run_cli(&["run", out_dis.to_str().expect("out utf8")]);
+    assert_eq!(
+        String::from_utf8_lossy(&run_out.stdout).trim_end(),
+        "x=10 y=4294967296 n=99\ny=8589934592 n=77",
+        "ADT layout must place big at 8, real at 16, int at 24 and use kind-aware Mov"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Regression: `chan of big` must allocate via `Newcl` (8-byte element)
 /// and Send must read 8 bytes from the value temp. Before the fix,
 /// `Newcw` was emitted unconditionally and the Send temp was 4 bytes wide,

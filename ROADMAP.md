@@ -206,17 +206,37 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Parser: recursive descent with Pratt expression parsing; 159/159 (100%) Inferno cmd/ programs parse (~2200 lines)
 - [x] Polymorphic type parameters (`Type[T]`, `func[T]`, `adt[T]`), `raises` clauses, varargs `fn(args, *)`
 - [x] Dereference operator (`*expr`), `Type.SubType` qualified types, exception handler blocks
+- [x] Prefix-operator binding power above every infix bp so `-a - b`, `big lv % big rv`, and similar parse with Limbo's intended precedence
 - [x] AST: complete type definitions for all Limbo language constructs (395 lines)
 - [x] Code generator: if/else, while, for, do-while, case, all arithmetic/comparison/logic operators (~1300 lines)
+- [x] Three-operand emission for non-commutative arithmetic (Subw, Divw, Modw, Shlw, Shrw, Expw, and big/real variants), preserving Dis `dst = mid OP
+  src` semantics
+- [x] Numeric kind tracking (`Word`, `Big`, `Real`) across allocation, expression evaluation, and slot sizing, so big and real values keep all 64
+  bits through arithmetic, comparisons, casts, and moves
+- [x] Mixed-kind promotion via `gen_expr_to_kind`: a narrower operand (for example, an int literal in `big_var + 1`) is widened with `Cvtwl`,
+  `Cvtwf`, or `Cvtlf` before the wide arithmetic opcode
 - [x] String operations: concatenation (Addc with chaining), comparison (Beqc/Bnec), indexing (Indc), assignment (Insc), length (Lenc)
 - [x] List operations: hd (Headp), tl (Tail), cons (Consp), nil comparison, list literals
-- [x] Array operations: creation (Newa), byte conversion (Cvtca), length (Lena), slicing (Slicea), slice assignment (Slicela)
-- [x] Channel operations: creation (Newcw), send (Send), receive (Recv)
-- [x] Thread creation: spawn with correct per-function frame type descriptors
-- [x] Multiple functions per module with local calls (Frame + Call) and return values through return pointer
+- [x] Array operations: creation (Newa), byte conversion (Cvtca), length (Lena), slicing (Slicea), slice assignment (Slicela), kind-aware element
+  read and write via Indw/Indl/Indf/Indb plus Movw/Movl/Movf/Movb through a heap-ref slot, and `arr[i] op= val` compound assignment
+- [x] Recursive nested array typing: `array of array of T` peels one `Type::Array` layer per `Index`, so the inner indexing picks the correct
+  element-width opcode pair
+- [x] Channel operations: kind-aware allocation via Newcw/Newcb/Newcl/Newcf/Newcp, plus Send and Recv sized by the channel's element width
+- [x] Thread creation: spawn with correct per-function frame type descriptors and kind-aware argument packing
+- [x] Forward-referenced local calls and spawns: a pre-pass populates `func_table` for every declared function, and a fixup pass patches
+  Call/Spawn destination operands after every body has been emitted
+- [x] Multiple functions per module with local calls (Frame + Call) and return values written directly through the return pointer (the caller's
+  destination slot is installed as the return target via Lea, eliminating an intermediate copy and supporting tuple-shaped returns wider than 8
+  bytes)
+- [x] Tuple unpack: `(a, b, ...) := func()` allocates per-field locals at the function's actual return-tuple offsets and uses kind-matched Mov per
+  field
 - [x] Module loading: $Sys and generic modules via Load instruction
-- [x] Ref ADT allocation (New) and field access (double-indirect read and write)
-- [x] Type conversions: int, big, real, string, array casts (Cvtwl, Cvtwf, Cvtwc, Cvtcw, Cvtac, Cvtca)
+- [x] Sys vararg call packing: cumulative argument offsets sized by each argument's `NumKind`, so `sys->print("%bd", x)` and similar correctly read
+  8 bytes for big and real values
+- [x] ADT layout-driven field access: a pre-pass over `Decl::Adt` and `ModuleMember::Adt` records each ADT's field offsets and types with proper
+  alignment (4 for word, byte, and pointer fields; 8 for big and real fields). `Dot` reads, `Dot` lvalue writes, and `ref Adt(...)` initialization
+  use the layout for offsets and pick `Movw`, `Movl`, `Movf`, or `Movp` per field
+- [x] Type conversions: int, big, real, string, array casts (Cvtwl, Cvtwf, Cvtwc, Cvtcw, Cvtac, Cvtca, Cvtlw, Cvtfw, Cvtlf, Cvtfl)
 - [x] Real and big literal support (Movf, Movl from 8-byte-aligned data section)
 - [x] Include file processing: reads .m module interface files, extracts types, constants, and function signatures
 - [x] Symbol table with type resolution and constant evaluation
@@ -227,6 +247,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [ ] Full type checker (validation, not just inference)
 - [ ] Alt statement codegen
 - [ ] Exception handler block codegen
+- [ ] Pick types and cyclic ADT references
 
 ### Documentation
 

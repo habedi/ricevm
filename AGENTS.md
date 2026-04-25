@@ -43,6 +43,8 @@ Priorities, in order:
   virtual device files, and file-based module loading.
 - `crates/ricevm-limbo/`: Built-in Limbo compiler. Lexer, parser, code generator, and .dis binary writer.
   Compiles Limbo source to Dis bytecode end-to-end without depending on the reference limbo.dis compiler in the Inferno OS.
+  Codegen is kind-aware: it tracks `NumKind` (word, big, and real) per local; sidecar maps for array element types, channel element types, and ADT
+  layouts; and a fixup pass for forward-referenced calls and spawns.
 - `crates/ricevm-cli/`: CLI with `run`, `dis`, and `compile` subcommands.
 - `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
   `libinterp/xec.c` for correctness validation).

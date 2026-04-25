@@ -17,6 +17,134 @@ enum ValType {
     Array, // array types (use Lena instead of Lenc)
 }
 
+/// Numeric kind: selects 4-byte word, 8-byte big, or 8-byte real slots and
+/// the corresponding Dis opcode family (Addw vs Addl vs Addf etc.). Ordering
+/// is used for width promotion in mixed expressions via `.max()`: word < big
+/// < real, so e.g. `word + real` promotes the temp widths to Real.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NumKind {
+    Word,
+    Big,
+    Real,
+}
+
+impl NumKind {
+    fn byte_size(self) -> i32 {
+        match self {
+            NumKind::Word => 4,
+            NumKind::Big | NumKind::Real => 8,
+        }
+    }
+}
+
+/// Map a Limbo type to a NumKind. Non-numeric types collapse to Word because
+/// this enum is only consulted for slot sizing inside numeric paths; pointer
+/// sites use `ValType::Ptr` separately.
+fn type_num_kind(ty: &Type) -> NumKind {
+    match ty {
+        Type::Basic(BasicType::Big) => NumKind::Big,
+        Type::Basic(BasicType::Real) => NumKind::Real,
+        _ => NumKind::Word,
+    }
+}
+
+/// Return the numeric kind of the value produced by a known `$Sys` builtin.
+/// Default Word covers everything not in the lookup; the kind is used to
+/// pick the right Mov/Cvt opcode when copying the return value out.
+/// Extract the array element Type from a VarDecl, if any. Looks at the
+/// explicit type annotation first, then the init expression's array forms
+/// (`array[N] of T`, `array[] of {...}`, `array of byte stringExpr`).
+fn decl_array_elem_type(v: &VarDecl) -> Option<Type> {
+    if let Some(Type::Array(elem)) = &v.ty {
+        return Some((**elem).clone());
+    }
+    match v.init.as_ref()? {
+        Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) => Some((**ty).clone()),
+        Expr::Cast(ty, _, _) => match ty.as_ref() {
+            Type::Array(elem) => Some((**elem).clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Reduce a Type to a BasicType when possible. Used by sites that pick a
+/// kind-aware opcode pair from an element type.
+fn type_basic(ty: &Type) -> Option<BasicType> {
+    match ty {
+        Type::Basic(b) => Some(*b),
+        _ => None,
+    }
+}
+
+/// Extract the channel element BasicType from a VarDecl, if any.
+fn decl_chan_elem_basic(v: &VarDecl) -> Option<BasicType> {
+    if let Some(Type::Chan(elem)) = &v.ty
+        && let Type::Basic(b) = elem.as_ref()
+    {
+        return Some(*b);
+    }
+    if let Some(Expr::ChanAlloc(ty, _)) = v.init.as_ref()
+        && let Type::Basic(b) = ty.as_ref()
+    {
+        return Some(*b);
+    }
+    None
+}
+
+/// Field width and alignment for ADT layout. Matches the reference Limbo
+/// ABI: word/byte/ptr fields are 4-byte sized and 4-byte aligned, and
+/// big/real are 8-byte sized with 8-byte alignment.
+fn type_size_align(ty: &Type) -> (i32, i32) {
+    match ty {
+        Type::Basic(BasicType::Big) | Type::Basic(BasicType::Real) => (8, 8),
+        // byte stored in a 4-byte slot in records (matches reference).
+        _ => (4, 4),
+    }
+}
+
+/// Compute an ADT's field layout: list of `(name, type, byte_offset)`.
+fn compute_adt_layout(adt: &AdtDecl) -> Vec<(String, Type, i32)> {
+    let mut fields = Vec::new();
+    let mut off = 0i32;
+    for member in &adt.members {
+        if let AdtMember::Field(v) = member {
+            let ty = match &v.ty {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+            let (size, align) = type_size_align(&ty);
+            // Round `off` up to alignment.
+            off = (off + align - 1) & !(align - 1);
+            for name in &v.names {
+                fields.push((name.clone(), ty.clone(), off));
+                off += size;
+            }
+        }
+    }
+    fields
+}
+
+/// Pick the Newc* opcode for a channel of the given element BasicType.
+fn newc_opcode(basic: Option<BasicType>) -> Opcode {
+    match basic {
+        Some(BasicType::Byte) => Opcode::Newcb,
+        Some(BasicType::Big) => Opcode::Newcl,
+        Some(BasicType::Real) => Opcode::Newcf,
+        Some(BasicType::String) => Opcode::Newcp,
+        // int and unknown default to a 4-byte word channel.
+        _ => Opcode::Newcw,
+    }
+}
+
+fn sys_return_kind(name: &str) -> NumKind {
+    match name {
+        // big-returning sys builtins (per sys.m signatures)
+        "seek" => NumKind::Big,
+        _ => NumKind::Word,
+    }
+}
+
 /// Code generation context.
 pub struct CodeGen {
     code: Vec<Instruction>,
@@ -29,13 +157,44 @@ pub struct CodeGen {
     imports: Vec<ImportModule>,
     sys_path_mp: i32,
     sys_mp_ref: i32,
-    /// Local variable table: name -> (fp offset, type).
-    locals: Vec<(String, i32, ValType)>,
+    /// Local variable table: name -> (fp offset, ValType, NumKind).
+    /// NumKind is Word for non-numeric locals (strings, arrays, refs); only
+    /// big/real locals carry a widened kind that sizes the slot and picks
+    /// the correct Mov/arith opcode family.
+    locals: Vec<(String, i32, ValType, NumKind)>,
     next_local: i32,
     frame_size: i32,
     sys_funcs: Vec<(String, usize)>,
-    /// Local function table: name -> (pc, frame_size).
-    func_table: Vec<(String, i32, i32)>,
+    /// Local function table: name -> (pc, frame_size, return NumKind).
+    /// The return kind picks the right Mov/Cvt opcode when copying the
+    /// callee's return value into the caller's slot.
+    func_table: Vec<(String, i32, i32, NumKind)>,
+    /// Sidecar map for array locals: name -> element Type.
+    /// Storing the full Type (not just BasicType) lets us express nested
+    /// types like `array of array of big` — `aa[i]` returns a slot whose
+    /// element type is `array of big`, which the recursive Index handler
+    /// then peels to compute the inner indexing.
+    local_array_elem: std::collections::HashMap<String, Type>,
+    /// Sidecar map for channel locals: name -> element BasicType. Lets
+    /// Send/Recv size the data temp by the channel's element width and
+    /// pick the right Newc* opcode at allocation time.
+    local_chan_elem: std::collections::HashMap<String, BasicType>,
+    /// Sidecar map for function return tuple shapes: name -> field Types.
+    /// Lets `(a, b, c) := func()` allocate per-field locals at correct
+    /// offsets and use kind-matched Mov for each field.
+    func_tuple_ret: std::collections::HashMap<String, Vec<Type>>,
+    /// Pending PC fixups for forward-referenced local calls and spawns.
+    /// `(code_idx, callee_name)` — the destination operand of code[code_idx]
+    /// will be patched to the callee's actual entry PC after all functions
+    /// have been generated.
+    pending_call_fixups: Vec<(usize, String)>,
+    /// ADT layouts: ADT name -> ordered (field_name, field_type, byte_off).
+    /// Built once from the AST so Dot/Arrow accesses can pick a kind-aware
+    /// Mov opcode and the correct field offset instead of a heuristic.
+    adt_layouts: std::collections::HashMap<String, Vec<(String, Type, i32)>>,
+    /// Sidecar map for ADT-typed locals: local name -> ADT name. Lets Dot
+    /// access resolve `local.field` to the right ADT layout.
+    local_adt_type: std::collections::HashMap<String, String>,
     /// Frame sizes for each compiled function, in order.
     func_frames: Vec<i32>,
     /// Exception handlers for the module.
@@ -67,6 +226,12 @@ impl CodeGen {
             sys_funcs: Vec::new(),
             func_table: Vec::new(),
             func_frames: Vec::new(),
+            local_array_elem: std::collections::HashMap::new(),
+            local_chan_elem: std::collections::HashMap::new(),
+            pending_call_fixups: Vec::new(),
+            adt_layouts: std::collections::HashMap::new(),
+            local_adt_type: std::collections::HashMap::new(),
+            func_tuple_ret: std::collections::HashMap::new(),
             handlers: Vec::new(),
         }
     }
@@ -81,6 +246,7 @@ impl CodeGen {
         self.sys_path_mp = self.intern_string("$Sys");
         self.sys_mp_ref = self.alloc_mp(4);
         self.collect_strings(file);
+        self.collect_adts(file);
         self.imports.push(ImportModule { functions: vec![] });
 
         // Pre-scan to count functions and allocate type indices
@@ -90,9 +256,50 @@ impl CodeGen {
             .filter_map(|d| if let Decl::Func(f) = d { Some(f) } else { None })
             .collect();
 
-        // Generate code for each function
+        // Pre-register every function name in func_table with a placeholder
+        // PC. This lets `spawn func()` and `func()` calls resolve their
+        // callee even when the callee is defined later in the source. The
+        // actual PC is filled in by gen_func when it lays out the body.
+        for func in &funcs {
+            let full_name = if let Some(q) = &func.name.qualifier {
+                format!("{q}.{}", func.name.name)
+            } else {
+                func.name.name.clone()
+            };
+            let ret_kind = func
+                .sig
+                .ret
+                .as_ref()
+                .map(type_num_kind)
+                .unwrap_or(NumKind::Word);
+            if let Some(Type::Tuple(fields)) = &func.sig.ret {
+                self.func_tuple_ret
+                    .insert(full_name.clone(), fields.clone());
+            }
+            // PC = -1 placeholder, frame_size = 0 placeholder.
+            self.func_table.push((full_name, -1, 0, ret_kind));
+        }
+
+        // Generate code for each function. gen_func patches the matching
+        // func_table entry's PC and frame_size.
         for func in &funcs {
             self.gen_func(func)?;
+        }
+
+        // Patch any forward-referenced Call/Spawn destinations now that
+        // every function's entry PC is known.
+        let fixups = std::mem::take(&mut self.pending_call_fixups);
+        for (code_idx, name) in fixups {
+            let pc = self
+                .func_table
+                .iter()
+                .find(|(n, _, _, _)| n == &name)
+                .map(|(_, pc, _, _)| *pc)
+                .unwrap_or(-1);
+            if pc < 0 {
+                return Err(format!("unresolved forward reference to function `{name}`"));
+            }
+            self.code[code_idx].destination = op_imm(pc);
         }
 
         self.build_types();
@@ -146,27 +353,42 @@ impl CodeGen {
         off
     }
 
-    fn alloc_local(&mut self, name: &str, ty: ValType) -> i32 {
-        if let Some((_, off, _)) = self.locals.iter().find(|(n, _, _)| n == name) {
+    fn alloc_local(&mut self, name: &str, ty: ValType, kind: NumKind) -> i32 {
+        if let Some((_, off, _, _)) = self.locals.iter().find(|(n, _, _, _)| n == name) {
             return *off;
         }
         let off = self.next_local;
-        self.next_local += 4;
+        self.next_local += kind.byte_size();
         self.grow_frame();
-        self.locals.push((name.to_string(), off, ty));
+        self.locals.push((name.to_string(), off, ty, kind));
         off
     }
 
     fn get_local(&self, name: &str) -> Option<(i32, ValType)> {
         self.locals
             .iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, o, t)| (*o, *t))
+            .find(|(n, _, _, _)| n == name)
+            .map(|(_, o, t, _)| (*o, *t))
+    }
+
+    fn local_num_kind(&self, name: &str) -> NumKind {
+        self.locals
+            .iter()
+            .find(|(n, _, _, _)| n == name)
+            .map(|(_, _, _, k)| *k)
+            .unwrap_or(NumKind::Word)
     }
 
     fn alloc_temp(&mut self) -> i32 {
         let off = self.next_local;
         self.next_local += 4;
+        self.grow_frame();
+        off
+    }
+
+    fn alloc_temp_for(&mut self, kind: NumKind) -> i32 {
+        let off = self.next_local;
+        self.next_local += kind.byte_size();
         self.grow_frame();
         off
     }
@@ -197,6 +419,63 @@ impl CodeGen {
                     self.scan_stmt_strings(stmt);
                 }
             }
+        }
+    }
+
+    /// Walk top-level declarations and module-member declarations to record
+    /// every ADT's field layout. Subsequent Dot/Arrow access can then
+    /// resolve `obj.field` to the right offset and type.
+    fn collect_adts(&mut self, file: &SourceFile) {
+        for decl in &file.decls {
+            match decl {
+                Decl::Adt(adt) => {
+                    self.adt_layouts
+                        .insert(adt.name.clone(), compute_adt_layout(adt));
+                }
+                Decl::Module(m) => {
+                    for member in &m.members {
+                        if let ModuleMember::Adt(adt) = member {
+                            self.adt_layouts
+                                .insert(adt.name.clone(), compute_adt_layout(adt));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Look up `(field_offset, field_type)` for `adt_name.field_name`.
+    fn adt_field_info(&self, adt_name: &str, field_name: &str) -> Option<(i32, Type)> {
+        let layout = self.adt_layouts.get(adt_name)?;
+        layout
+            .iter()
+            .find(|(n, _, _)| n == field_name)
+            .map(|(_, t, off)| (*off, t.clone()))
+    }
+
+    /// Extract the ADT name from a Limbo Type, peeling `ref` wrappers.
+    fn adt_name_for_type(ty: &Type) -> Option<String> {
+        match ty {
+            Type::Named(q) => Some(q.name.clone()),
+            Type::Ref(inner) => Self::adt_name_for_type(inner),
+            _ => None,
+        }
+    }
+
+    /// Resolve an expression to the ADT name of the value it produces, when
+    /// derivable. Handles Ident lookup and one level of Dot navigation
+    /// (`outer.inner.field` works iff the outer type's `inner` field is
+    /// itself an ADT-typed field).
+    fn adt_name_for_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident(name, _) => self.local_adt_type.get(name).cloned(),
+            Expr::Dot(inner, field, _) => {
+                let outer = self.adt_name_for_expr(inner)?;
+                let (_, ty) = self.adt_field_info(&outer, field)?;
+                Self::adt_name_for_type(&ty)
+            }
+            _ => None,
         }
     }
 
@@ -342,10 +621,33 @@ impl CodeGen {
         for param in &func.sig.params {
             for name in &param.names {
                 let ty = self.infer_param_type(param);
+                let kind = type_num_kind(&param.ty);
                 if name != "nil" {
-                    self.locals.push((name.clone(), param_off, ty));
+                    self.locals.push((name.clone(), param_off, ty, kind));
+                    // Track array params' element Type so indexing into
+                    // them later picks the right Ind/Mov opcode pair, and
+                    // recursive nested types (`array of array of T`) work
+                    // by peeling one layer per Index.
+                    if let Type::Array(elem) = &param.ty {
+                        self.local_array_elem.insert(name.clone(), (**elem).clone());
+                    }
+                    // Same for chan params so Send/Recv on them know the
+                    // element width.
+                    if let Type::Chan(elem) = &param.ty
+                        && let Type::Basic(b) = elem.as_ref()
+                    {
+                        self.local_chan_elem.insert(name.clone(), *b);
+                    }
+                    // ADT-typed params (`p: ref Foo` or `p: Foo`): record the
+                    // ADT name so field access through `p` finds the layout.
+                    if let Some(adt) = Self::adt_name_for_type(&param.ty) {
+                        self.local_adt_type.insert(name.clone(), adt);
+                    }
                 }
-                param_off += 4;
+                // Frame param slots are 4-byte aligned in the reference ABI;
+                // big/real params occupy two adjacent slots. This keeps the
+                // offsets consistent with how the caller packs arguments.
+                param_off += kind.byte_size();
             }
         }
         self.next_local = param_off.max(40);
@@ -363,14 +665,23 @@ impl CodeGen {
             self.emit(Opcode::Ret, op_unused(), mid_unused(), op_unused());
         }
 
-        // Record function info
+        // Patch the pre-registered func_table entry with the actual PC
+        // and frame size. The pre-registration pass in `compile()` filled
+        // name and ret_kind so spawn/call could look up forward-defined
+        // functions while emitting code; here we finalize the layout.
         let full_name = if let Some(q) = &func.name.qualifier {
             format!("{q}.{}", func.name.name)
         } else {
             func.name.name.clone()
         };
-        self.func_table
-            .push((full_name, entry_pc as i32, self.frame_size));
+        if let Some(entry) = self
+            .func_table
+            .iter_mut()
+            .find(|(n, pc, _, _)| n == &full_name && *pc < 0)
+        {
+            entry.1 = entry_pc as i32;
+            entry.2 = self.frame_size;
+        }
         self.func_frames.push(self.frame_size);
 
         let func_idx = self.func_frames.len() as i32 - 1;
@@ -392,7 +703,55 @@ impl CodeGen {
             | Type::Basic(BasicType::Byte)
             | Type::Basic(BasicType::Big)
             | Type::Basic(BasicType::Real) => ValType::Word,
+            // Arrays carry their own ValType so call sites and Index handlers
+            // can pick array-specific opcodes (Indw/Indl/Movw/Movl/...).
+            Type::Array(_) => ValType::Array,
             _ => ValType::Ptr,
+        }
+    }
+
+    /// Look up an array local's element Type, or None if not an array.
+    fn array_elem_type(&self, name: &str) -> Option<Type> {
+        self.local_array_elem.get(name).cloned()
+    }
+
+    /// Resolve the array element Type for an arr expression. Handles
+    /// `Ident` (look up sidecar) and `Index(inner, _)` (recursively peel
+    /// one layer of nesting); other forms fall back to None.
+    fn array_elem_type_for_expr(&self, expr: &Expr) -> Option<Type> {
+        match expr {
+            Expr::Ident(name, _) => self.array_elem_type(name),
+            Expr::Index(inner_arr, _, _) => {
+                // Outer Index returns an element of inner's elem type. If
+                // that elem type is itself `array of X`, we want X.
+                let inner_elem = self.array_elem_type_for_expr(inner_arr)?;
+                if let Type::Array(elem) = inner_elem {
+                    Some(*elem)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Convenience for sites that need a BasicType (to pick Indw vs Indl
+    /// etc.). Returns None when the element type isn't a single basic type
+    /// — e.g., nested arrays or ADT-typed elements collapse to Word/Indw
+    /// at the call site.
+    fn array_elem_basic_for_expr(&self, expr: &Expr) -> Option<BasicType> {
+        type_basic(&self.array_elem_type_for_expr(expr)?)
+    }
+
+    /// Pick the (Ind*, Mov*) opcode pair for an array element of the given
+    /// BasicType. Defaults (None or non-numeric BasicType::String) treat
+    /// the element as a 4-byte word (the common case for ADT/pointer arrays).
+    fn array_elem_opcodes(basic: Option<BasicType>) -> (Opcode, Opcode) {
+        match basic {
+            Some(BasicType::Byte) => (Opcode::Indb, Opcode::Movb),
+            Some(BasicType::Big) => (Opcode::Indl, Opcode::Movl),
+            Some(BasicType::Real) => (Opcode::Indf, Opcode::Movf),
+            _ => (Opcode::Indw, Opcode::Movw),
         }
     }
 
@@ -403,8 +762,24 @@ impl CodeGen {
             Stmt::Expr(e) => self.gen_expr_discard(e),
             Stmt::VarDecl(v) => {
                 let ty = self.infer_decl_type(v);
+                let kind = self.decl_num_kind(v);
+                // If the declared (or inferred) Limbo type is an array,
+                // record its full element Type so nested `array of array
+                // of T` works through recursive peeling.
+                let elem_type = decl_array_elem_type(v);
+                let chan_elem_basic = decl_chan_elem_basic(v);
+                let adt_name = v.ty.as_ref().and_then(Self::adt_name_for_type);
                 for name in &v.names {
-                    self.alloc_local(name, ty);
+                    self.alloc_local(name, ty, kind);
+                    if let Some(t) = &elem_type {
+                        self.local_array_elem.insert(name.clone(), t.clone());
+                    }
+                    if let Some(b) = chan_elem_basic {
+                        self.local_chan_elem.insert(name.clone(), b);
+                    }
+                    if let Some(a) = &adt_name {
+                        self.local_adt_type.insert(name.clone(), a.clone());
+                    }
                 }
                 if let Some(init) = &v.init {
                     let name = v.names.first().map(|s| s.as_str()).unwrap_or("");
@@ -415,17 +790,39 @@ impl CodeGen {
             }
             Stmt::Return(expr, _) => {
                 if let Some(e) = expr {
-                    // Write return value through the return pointer at 16(fp)
-                    let val_tmp = self.alloc_temp();
-                    self.gen_expr_to(e, val_tmp)?;
-                    let ty = self.infer_expr_type(e);
-                    let op = if ty != ValType::Word {
-                        Opcode::Movp
+                    // Tuple return: write each field through the return
+                    // pointer at the appropriate cumulative offset, sized
+                    // by each field's NumKind.
+                    if let Expr::Tuple(fields, _) = e {
+                        let mut field_off = 0i32;
+                        for field in fields {
+                            let ty = self.infer_expr_type(field);
+                            let kind = self.infer_num_kind(field);
+                            let tmp = self.alloc_temp_for(kind);
+                            self.gen_expr_to(field, tmp)?;
+                            let op = match (ty, kind) {
+                                (_, NumKind::Big) => Opcode::Movl,
+                                (_, NumKind::Real) => Opcode::Movf,
+                                (ValType::Word, NumKind::Word) => Opcode::Movw,
+                                _ => Opcode::Movp,
+                            };
+                            self.emit(op, op_fp(tmp), mid_unused(), op_fp_ind(16, field_off));
+                            field_off += kind.byte_size();
+                        }
                     } else {
-                        Opcode::Movw
-                    };
-                    // 0(16(fp)) = write to the address pointed to by fp[16]
-                    self.emit(op, op_fp(val_tmp), mid_unused(), op_fp_ind(16, 0));
+                        // Single value: kind-matched opcode through return ptr.
+                        let ty = self.infer_expr_type(e);
+                        let kind = self.infer_num_kind(e);
+                        let val_tmp = self.alloc_temp_for(kind);
+                        self.gen_expr_to(e, val_tmp)?;
+                        let op = match (ty, kind) {
+                            (_, NumKind::Big) => Opcode::Movl,
+                            (_, NumKind::Real) => Opcode::Movf,
+                            (ValType::Word, NumKind::Word) => Opcode::Movw,
+                            _ => Opcode::Movp,
+                        };
+                        self.emit(op, op_fp(val_tmp), mid_unused(), op_fp_ind(16, 0));
+                    }
                 }
                 self.emit(Opcode::Ret, op_unused(), mid_unused(), op_unused());
                 Ok(())
@@ -461,15 +858,15 @@ impl CodeGen {
                     let func_pc = self
                         .func_table
                         .iter()
-                        .find(|(n, _, _)| n == func_name)
-                        .map(|(_, pc, _)| *pc);
+                        .find(|(n, _, _, _)| n == func_name)
+                        .map(|(_, pc, _, _)| *pc);
                     if let Some(pc) = func_pc {
                         // Find the type index for this function
                         let func_type = self
                             .func_table
                             .iter()
                             .enumerate()
-                            .find(|(_, (n, _, _))| n == func_name)
+                            .find(|(_, (n, _, _, _))| n == func_name)
                             .map(|(i, _)| 2 + i as i32)
                             .unwrap_or(1);
                         let frame_tmp = self.alloc_temp();
@@ -479,24 +876,36 @@ impl CodeGen {
                             mid_unused(),
                             op_fp(frame_tmp),
                         );
-                        // Pack arguments
-                        for (i, arg) in args.iter().enumerate() {
-                            let arg_tmp = self.alloc_temp();
+                        // Pack arguments at cumulative offsets matching the
+                        // spawnee's kind-sized param layout.
+                        let mut arg_off = 32i32;
+                        for arg in args.iter() {
+                            let kind = self.infer_num_kind(arg);
+                            let arg_tmp = self.alloc_temp_for(kind);
                             self.gen_expr_to(arg, arg_tmp)?;
                             let ty = self.infer_expr_type(arg);
-                            let op = if ty != ValType::Word {
-                                Opcode::Movp
-                            } else {
-                                Opcode::Movw
+                            let op = match (ty, kind) {
+                                (_, NumKind::Big) => Opcode::Movl,
+                                (_, NumKind::Real) => Opcode::Movf,
+                                (ValType::Word, NumKind::Word) => Opcode::Movw,
+                                _ => Opcode::Movp,
                             };
                             self.emit(
                                 op,
                                 op_fp(arg_tmp),
                                 mid_unused(),
-                                op_fp_ind(frame_tmp, 32 + (i as i32) * 4),
+                                op_fp_ind(frame_tmp, arg_off),
                             );
+                            arg_off += kind.byte_size();
                         }
+                        let spawn_idx = self.code.len();
                         self.emit(Opcode::Spawn, op_fp(frame_tmp), mid_unused(), op_imm(pc));
+                        if pc < 0 {
+                            // Forward reference: patch the destination's
+                            // immediate after the callee is generated.
+                            self.pending_call_fixups
+                                .push((spawn_idx, func_name.clone()));
+                        }
                         return Ok(());
                     }
                 }
@@ -523,6 +932,122 @@ impl CodeGen {
             return self.infer_expr_type(init);
         }
         ValType::Word
+    }
+
+    /// Resolve the NumKind for a VarDecl. An explicit `: big` / `: real`
+    /// annotation wins; otherwise we look at the init expression.
+    fn decl_num_kind(&self, v: &VarDecl) -> NumKind {
+        if let Some(ty) = &v.ty {
+            return type_num_kind(ty);
+        }
+        if let Some(init) = &v.init {
+            return self.infer_num_kind(init);
+        }
+        NumKind::Word
+    }
+
+    /// Infer the numeric kind of an expression. Used only by numeric paths
+    /// (binary arith, casts, var-decl sizing) — non-numeric expressions
+    /// collapse to Word, which is a valid default for those callers.
+    fn infer_num_kind(&self, expr: &Expr) -> NumKind {
+        match expr {
+            Expr::IntLit(v, _) => {
+                if *v > i32::MAX as i64 || *v < i32::MIN as i64 {
+                    NumKind::Big
+                } else {
+                    NumKind::Word
+                }
+            }
+            Expr::RealLit(_, _) => NumKind::Real,
+            Expr::CharLit(_, _) => NumKind::Word,
+            Expr::Ident(name, _) => self.local_num_kind(name),
+            Expr::Cast(ty, _, _) => type_num_kind(ty),
+            // Unary ops preserve the inner kind (negation of big stays big).
+            Expr::Unary(_, inner, _) => self.infer_num_kind(inner),
+            Expr::Binary(lhs, op, rhs, _) => match op {
+                // Relational and logical ops always yield a word-sized bool.
+                BinOp::Eq
+                | BinOp::Neq
+                | BinOp::Lt
+                | BinOp::Gt
+                | BinOp::Leq
+                | BinOp::Geq
+                | BinOp::LogAnd
+                | BinOp::LogOr => NumKind::Word,
+                // Arithmetic: promote to the widest operand kind.
+                _ => self.infer_num_kind(lhs).max(self.infer_num_kind(rhs)),
+            },
+            Expr::Len(_, _) => NumKind::Word,
+            // Local function calls: look up return kind in func_table.
+            Expr::Call(callee, _, _) => {
+                if let Expr::Ident(name, _) = callee.as_ref() {
+                    self.func_table
+                        .iter()
+                        .find(|(n, _, _, _)| n == name)
+                        .map(|(_, _, _, k)| *k)
+                        .unwrap_or(NumKind::Word)
+                } else if let Expr::ModQual(_, name, _) = callee.as_ref() {
+                    sys_return_kind(name)
+                } else {
+                    NumKind::Word
+                }
+            }
+            // Array element access inherits the element's NumKind so callers
+            // (Cast, gen_expr_to_kind, sys-print arg packing) treat `a[i]`
+            // as Big/Real when the array's element type is.
+            Expr::Index(arr, _, _) => {
+                if let Some(b) = self.array_elem_basic_for_expr(arr) {
+                    type_num_kind(&Type::Basic(b))
+                } else {
+                    NumKind::Word
+                }
+            }
+            // `<-chan` returns the channel's element kind.
+            Expr::Recv(chan_expr, _) => {
+                if let Expr::Ident(name, _) = chan_expr.as_ref()
+                    && let Some(b) = self.local_chan_elem.get(name)
+                {
+                    type_num_kind(&Type::Basic(*b))
+                } else {
+                    NumKind::Word
+                }
+            }
+            // ADT field access propagates the field's NumKind so big/real
+            // fields read as Big/Real (and arg packing/comparisons size
+            // their slots correctly).
+            Expr::Dot(inner, field, _) => self
+                .adt_name_for_expr(inner)
+                .and_then(|a| self.adt_field_info(&a, field))
+                .map(|(_, t)| type_num_kind(&t))
+                .unwrap_or(NumKind::Word),
+            _ => NumKind::Word,
+        }
+    }
+
+    /// Produce a value of `target` kind at `dst`, emitting a Cvt* instruction
+    /// when the expression's natural kind differs. This is the kind-aware
+    /// replacement for raw `gen_expr_to(expr, dst)` at sites where the slot
+    /// width and operand width must match (binary arith, returns, call args).
+    fn gen_expr_to_kind(&mut self, expr: &Expr, dst: i32, target: NumKind) -> Result<(), String> {
+        let inner = self.infer_num_kind(expr);
+        if inner == target {
+            return self.gen_expr_to(expr, dst);
+        }
+        // Narrow into a temp of the inner kind, then convert to target.
+        let tmp = self.alloc_temp_for(inner);
+        self.gen_expr_to(expr, tmp)?;
+        let cvt = match (inner, target) {
+            (NumKind::Word, NumKind::Big) => Opcode::Cvtwl,
+            (NumKind::Word, NumKind::Real) => Opcode::Cvtwf,
+            (NumKind::Big, NumKind::Word) => Opcode::Cvtlw,
+            (NumKind::Big, NumKind::Real) => Opcode::Cvtlf,
+            (NumKind::Real, NumKind::Word) => Opcode::Cvtfw,
+            (NumKind::Real, NumKind::Big) => Opcode::Cvtfl,
+            // Same-kind paths are handled by the early return above.
+            _ => return self.gen_expr_to(expr, dst),
+        };
+        self.emit(cvt, op_fp(tmp), mid_unused(), op_fp(dst));
+        Ok(())
     }
 
     fn infer_expr_type(&self, expr: &Expr) -> ValType {
@@ -555,6 +1080,31 @@ impl CodeGen {
             Expr::Hd(_, _) => ValType::Ptr,
             Expr::Tl(_, _) => ValType::Ptr,
             Expr::Len(_, _) => ValType::Word,
+            // ADT field access mirrors the field's declared type.
+            Expr::Dot(inner, field, _) => {
+                match self
+                    .adt_name_for_expr(inner)
+                    .and_then(|a| self.adt_field_info(&a, field))
+                {
+                    Some((_, Type::Basic(_))) => ValType::Word,
+                    Some((_, Type::Array(_))) => ValType::Array,
+                    Some((_, _)) => ValType::Ptr,
+                    None => ValType::Word,
+                }
+            }
+            Expr::Index(arr, _, _) => {
+                // Element type drives the resulting ValType: word/byte/big/
+                // real → Word; nested arrays → Array; everything else (string,
+                // adt, ref, list, chan) → Ptr.
+                match self.array_elem_type_for_expr(arr) {
+                    Some(Type::Basic(_)) => ValType::Word,
+                    Some(Type::Array(_)) => ValType::Array,
+                    Some(_) => ValType::Ptr,
+                    // Unknown element type: default to Word (covers
+                    // string-char indexing and anonymous arrays alike).
+                    None => ValType::Word,
+                }
+            }
             Expr::Load(_, _, _) => ValType::Ptr,
             Expr::Call(callee, _, _) => {
                 // Infer return type from callee name
@@ -572,7 +1122,14 @@ impl CodeGen {
             Expr::ArrayAlloc(_, _, _) | Expr::ArrayLit(_, _, _) => ValType::Array,
             Expr::ChanAlloc(_, _) | Expr::ListLit(_, _) => ValType::Ptr,
             Expr::Cast(ty, _, _) => match ty.as_ref() {
-                Type::Basic(BasicType::Int) | Type::Basic(BasicType::Byte) => ValType::Word,
+                // Numeric casts produce a numeric value; the slot is sized
+                // by NumKind (looked up separately), but the ValType is Word
+                // so binary arith doesn't misroute through the string-concat
+                // path that triggers on `lhs ValType == Ptr`.
+                Type::Basic(BasicType::Int)
+                | Type::Basic(BasicType::Byte)
+                | Type::Basic(BasicType::Big)
+                | Type::Basic(BasicType::Real) => ValType::Word,
                 Type::Array(_) => ValType::Array,
                 _ => ValType::Ptr,
             },
@@ -775,23 +1332,44 @@ impl CodeGen {
                     let off = self
                         .get_local(name)
                         .map(|(o, _)| o)
-                        .unwrap_or_else(|| self.alloc_local(name, ty));
+                        .unwrap_or_else(|| self.alloc_local(name, ty, NumKind::Word));
                     self.gen_expr_to(rhs, off)
                 } else if let Expr::Index(arr_expr, idx_expr, _) = lhs.as_ref() {
-                    // s[i] = val → Insc val, idx, str
-                    let val_tmp = self.alloc_temp();
+                    // Distinguish array-element write from string-character
+                    // insert by the lvalue's ValType. Strings are Ptr; arrays
+                    // are Array (set by infer_param_type / infer_decl_type).
+                    let arr_ty = self.infer_expr_type(arr_expr);
                     let idx_tmp = self.alloc_temp();
                     let arr_tmp = self.alloc_temp();
-                    self.gen_expr_to(rhs, val_tmp)?;
-                    self.gen_expr_to(idx_expr, idx_tmp)?;
-                    self.gen_expr_to(arr_expr, arr_tmp)?;
-                    // Insc src, mid, dst: dst[mid] = src
-                    self.emit(
-                        Opcode::Insc,
-                        op_fp(val_tmp),
-                        mid_fp(idx_tmp),
-                        op_fp(arr_tmp),
-                    );
+                    if arr_ty == ValType::Array {
+                        // Array element write:
+                        //   Ind* arr, ref, idx — install heap_ref at ref slot
+                        //   Mov* val, *(ref)  — write through ref
+                        let elem = self.array_elem_basic_for_expr(arr_expr);
+                        let elem_kind = elem
+                            .map(|b| type_num_kind(&Type::Basic(b)))
+                            .unwrap_or(NumKind::Word);
+                        let val_tmp = self.alloc_temp_for(elem_kind);
+                        self.gen_expr_to(rhs, val_tmp)?;
+                        self.gen_expr_to(idx_expr, idx_tmp)?;
+                        self.gen_expr_to(arr_expr, arr_tmp)?;
+                        let ref_tmp = self.alloc_temp();
+                        let (ind_op, mov_op) = Self::array_elem_opcodes(elem);
+                        self.emit(ind_op, op_fp(arr_tmp), mid_fp(ref_tmp), op_fp(idx_tmp));
+                        self.emit(mov_op, op_fp(val_tmp), mid_unused(), op_fp_ind(ref_tmp, 0));
+                    } else {
+                        // String char insert: s[i] = c.
+                        let val_tmp = self.alloc_temp();
+                        self.gen_expr_to(rhs, val_tmp)?;
+                        self.gen_expr_to(idx_expr, idx_tmp)?;
+                        self.gen_expr_to(arr_expr, arr_tmp)?;
+                        self.emit(
+                            Opcode::Insc,
+                            op_fp(val_tmp),
+                            mid_fp(idx_tmp),
+                            op_fp(arr_tmp),
+                        );
+                    }
                     Ok(())
                 } else if let Expr::Slice(arr_expr, lo, _, _) = lhs.as_ref() {
                     // a[lo:] = rhs → Slicela rhs, lo, a
@@ -816,17 +1394,40 @@ impl CodeGen {
                     );
                     Ok(())
                 } else if let Expr::Dot(inner_expr, field, _) = lhs.as_ref() {
-                    // p.field = val → write through ref pointer
+                    // p.field = val → write through the ref pointer. Use the
+                    // ADT layout when available so big/real fields use the
+                    // wide opcode and the right offset.
                     let ref_tmp = self.alloc_temp();
-                    let val_tmp = self.alloc_temp();
+                    let (field_off, write_kind) = match self
+                        .adt_name_for_expr(inner_expr)
+                        .and_then(|a| self.adt_field_info(&a, field))
+                    {
+                        Some((off, ty)) => {
+                            let kind = type_num_kind(&ty);
+                            (off, Some((ty, kind)))
+                        }
+                        None => (self.estimate_field_offset(inner_expr, field), None),
+                    };
+                    let val_kind = write_kind
+                        .as_ref()
+                        .map(|(_, k)| *k)
+                        .unwrap_or(NumKind::Word);
+                    let val_tmp = self.alloc_temp_for(val_kind);
+                    self.gen_expr_to_kind(rhs, val_tmp, val_kind)?;
                     self.gen_expr_to(inner_expr, ref_tmp)?;
-                    self.gen_expr_to(rhs, val_tmp)?;
-                    let field_off = self.estimate_field_offset(inner_expr, field);
-                    let ty = self.infer_expr_type(rhs);
-                    let op = if ty != ValType::Word {
-                        Opcode::Movp
-                    } else {
-                        Opcode::Movw
+                    let op = match &write_kind {
+                        Some((Type::Basic(BasicType::Big), _)) => Opcode::Movl,
+                        Some((Type::Basic(BasicType::Real), _)) => Opcode::Movf,
+                        Some((Type::Basic(_), _)) => Opcode::Movw,
+                        Some((_, _)) => Opcode::Movp,
+                        None => {
+                            // Heuristic fallback: use rhs's ValType.
+                            if self.infer_expr_type(rhs) != ValType::Word {
+                                Opcode::Movp
+                            } else {
+                                Opcode::Movw
+                            }
+                        }
                     };
                     self.emit(
                         op,
@@ -845,23 +1446,70 @@ impl CodeGen {
                     let off = self
                         .get_local(name)
                         .map(|(o, _)| o)
-                        .unwrap_or_else(|| self.alloc_local(name, ValType::Word));
-                    let rhs_tmp = self.alloc_temp();
-                    self.gen_expr_to(rhs, rhs_tmp)?;
-                    // For string +=, use Addc
+                        .unwrap_or_else(|| self.alloc_local(name, ValType::Word, NumKind::Word));
                     let (_, vt) = self.get_local(name).unwrap_or((off, ValType::Word));
+                    // String +=: use Addc with the same operand layout.
                     if vt == ValType::Ptr && *op == BinOp::Add {
+                        let rhs_tmp = self.alloc_temp();
+                        self.gen_expr_to(rhs, rhs_tmp)?;
                         self.emit(Opcode::Addc, op_fp(rhs_tmp), mid_unused(), op_fp(off));
-                    } else {
-                        let opcode = match op {
-                            BinOp::Add => Opcode::Addw,
-                            BinOp::Sub => Opcode::Subw,
-                            BinOp::Mul => Opcode::Mulw,
-                            BinOp::Div => Opcode::Divw,
-                            _ => Opcode::Addw,
-                        };
-                        self.emit(opcode, op_fp(rhs_tmp), mid_unused(), op_fp(off));
+                        return Ok(());
                     }
+                    // Numeric compound assign: dispatch by the lvalue's kind
+                    // so big/real `x op= y` uses the wide opcode family.
+                    let kind = self.local_num_kind(name);
+                    let rhs_tmp = self.alloc_temp_for(kind);
+                    self.gen_expr_to_kind(rhs, rhs_tmp, kind)?;
+                    let opcode = match (op, kind) {
+                        (BinOp::Add, NumKind::Word) => Opcode::Addw,
+                        (BinOp::Add, NumKind::Big) => Opcode::Addl,
+                        (BinOp::Add, NumKind::Real) => Opcode::Addf,
+                        (BinOp::Sub, NumKind::Word) => Opcode::Subw,
+                        (BinOp::Sub, NumKind::Big) => Opcode::Subl,
+                        (BinOp::Sub, NumKind::Real) => Opcode::Subf,
+                        (BinOp::Mul, NumKind::Word) => Opcode::Mulw,
+                        (BinOp::Mul, NumKind::Big) => Opcode::Mull,
+                        (BinOp::Mul, NumKind::Real) => Opcode::Mulf,
+                        (BinOp::Div, NumKind::Word) => Opcode::Divw,
+                        (BinOp::Div, NumKind::Big) => Opcode::Divl,
+                        (BinOp::Div, NumKind::Real) => Opcode::Divf,
+                        _ => Opcode::Addw,
+                    };
+                    self.emit(opcode, op_fp(rhs_tmp), mid_unused(), op_fp(off));
+                    Ok(())
+                } else if let Expr::Index(arr_expr, idx_expr, _) = lhs.as_ref() {
+                    // Array element compound assign: arr[i] op= val.
+                    //   Ind* arr, ref, idx       — install heap ref
+                    //   Op*  val, op_fp_ind(ref) — 2-op form: dst = dst OP src
+                    let elem = self.array_elem_basic_for_expr(arr_expr);
+                    let elem_kind = elem
+                        .map(|b| type_num_kind(&Type::Basic(b)))
+                        .unwrap_or(NumKind::Word);
+                    let val_tmp = self.alloc_temp_for(elem_kind);
+                    self.gen_expr_to_kind(rhs, val_tmp, elem_kind)?;
+                    let idx_tmp = self.alloc_temp();
+                    let arr_tmp = self.alloc_temp();
+                    self.gen_expr_to(idx_expr, idx_tmp)?;
+                    self.gen_expr_to(arr_expr, arr_tmp)?;
+                    let ref_tmp = self.alloc_temp();
+                    let (ind_op, _) = Self::array_elem_opcodes(elem);
+                    self.emit(ind_op, op_fp(arr_tmp), mid_fp(ref_tmp), op_fp(idx_tmp));
+                    let opcode = match (op, elem_kind) {
+                        (BinOp::Add, NumKind::Word) => Opcode::Addw,
+                        (BinOp::Add, NumKind::Big) => Opcode::Addl,
+                        (BinOp::Add, NumKind::Real) => Opcode::Addf,
+                        (BinOp::Sub, NumKind::Word) => Opcode::Subw,
+                        (BinOp::Sub, NumKind::Big) => Opcode::Subl,
+                        (BinOp::Sub, NumKind::Real) => Opcode::Subf,
+                        (BinOp::Mul, NumKind::Word) => Opcode::Mulw,
+                        (BinOp::Mul, NumKind::Big) => Opcode::Mull,
+                        (BinOp::Mul, NumKind::Real) => Opcode::Mulf,
+                        (BinOp::Div, NumKind::Word) => Opcode::Divw,
+                        (BinOp::Div, NumKind::Big) => Opcode::Divl,
+                        (BinOp::Div, NumKind::Real) => Opcode::Divf,
+                        _ => Opcode::Addw,
+                    };
+                    self.emit(opcode, op_fp(val_tmp), mid_unused(), op_fp_ind(ref_tmp, 0));
                     Ok(())
                 } else {
                     Ok(())
@@ -869,23 +1517,98 @@ impl CodeGen {
             }
             Expr::DeclAssign(names, rhs, _) => {
                 let ty = self.infer_expr_type(rhs);
+                let kind = self.infer_num_kind(rhs);
                 let name = names.first().map(|s| s.as_str()).unwrap_or("_");
-                let off = self.alloc_local(name, ty);
+                let off = self.alloc_local(name, ty, kind);
+                // Capture array element type when the rhs is `array[N] of T`
+                // so subsequent indexing picks the right opcode pair.
+                if let Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) = rhs.as_ref() {
+                    self.local_array_elem
+                        .insert(name.to_string(), (**ty).clone());
+                }
+                // Same for `chan of T` so Send/Recv can pick the right width.
+                if let Expr::ChanAlloc(ty, _) = rhs.as_ref()
+                    && let Type::Basic(b) = ty.as_ref()
+                {
+                    self.local_chan_elem.insert(name.to_string(), *b);
+                }
+                // ADT inference: the parser emits `ref Foo(...)` as
+                // `Unary(Ref, Call(Ident(Foo), args))`, not RefAlloc. Detect
+                // both shapes so DeclAssign records the ADT name.
+                let adt_from_rhs = match rhs.as_ref() {
+                    Expr::RefAlloc(ty, _, _) => Self::adt_name_for_type(ty),
+                    Expr::Unary(UnaryOp::Ref, inner, _) => {
+                        if let Expr::Call(callee, _, _) = inner.as_ref()
+                            && let Expr::Ident(n, _) = callee.as_ref()
+                            && self.adt_layouts.contains_key(n)
+                        {
+                            Some(n.clone())
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(a) = adt_from_rhs {
+                    self.local_adt_type.insert(name.to_string(), a);
+                }
                 self.gen_expr_to(rhs, off)
             }
             Expr::TupleDeclAssign(names, rhs, _) => {
-                // Generate call, then extract tuple fields
-                let ret_tmp = self.alloc_temp();
+                // For function-call rhs with a known tuple return shape, lay
+                // out per-field offsets using each field's actual width.
+                // Otherwise fall back to a 4-byte stride (the historical
+                // behavior, accurate for word-only tuples).
+                let field_types: Option<Vec<Type>> = if let Expr::Call(callee, _, _) = rhs.as_ref()
+                {
+                    let cname = match callee.as_ref() {
+                        Expr::Ident(n, _) => Some(n.clone()),
+                        _ => None,
+                    };
+                    cname.and_then(|n| self.func_tuple_ret.get(&n).cloned())
+                } else {
+                    None
+                };
+                let kinds: Vec<NumKind> = if let Some(types) = &field_types {
+                    types.iter().map(type_num_kind).collect()
+                } else {
+                    names.iter().map(|_| NumKind::Word).collect()
+                };
+                // Allocate ret_tmp wide enough to hold the whole tuple by
+                // summing field widths. Without this, big/real fields would
+                // overflow into adjacent temps.
+                let total: i32 = kinds.iter().map(|k| k.byte_size()).sum();
+                let ret_tmp = self.next_local;
+                self.next_local += total.max(4);
+                self.grow_frame();
                 self.gen_expr_to(rhs, ret_tmp)?;
+                let mut field_off = ret_tmp;
                 for (i, name) in names.iter().enumerate() {
+                    let kind = kinds.get(i).copied().unwrap_or(NumKind::Word);
+                    let ty = field_types
+                        .as_ref()
+                        .and_then(|t| t.get(i))
+                        .map(|t| match t {
+                            Type::Basic(BasicType::Int)
+                            | Type::Basic(BasicType::Byte)
+                            | Type::Basic(BasicType::Big)
+                            | Type::Basic(BasicType::Real) => ValType::Word,
+                            _ => ValType::Ptr,
+                        })
+                        .unwrap_or(ValType::Word);
                     if name != "nil" {
-                        let off = self.alloc_local(name, ValType::Word);
-                        // Tuple fields at ret_tmp + i*4
-                        let field_off = ret_tmp + (i as i32) * 4;
+                        let off = self.alloc_local(name, ty, kind);
                         if field_off != off {
-                            self.emit(Opcode::Movw, op_fp(field_off), mid_unused(), op_fp(off));
+                            let op = match kind {
+                                NumKind::Big => Opcode::Movl,
+                                NumKind::Real => Opcode::Movf,
+                                NumKind::Word if ty == ValType::Ptr => Opcode::Movp,
+                                NumKind::Word => Opcode::Movw,
+                            };
+                            self.emit(op, op_fp(field_off), mid_unused(), op_fp(off));
                         }
                     }
+                    field_off += kind.byte_size();
                 }
                 Ok(())
             }
@@ -893,7 +1616,7 @@ impl CodeGen {
                 if let Expr::Ident(name, _) = inner.as_ref()
                     && let Some((off, _)) = self.get_local(name)
                 {
-                    self.emit(Opcode::Addw, op_imm(1), mid_unused(), op_fp(off));
+                    self.emit_inc_dec(off, self.local_num_kind(name), true);
                 }
                 Ok(())
             }
@@ -901,16 +1624,27 @@ impl CodeGen {
                 if let Expr::Ident(name, _) = inner.as_ref()
                     && let Some((off, _)) = self.get_local(name)
                 {
-                    self.emit(Opcode::Subw, op_imm(1), mid_unused(), op_fp(off));
+                    self.emit_inc_dec(off, self.local_num_kind(name), false);
                 }
                 Ok(())
             }
             Expr::Call(_, _, _) => self.gen_call_expr(expr),
             Expr::Send(chan_expr, val_expr, _) => {
+                // Size the value temp by the channel's element kind so the
+                // VM's op_send (which reads `elem_size` bytes from the val
+                // slot) doesn't truncate big/real messages.
+                let chan_elem = if let Expr::Ident(name, _) = chan_expr.as_ref() {
+                    self.local_chan_elem.get(name).copied()
+                } else {
+                    None
+                };
+                let val_kind = chan_elem
+                    .map(|b| type_num_kind(&Type::Basic(b)))
+                    .unwrap_or_else(|| self.infer_num_kind(val_expr));
                 let chan_tmp = self.alloc_temp();
-                let val_tmp = self.alloc_temp();
+                let val_tmp = self.alloc_temp_for(val_kind);
                 self.gen_expr_to(chan_expr, chan_tmp)?;
-                self.gen_expr_to(val_expr, val_tmp)?;
+                self.gen_expr_to_kind(val_expr, val_tmp, val_kind)?;
                 self.emit(Opcode::Send, op_fp(val_tmp), mid_unused(), op_fp(chan_tmp));
                 Ok(())
             }
@@ -967,10 +1701,17 @@ impl CodeGen {
             Expr::Ident(name, _) => {
                 if let Some((off, ty)) = self.get_local(name) {
                     if off != dst {
-                        let op = if ty != ValType::Word {
-                            Opcode::Movp
-                        } else {
-                            Opcode::Movw
+                        let kind = self.local_num_kind(name);
+                        let op = match (ty, kind) {
+                            // Big/real locals carry an 8-byte payload: use the
+                            // matching wide move regardless of the surrounding
+                            // ValType (which is Word for both).
+                            (_, NumKind::Big) => Opcode::Movl,
+                            (_, NumKind::Real) => Opcode::Movf,
+                            (ValType::Word, NumKind::Word) => Opcode::Movw,
+                            // Strings, lists, refs, channels, modules: 4-byte
+                            // pointer move with ref-counting in the VM.
+                            _ => Opcode::Movp,
                         };
                         self.emit(op, op_fp(off), mid_unused(), op_fp(dst));
                     }
@@ -993,17 +1734,27 @@ impl CodeGen {
                 self.gen_binary(lhs, *op, rhs, dst)
             }
             Expr::Index(arr, idx, _) => {
-                let arr_tmp = self.alloc_temp();
-                let idx_tmp = self.alloc_temp();
-                self.gen_expr_to(arr, arr_tmp)?;
-                self.gen_expr_to(idx, idx_tmp)?;
                 let arr_ty = self.infer_expr_type(arr);
                 if arr_ty == ValType::Ptr {
-                    // String indexing: Indc src, mid, dst → dst = src[mid]
+                    // String character read: Indc arr, idx, dst.
+                    let arr_tmp = self.alloc_temp();
+                    let idx_tmp = self.alloc_temp();
+                    self.gen_expr_to(arr, arr_tmp)?;
+                    self.gen_expr_to(idx, idx_tmp)?;
                     self.emit(Opcode::Indc, op_fp(arr_tmp), mid_fp(idx_tmp), op_fp(dst));
                 } else {
-                    // Array indexing: Indw
-                    self.emit(Opcode::Indw, op_fp(arr_tmp), mid_unused(), op_fp(dst));
+                    // Array element read:
+                    //   Ind* arr, ref, idx — install heap_ref at ref slot
+                    //   Mov* *(ref), dst   — read through ref
+                    let elem = self.array_elem_basic_for_expr(arr);
+                    let arr_tmp = self.alloc_temp();
+                    let idx_tmp = self.alloc_temp();
+                    self.gen_expr_to(arr, arr_tmp)?;
+                    self.gen_expr_to(idx, idx_tmp)?;
+                    let ref_tmp = self.alloc_temp();
+                    let (ind_op, mov_op) = Self::array_elem_opcodes(elem);
+                    self.emit(ind_op, op_fp(arr_tmp), mid_fp(ref_tmp), op_fp(idx_tmp));
+                    self.emit(mov_op, op_fp_ind(ref_tmp, 0), mid_unused(), op_fp(dst));
                 }
                 Ok(())
             }
@@ -1147,7 +1898,7 @@ impl CodeGen {
             Expr::DeclAssign(names, rhs, _) => {
                 let ty = self.infer_expr_type(rhs);
                 let name = names.first().map(|s| s.as_str()).unwrap_or("_");
-                let off = self.alloc_local(name, ty);
+                let off = self.alloc_local(name, ty, NumKind::Word);
                 self.gen_expr_to(rhs, off)?;
                 if off != dst {
                     let op = if ty != ValType::Word {
@@ -1170,25 +1921,64 @@ impl CodeGen {
                 }
                 match ty.as_ref() {
                     Type::Basic(BasicType::Int) => {
-                        // int(x) — convert to word
-                        self.gen_expr_to(inner, dst)?;
+                        // int(x) — narrow to word, picking the converter by
+                        // the inner expression's actual kind.
+                        let inner_kind = self.infer_num_kind(inner);
                         let inner_ty = self.infer_expr_type(inner);
-                        if inner_ty == ValType::Ptr {
-                            // string to int: Cvtcw
-                            self.emit(Opcode::Cvtcw, op_fp(dst), mid_unused(), op_fp(dst));
+                        match inner_kind {
+                            NumKind::Word => {
+                                self.gen_expr_to(inner, dst)?;
+                                if inner_ty == ValType::Ptr {
+                                    // string to int: Cvtcw
+                                    self.emit(Opcode::Cvtcw, op_fp(dst), mid_unused(), op_fp(dst));
+                                }
+                            }
+                            NumKind::Big => {
+                                let tmp = self.alloc_temp_for(NumKind::Big);
+                                self.gen_expr_to(inner, tmp)?;
+                                self.emit(Opcode::Cvtlw, op_fp(tmp), mid_unused(), op_fp(dst));
+                            }
+                            NumKind::Real => {
+                                let tmp = self.alloc_temp_for(NumKind::Real);
+                                self.gen_expr_to(inner, tmp)?;
+                                self.emit(Opcode::Cvtfw, op_fp(tmp), mid_unused(), op_fp(dst));
+                            }
                         }
-                        // big to int: Cvtlw, real to int: Cvtfw (simplified: just truncate)
                     }
                     Type::Basic(BasicType::Big) => {
-                        // big(x) — convert word to big
-                        self.gen_expr_to(inner, dst)?;
-                        self.emit(Opcode::Cvtwl, op_fp(dst), mid_unused(), op_fp(dst));
+                        // big(x) — widen to big, dispatching on inner kind.
+                        // Skip the converter when the inner is already big.
+                        match self.infer_num_kind(inner) {
+                            NumKind::Word => {
+                                let tmp = self.alloc_temp_for(NumKind::Word);
+                                self.gen_expr_to(inner, tmp)?;
+                                self.emit(Opcode::Cvtwl, op_fp(tmp), mid_unused(), op_fp(dst));
+                            }
+                            NumKind::Big => {
+                                self.gen_expr_to(inner, dst)?;
+                            }
+                            NumKind::Real => {
+                                let tmp = self.alloc_temp_for(NumKind::Real);
+                                self.gen_expr_to(inner, tmp)?;
+                                self.emit(Opcode::Cvtfl, op_fp(tmp), mid_unused(), op_fp(dst));
+                            }
+                        }
                     }
-                    Type::Basic(BasicType::Real) => {
-                        // real(x) — convert to float
-                        self.gen_expr_to(inner, dst)?;
-                        self.emit(Opcode::Cvtwf, op_fp(dst), mid_unused(), op_fp(dst));
-                    }
+                    Type::Basic(BasicType::Real) => match self.infer_num_kind(inner) {
+                        NumKind::Word => {
+                            let tmp = self.alloc_temp_for(NumKind::Word);
+                            self.gen_expr_to(inner, tmp)?;
+                            self.emit(Opcode::Cvtwf, op_fp(tmp), mid_unused(), op_fp(dst));
+                        }
+                        NumKind::Big => {
+                            let tmp = self.alloc_temp_for(NumKind::Big);
+                            self.gen_expr_to(inner, tmp)?;
+                            self.emit(Opcode::Cvtlf, op_fp(tmp), mid_unused(), op_fp(dst));
+                        }
+                        NumKind::Real => {
+                            self.gen_expr_to(inner, dst)?;
+                        }
+                    },
                     Type::Basic(BasicType::String) => {
                         // string x — various conversions
                         let inner_ty = self.infer_expr_type(inner);
@@ -1214,51 +2004,90 @@ impl CodeGen {
                 self.emit(Opcode::Newa, op_fp(sz_tmp), mid_imm(0), op_fp(dst));
                 Ok(())
             }
-            Expr::RefAlloc(_, args, _) => {
-                // ref Adt(field1, field2, ...) → New $type, dst; then fill fields
-                // Allocate a record with size = args.len() * 4
-                let record_size = (args.len() as i32) * 4;
-                // We need a type descriptor for this record. Use a simple one.
-                // For now, use New with an immediate size (simplified)
+            Expr::RefAlloc(ty, args, _) => {
+                // ref Adt(arg1, arg2, ...) → New $type, dst; then fill fields
+                // at the ADT's actual layout offsets with kind-aware Mov so
+                // big/real fields land in 8-byte slots. When the ADT layout
+                // is unknown (or the type is non-Named), fall back to the
+                // historical i*4 / Movw layout.
                 self.emit(Opcode::New, op_imm(1), mid_unused(), op_fp(dst));
-                // Fill fields at offsets 0, 4, 8, ...
+                let layout =
+                    Self::adt_name_for_type(ty).and_then(|a| self.adt_layouts.get(&a).cloned());
                 for (i, arg) in args.iter().enumerate() {
-                    let field_off = (i as i32) * 4;
-                    let arg_tmp = self.alloc_temp();
-                    self.gen_expr_to(arg, arg_tmp)?;
-                    let ty = self.infer_expr_type(arg);
-                    let op = if ty != ValType::Word {
-                        Opcode::Movp
-                    } else {
-                        Opcode::Movw
+                    let (field_off, field_ty) = match layout.as_ref().and_then(|l| l.get(i)) {
+                        Some((_, t, off)) => (*off, Some(t.clone())),
+                        None => ((i as i32) * 4, None),
+                    };
+                    let kind = field_ty
+                        .as_ref()
+                        .map(type_num_kind)
+                        .unwrap_or(NumKind::Word);
+                    let arg_tmp = self.alloc_temp_for(kind);
+                    self.gen_expr_to_kind(arg, arg_tmp, kind)?;
+                    let op = match field_ty.as_ref() {
+                        Some(Type::Basic(BasicType::Big)) => Opcode::Movl,
+                        Some(Type::Basic(BasicType::Real)) => Opcode::Movf,
+                        Some(Type::Basic(_)) => Opcode::Movw,
+                        Some(_) => Opcode::Movp,
+                        None => {
+                            // Heuristic fallback when the ADT layout is unknown.
+                            if self.infer_expr_type(arg) != ValType::Word {
+                                Opcode::Movp
+                            } else {
+                                Opcode::Movw
+                            }
+                        }
                     };
                     self.emit(op, op_fp(arg_tmp), mid_unused(), op_fp_ind(dst, field_off));
                 }
-                let _ = record_size;
                 Ok(())
             }
             Expr::Dot(inner, field, _) => {
-                // expr.field → read field at offset from the ref pointer
-                // Simplified: field offset = field_index * 4
+                // expr.field → read through the ref pointer using the ADT
+                // layout when known. Falls back to the historical heuristic
+                // (`estimate_field_offset` + Movw) for unknown types so the
+                // existing 155 Inferno programs keep compiling.
                 let ref_tmp = self.alloc_temp();
                 self.gen_expr_to(inner, ref_tmp)?;
-                let field_off = self.estimate_field_offset(inner, field);
-                // Double-indirect: read offset(ref(fp))
+                let (field_off, mov_op) = match self
+                    .adt_name_for_expr(inner)
+                    .and_then(|a| self.adt_field_info(&a, field))
+                {
+                    Some((off, ty)) => {
+                        let op = match &ty {
+                            Type::Basic(BasicType::Big) => Opcode::Movl,
+                            Type::Basic(BasicType::Real) => Opcode::Movf,
+                            Type::Basic(_) => Opcode::Movw,
+                            _ => Opcode::Movp,
+                        };
+                        (off, op)
+                    }
+                    None => (self.estimate_field_offset(inner, field), Opcode::Movw),
+                };
                 self.emit(
-                    Opcode::Movw,
+                    mov_op,
                     op_fp_ind(ref_tmp, field_off),
                     mid_unused(),
                     op_fp(dst),
                 );
                 Ok(())
             }
-            Expr::ChanAlloc(_, _) => {
-                // chan of type → Newcw $0, dst
-                self.emit(Opcode::Newcw, op_unused(), mid_imm(0), op_fp(dst));
+            Expr::ChanAlloc(ty, _) => {
+                // chan of T → Newc{w/b/l/f/p} $0, dst, picking the opcode
+                // by element width so Send/Recv copy the right number of
+                // bytes per message.
+                let elem = match ty.as_ref() {
+                    Type::Basic(b) => Some(*b),
+                    _ => None,
+                };
+                self.emit(newc_opcode(elem), op_unused(), mid_imm(0), op_fp(dst));
                 Ok(())
             }
             Expr::Recv(chan_expr, _) => {
-                // <-chan → Recv chan, dst
+                // <-chan → Recv chan, dst. The dst slot is the receiver's
+                // local; its size is set by the surrounding kind-aware
+                // alloc, so the channel's elem_size and dst's slot size
+                // align as long as the Limbo program is type-clean.
                 let chan_tmp = self.alloc_temp();
                 self.gen_expr_to(chan_expr, chan_tmp)?;
                 self.emit(Opcode::Recv, op_fp(chan_tmp), mid_unused(), op_fp(dst));
@@ -1292,7 +2121,7 @@ impl CodeGen {
                     let off = self
                         .get_local(name)
                         .map(|(o, _)| o)
-                        .unwrap_or_else(|| self.alloc_local(name, ty));
+                        .unwrap_or_else(|| self.alloc_local(name, ty, NumKind::Word));
                     if off != dst {
                         let op = if ty != ValType::Word {
                             Opcode::Movp
@@ -1316,12 +2145,12 @@ impl CodeGen {
         match op {
             BinOp::Eq | BinOp::Neq | BinOp::Lt | BinOp::Gt | BinOp::Leq | BinOp::Geq => {
                 let lt = self.infer_expr_type(lhs);
-                let l = self.alloc_temp();
-                let r = self.alloc_temp();
-                self.gen_expr_to(lhs, l)?;
-                self.gen_expr_to(rhs, r)?;
-                // For pointer comparisons (string ==), use Beqc/Bnec
+                // Pointer comparisons (string ==/!=) compare 4-byte ids.
                 if lt == ValType::Ptr && matches!(op, BinOp::Eq | BinOp::Neq) {
+                    let l = self.alloc_temp();
+                    let r = self.alloc_temp();
+                    self.gen_expr_to(lhs, l)?;
+                    self.gen_expr_to(rhs, r)?;
                     self.emit(Opcode::Movw, op_imm(1), mid_unused(), op_fp(dst));
                     let branch = if op == BinOp::Eq {
                         Opcode::Beqc
@@ -1332,22 +2161,41 @@ impl CodeGen {
                     self.emit(branch, op_fp(l), mid_fp(r), op_imm(0));
                     self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
                     self.code[skip].destination = op_imm(self.code.len() as i32);
-                } else {
-                    self.emit(Opcode::Movw, op_imm(1), mid_unused(), op_fp(dst));
-                    let branch = match op {
-                        BinOp::Eq => Opcode::Beqw,
-                        BinOp::Neq => Opcode::Bnew,
-                        BinOp::Lt => Opcode::Bltw,
-                        BinOp::Gt => Opcode::Bgtw,
-                        BinOp::Leq => Opcode::Blew,
-                        BinOp::Geq => Opcode::Bgew,
-                        _ => Opcode::Beqw,
-                    };
-                    let skip = self.code.len();
-                    self.emit(branch, op_fp(l), mid_fp(r), op_imm(0));
-                    self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
-                    self.code[skip].destination = op_imm(self.code.len() as i32);
+                    return Ok(());
                 }
+                // Numeric comparisons promote both operands to the wider kind
+                // and pick the matching branch opcode (Beqw/Beql/Beqf, etc.).
+                let kind = self.infer_num_kind(lhs).max(self.infer_num_kind(rhs));
+                let l = self.alloc_temp_for(kind);
+                let r = self.alloc_temp_for(kind);
+                self.gen_expr_to_kind(lhs, l, kind)?;
+                self.gen_expr_to_kind(rhs, r, kind)?;
+                self.emit(Opcode::Movw, op_imm(1), mid_unused(), op_fp(dst));
+                let branch = match (op, kind) {
+                    (BinOp::Eq, NumKind::Word) => Opcode::Beqw,
+                    (BinOp::Eq, NumKind::Big) => Opcode::Beql,
+                    (BinOp::Eq, NumKind::Real) => Opcode::Beqf,
+                    (BinOp::Neq, NumKind::Word) => Opcode::Bnew,
+                    (BinOp::Neq, NumKind::Big) => Opcode::Bnel,
+                    (BinOp::Neq, NumKind::Real) => Opcode::Bnef,
+                    (BinOp::Lt, NumKind::Word) => Opcode::Bltw,
+                    (BinOp::Lt, NumKind::Big) => Opcode::Bltl,
+                    (BinOp::Lt, NumKind::Real) => Opcode::Bltf,
+                    (BinOp::Gt, NumKind::Word) => Opcode::Bgtw,
+                    (BinOp::Gt, NumKind::Big) => Opcode::Bgtl,
+                    (BinOp::Gt, NumKind::Real) => Opcode::Bgtf,
+                    (BinOp::Leq, NumKind::Word) => Opcode::Blew,
+                    (BinOp::Leq, NumKind::Big) => Opcode::Blel,
+                    (BinOp::Leq, NumKind::Real) => Opcode::Blef,
+                    (BinOp::Geq, NumKind::Word) => Opcode::Bgew,
+                    (BinOp::Geq, NumKind::Big) => Opcode::Bgel,
+                    (BinOp::Geq, NumKind::Real) => Opcode::Bgef,
+                    _ => Opcode::Beqw,
+                };
+                let skip = self.code.len();
+                self.emit(branch, op_fp(l), mid_fp(r), op_imm(0));
+                self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
+                self.code[skip].destination = op_imm(self.code.len() as i32);
                 return Ok(());
             }
             BinOp::LogAnd => return self.gen_logical_and(lhs, rhs, dst),
@@ -1355,28 +2203,73 @@ impl CodeGen {
             _ => {}
         }
 
-        let l = self.alloc_temp();
-        let r = self.alloc_temp();
-        self.gen_expr_to(lhs, l)?;
-        self.gen_expr_to(rhs, r)?;
-        let opcode = match op {
-            BinOp::Add => Opcode::Addw,
-            BinOp::Sub => Opcode::Subw,
-            BinOp::Mul => Opcode::Mulw,
-            BinOp::Div => Opcode::Divw,
-            BinOp::Mod => Opcode::Modw,
-            BinOp::And => Opcode::Andw,
-            BinOp::Or => Opcode::Orw,
-            BinOp::Xor => Opcode::Xorw,
-            BinOp::Lshift => Opcode::Shlw,
-            BinOp::Rshift => Opcode::Shrw,
-            BinOp::Power => Opcode::Expw,
+        // Shift and exponent ops have an asymmetric kind contract: the base
+        // (lhs) carries the operand kind, but the shift count / exponent
+        // (rhs) is always a Word. Handle them separately so we don't widen
+        // the count's temp slot.
+        if matches!(op, BinOp::Lshift | BinOp::Rshift | BinOp::Power) {
+            let lhs_kind = self.infer_num_kind(lhs);
+            let l = self.alloc_temp_for(lhs_kind);
+            let r = self.alloc_temp_for(NumKind::Word);
+            self.gen_expr_to_kind(lhs, l, lhs_kind)?;
+            self.gen_expr_to_kind(rhs, r, NumKind::Word)?;
+            let opcode = match (op, lhs_kind) {
+                (BinOp::Lshift, NumKind::Word) => Opcode::Shlw,
+                (BinOp::Lshift, NumKind::Big) => Opcode::Shll,
+                (BinOp::Rshift, NumKind::Word) => Opcode::Shrw,
+                (BinOp::Rshift, NumKind::Big) => Opcode::Shrl,
+                (BinOp::Power, NumKind::Word) => Opcode::Expw,
+                (BinOp::Power, NumKind::Big) => Opcode::Expl,
+                (BinOp::Power, NumKind::Real) => Opcode::Expf,
+                _ => return Err(format!("unsupported {op:?} on real-typed operand")),
+            };
+            // 3-op: src = exponent/count (word), mid = base (kind), dst = result.
+            self.emit(opcode, op_fp(r), mid_fp(l), op_fp(dst));
+            return Ok(());
+        }
+
+        let kind = self.infer_num_kind(lhs).max(self.infer_num_kind(rhs));
+        let l = self.alloc_temp_for(kind);
+        let r = self.alloc_temp_for(kind);
+        // Use kind-aware gen_expr_to so a narrower operand (e.g. an int
+        // literal in `big_var + 1`) is widened via Cvtwl/Cvtwf rather than
+        // leaving the high bytes of the wide temp uninitialized.
+        self.gen_expr_to_kind(lhs, l, kind)?;
+        self.gen_expr_to_kind(rhs, r, kind)?;
+        let opcode = match (op, kind) {
+            (BinOp::Add, NumKind::Word) => Opcode::Addw,
+            (BinOp::Add, NumKind::Big) => Opcode::Addl,
+            (BinOp::Add, NumKind::Real) => Opcode::Addf,
+            (BinOp::Sub, NumKind::Word) => Opcode::Subw,
+            (BinOp::Sub, NumKind::Big) => Opcode::Subl,
+            (BinOp::Sub, NumKind::Real) => Opcode::Subf,
+            (BinOp::Mul, NumKind::Word) => Opcode::Mulw,
+            (BinOp::Mul, NumKind::Big) => Opcode::Mull,
+            (BinOp::Mul, NumKind::Real) => Opcode::Mulf,
+            (BinOp::Div, NumKind::Word) => Opcode::Divw,
+            (BinOp::Div, NumKind::Big) => Opcode::Divl,
+            (BinOp::Div, NumKind::Real) => Opcode::Divf,
+            (BinOp::Mod, NumKind::Word) => Opcode::Modw,
+            (BinOp::Mod, NumKind::Big) => Opcode::Modl,
+            // No Modf in Dis: Limbo programs use math->fmod for real %.
+            (BinOp::Mod, NumKind::Real) => {
+                return Err("real % real has no Dis opcode; use math->fmod".to_string());
+            }
+            (BinOp::And, NumKind::Word) => Opcode::Andw,
+            (BinOp::And, NumKind::Big) => Opcode::Andl,
+            (BinOp::Or, NumKind::Word) => Opcode::Orw,
+            (BinOp::Or, NumKind::Big) => Opcode::Orl,
+            (BinOp::Xor, NumKind::Word) => Opcode::Xorw,
+            (BinOp::Xor, NumKind::Big) => Opcode::Xorl,
+            (BinOp::And | BinOp::Or | BinOp::Xor, NumKind::Real) => {
+                return Err(format!("bitwise {op:?} on real operand is not valid"));
+            }
             _ => Opcode::Movw,
         };
-        self.emit(opcode, op_fp(l), mid_unused(), op_fp(r));
-        if r != dst {
-            self.emit(Opcode::Movw, op_fp(r), mid_unused(), op_fp(dst));
-        }
+        // The 3-operand form computes `dst = mid OP src` for Sub/Div/Mod in
+        // the reference Dis VM (xec.c), so place lhs in mid and rhs in src.
+        // Commutative ops (Add/Mul/And/Or/Xor) are unaffected by the order.
+        self.emit(opcode, op_fp(r), mid_fp(l), op_fp(dst));
         Ok(())
     }
 
@@ -1409,15 +2302,38 @@ impl CodeGen {
     }
 
     fn gen_unary(&mut self, op: UnaryOp, inner: &Expr, dst: i32) -> Result<(), String> {
-        self.gen_expr_to(inner, dst)?;
+        let kind = self.infer_num_kind(inner);
         match op {
             UnaryOp::Neg => {
-                let t = self.alloc_temp();
-                self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(t));
-                self.emit(Opcode::Subw, op_fp(dst), mid_unused(), op_fp(t));
-                self.emit(Opcode::Movw, op_fp(t), mid_unused(), op_fp(dst));
+                // Compute `0 - inner` using the matching opcode family. Dis
+                // sub semantics: `dst = mid - src`, so emit src=inner_tmp,
+                // mid=zero_tmp.
+                let inner_tmp = self.alloc_temp_for(kind);
+                let zero_tmp = self.alloc_temp_for(kind);
+                self.gen_expr_to(inner, inner_tmp)?;
+                let (mov_zero, sub) = match kind {
+                    NumKind::Word => (Opcode::Movw, Opcode::Subw),
+                    NumKind::Big => (Opcode::Movl, Opcode::Subl),
+                    NumKind::Real => (Opcode::Movf, Opcode::Subf),
+                };
+                if kind == NumKind::Real {
+                    // Real has no immediate move; use a cast from word 0.
+                    let z_word = self.alloc_temp_for(NumKind::Word);
+                    self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(z_word));
+                    self.emit(Opcode::Cvtwf, op_fp(z_word), mid_unused(), op_fp(zero_tmp));
+                } else if kind == NumKind::Big {
+                    let z_word = self.alloc_temp_for(NumKind::Word);
+                    self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(z_word));
+                    self.emit(Opcode::Cvtwl, op_fp(z_word), mid_unused(), op_fp(zero_tmp));
+                } else {
+                    self.emit(mov_zero, op_imm(0), mid_unused(), op_fp(zero_tmp));
+                }
+                self.emit(sub, op_fp(inner_tmp), mid_fp(zero_tmp), op_fp(dst));
             }
             UnaryOp::Not => {
+                // `!x` is a boolean negation: x == 0 ? 1 : 0. Always emits a
+                // word boolean regardless of the inner kind.
+                self.gen_expr_to(inner, dst)?;
                 let skip = self.code.len();
                 self.emit(Opcode::Beqw, op_fp(dst), mid_imm(0), op_imm(0));
                 self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
@@ -1428,11 +2344,69 @@ impl CodeGen {
                 self.code[end].destination = op_imm(self.code.len() as i32);
             }
             UnaryOp::BitNot => {
-                let t = self.alloc_temp();
-                self.emit(Opcode::Movw, op_imm(-1), mid_unused(), op_fp(t));
-                self.emit(Opcode::Xorw, op_fp(t), mid_unused(), op_fp(dst));
+                // `~x = x ^ -1`. Big variant uses Xorl with a sign-extended
+                // -1 in a wide temp.
+                self.gen_expr_to(inner, dst)?;
+                match kind {
+                    NumKind::Word => {
+                        let t = self.alloc_temp();
+                        self.emit(Opcode::Movw, op_imm(-1), mid_unused(), op_fp(t));
+                        self.emit(Opcode::Xorw, op_fp(t), mid_unused(), op_fp(dst));
+                    }
+                    NumKind::Big => {
+                        let z_word = self.alloc_temp_for(NumKind::Word);
+                        let t = self.alloc_temp_for(NumKind::Big);
+                        self.emit(Opcode::Movw, op_imm(-1), mid_unused(), op_fp(z_word));
+                        self.emit(Opcode::Cvtwl, op_fp(z_word), mid_unused(), op_fp(t));
+                        self.emit(Opcode::Xorl, op_fp(t), mid_unused(), op_fp(dst));
+                    }
+                    NumKind::Real => {
+                        return Err("bitwise NOT on real operand is not valid".to_string());
+                    }
+                }
             }
-            UnaryOp::Ref => {}
+            UnaryOp::Ref => {
+                // The parser emits `ref TypeName(args)` as
+                // `Unary(Ref, Call(Ident(TypeName), args))`. If the callee
+                // resolves to a known ADT (not a function), treat it as
+                // record allocation: New + per-field init at the ADT's
+                // actual layout offsets with kind-aware Mov.
+                if let Expr::Call(callee, args, _) = inner
+                    && let Expr::Ident(name, _) = callee.as_ref()
+                    && self.adt_layouts.contains_key(name)
+                {
+                    self.emit(Opcode::New, op_imm(1), mid_unused(), op_fp(dst));
+                    let layout = self.adt_layouts.get(name).cloned();
+                    for (i, arg) in args.iter().enumerate() {
+                        let (field_off, field_ty) = match layout.as_ref().and_then(|l| l.get(i)) {
+                            Some((_, t, off)) => (*off, Some(t.clone())),
+                            None => ((i as i32) * 4, None),
+                        };
+                        let kind = field_ty
+                            .as_ref()
+                            .map(type_num_kind)
+                            .unwrap_or(NumKind::Word);
+                        let arg_tmp = self.alloc_temp_for(kind);
+                        self.gen_expr_to_kind(arg, arg_tmp, kind)?;
+                        let op = match field_ty.as_ref() {
+                            Some(Type::Basic(BasicType::Big)) => Opcode::Movl,
+                            Some(Type::Basic(BasicType::Real)) => Opcode::Movf,
+                            Some(Type::Basic(_)) => Opcode::Movw,
+                            Some(_) => Opcode::Movp,
+                            None => {
+                                if self.infer_expr_type(arg) != ValType::Word {
+                                    Opcode::Movp
+                                } else {
+                                    Opcode::Movw
+                                }
+                            }
+                        };
+                        self.emit(op, op_fp(arg_tmp), mid_unused(), op_fp_ind(dst, field_off));
+                    }
+                } else {
+                    self.gen_expr_to(inner, dst)?;
+                }
+            }
         }
         Ok(())
     }
@@ -1492,23 +2466,29 @@ impl CodeGen {
             .func_table
             .iter()
             .enumerate()
-            .find(|(_, (n, _, _))| n == func_name)
-            .map(|(i, (_, pc, _))| (i, *pc));
+            .find(|(_, (n, _, _, _))| n == func_name)
+            .map(|(i, (_, pc, _, ret))| (i, *pc, *ret));
 
-        if let Some((func_idx, func_pc)) = func_info {
+        if let Some((func_idx, func_pc, ret_kind)) = func_info {
             let func_type = 2 + func_idx as i32;
 
-            // Evaluate args first
-            let mut arg_temps = Vec::new();
+            // Evaluate args first into temps sized by each arg's kind so
+            // big/real values aren't truncated.
+            let mut arg_temps: Vec<(i32, ValType, NumKind)> = Vec::new();
             for arg in args {
-                let tmp = self.alloc_temp();
+                let kind = self.infer_num_kind(arg);
+                let tmp = self.alloc_temp_for(kind);
                 self.gen_expr_to(arg, tmp)?;
                 let ty = self.infer_expr_type(arg);
-                arg_temps.push((tmp, ty));
+                arg_temps.push((tmp, ty, kind));
             }
 
             let frame_tmp = self.alloc_temp();
-            let ret_tmp = self.alloc_temp();
+            // ret_tmp receives the callee's return value via the standard
+            // pointer-installed-at-frame[16] convention. Its slot must be
+            // wide enough for the return kind so 8-byte big/real values
+            // don't overflow into adjacent temps.
+            let ret_tmp = self.alloc_temp_for(ret_kind);
 
             self.emit(
                 Opcode::Frame,
@@ -1517,32 +2497,50 @@ impl CodeGen {
                 op_fp(frame_tmp),
             );
 
-            for (i, (tmp, ty)) in arg_temps.iter().enumerate() {
-                let arg_off = 32 + (i as i32) * 4;
-                let op = if *ty != ValType::Word {
-                    Opcode::Movp
-                } else {
-                    Opcode::Movw
+            // Pack args into the callee frame at cumulative offsets matching
+            // the callee's param layout (4 bytes per Word/Ptr, 8 bytes per
+            // Big/Real). The callee's `param_off += kind.byte_size()` loop
+            // produces matching offsets.
+            let mut arg_off = 32i32;
+            for (tmp, ty, kind) in &arg_temps {
+                let op = match (ty, kind) {
+                    (_, NumKind::Big) => Opcode::Movl,
+                    (_, NumKind::Real) => Opcode::Movf,
+                    (ValType::Word, NumKind::Word) => Opcode::Movw,
+                    _ => Opcode::Movp,
                 };
                 self.emit(op, op_fp(*tmp), mid_unused(), op_fp_ind(frame_tmp, arg_off));
+                arg_off += kind.byte_size();
             }
 
+            // When the caller wants the result, install dst directly as the
+            // return target. This skips an intermediate ret_tmp + Mov pair,
+            // and matters for tuple returns whose total width can exceed 8
+            // bytes — a single Mov{w/l/f} couldn't copy the whole tuple.
+            // The caller (e.g., TupleDeclAssign) is responsible for sizing
+            // `dst` to fit the full return shape.
+            let return_target = result_dst.unwrap_or(ret_tmp);
             self.emit(
                 Opcode::Lea,
-                op_fp(ret_tmp),
+                op_fp(return_target),
                 mid_unused(),
                 op_fp_ind(frame_tmp, 16),
             );
+            let call_idx = self.code.len();
             self.emit(
                 Opcode::Call,
                 op_fp(frame_tmp),
                 mid_unused(),
                 op_imm(func_pc),
             );
-
-            if let Some(dst) = result_dst {
-                self.emit(Opcode::Movw, op_fp(ret_tmp), mid_unused(), op_fp(dst));
+            if func_pc < 0 {
+                // Forward reference: pre-registered placeholder PC. Patch
+                // after the callee is generated.
+                self.pending_call_fixups
+                    .push((call_idx, func_name.to_string()));
             }
+            // Suppress unused-variable warning when result_dst is None.
+            let _ = ret_kind;
         }
         Ok(())
     }
@@ -1555,19 +2553,24 @@ impl CodeGen {
     ) -> Result<(), String> {
         let func_idx = self.ensure_sys_func(func_name);
 
-        // Phase 1: Evaluate all arguments into temporaries BEFORE allocating call frame.
-        // This ensures nested calls (like sys->fildes(1)) complete first.
-        let mut arg_temps = Vec::new();
+        // Phase 1: Evaluate all arguments into kind-sized temps BEFORE
+        // allocating the call frame. Nested calls (like sys->fildes(1))
+        // complete first; each temp's width matches its arg's kind so big
+        // and real values aren't truncated when packed.
+        let mut arg_temps: Vec<(i32, ValType, NumKind)> = Vec::new();
         for arg in args {
-            let tmp = self.alloc_temp();
+            let kind = self.infer_num_kind(arg);
+            let tmp = self.alloc_temp_for(kind);
             self.gen_expr_to(arg, tmp)?;
             let ty = self.infer_expr_type(arg);
-            arg_temps.push((tmp, ty));
+            arg_temps.push((tmp, ty, kind));
         }
 
         // Phase 2: Allocate call frame and fill it
         let frame_tmp = self.alloc_temp();
-        let ret_tmp = self.alloc_temp();
+        // Wide enough for big/real returns; pointer returns share the 4-byte
+        // size of Word so ValType::Ptr sys functions are unaffected.
+        let ret_tmp = self.alloc_temp_for(sys_return_kind(func_name));
 
         self.emit(
             Opcode::Mframe,
@@ -1576,19 +2579,28 @@ impl CodeGen {
             op_fp(frame_tmp),
         );
 
-        for (i, (tmp, ty)) in arg_temps.iter().enumerate() {
-            let arg_off = 32 + (i as i32) * 4;
-            let op = if *ty != ValType::Word {
-                Opcode::Movp
-            } else {
-                Opcode::Movw
+        // Pack args at cumulative offsets so each occupies the right width
+        // (4 bytes per Word/Ptr, 8 bytes per Big/Real). For varargs like
+        // `sys->print`, this puts the format-string-driven $Sys formatter's
+        // expected layout in place: %d reads 4 bytes, %bd 8, %f 8, etc.
+        let mut arg_off = 32i32;
+        for (tmp, ty, kind) in &arg_temps {
+            let op = match (ty, kind) {
+                (_, NumKind::Big) => Opcode::Movl,
+                (_, NumKind::Real) => Opcode::Movf,
+                (ValType::Word, NumKind::Word) => Opcode::Movw,
+                _ => Opcode::Movp,
             };
             self.emit(op, op_fp(*tmp), mid_unused(), op_fp_ind(frame_tmp, arg_off));
+            arg_off += kind.byte_size();
         }
 
+        // Same direct-return-target trick as gen_local_call: skip the
+        // intermediate ret_tmp when the caller provides a destination.
+        let return_target = result_dst.unwrap_or(ret_tmp);
         self.emit(
             Opcode::Lea,
-            op_fp(ret_tmp),
+            op_fp(return_target),
             mid_unused(),
             op_fp_ind(frame_tmp, 16),
         );
@@ -1598,19 +2610,6 @@ impl CodeGen {
             mid_imm(func_idx as i32),
             op_mp(self.sys_mp_ref),
         );
-
-        if let Some(dst) = result_dst {
-            let ret_is_ptr = matches!(
-                func_name,
-                "fildes" | "open" | "create" | "fstat" | "stat" | "sprint" | "aprint"
-            );
-            let op = if ret_is_ptr {
-                Opcode::Movp
-            } else {
-                Opcode::Movw
-            };
-            self.emit(op, op_fp(ret_tmp), mid_unused(), op_fp(dst));
-        }
         Ok(())
     }
 
@@ -1647,6 +2646,37 @@ impl CodeGen {
             middle: mid,
             destination: dst,
         });
+    }
+
+    /// Emit an in-place increment or decrement of a local at `off`. Picks
+    /// the opcode family by `kind`: Word uses Addw/Subw with an immediate;
+    /// Big and Real materialize a kind-sized `1` in a wide temp via Cvt and
+    /// use Addl/Subl or Addf/Subf so the carry/precision of the high bytes
+    /// is preserved.
+    fn emit_inc_dec(&mut self, off: i32, kind: NumKind, inc: bool) {
+        match kind {
+            NumKind::Word => {
+                let opc = if inc { Opcode::Addw } else { Opcode::Subw };
+                self.emit(opc, op_imm(1), mid_unused(), op_fp(off));
+            }
+            NumKind::Big => {
+                let z = self.alloc_temp_for(NumKind::Word);
+                let one = self.alloc_temp_for(NumKind::Big);
+                self.emit(Opcode::Movw, op_imm(1), mid_unused(), op_fp(z));
+                self.emit(Opcode::Cvtwl, op_fp(z), mid_unused(), op_fp(one));
+                let opc = if inc { Opcode::Addl } else { Opcode::Subl };
+                // 2-op form: dst = dst OP src, so off += one (or off -= one).
+                self.emit(opc, op_fp(one), mid_unused(), op_fp(off));
+            }
+            NumKind::Real => {
+                let z = self.alloc_temp_for(NumKind::Word);
+                let one = self.alloc_temp_for(NumKind::Real);
+                self.emit(Opcode::Movw, op_imm(1), mid_unused(), op_fp(z));
+                self.emit(Opcode::Cvtwf, op_fp(z), mid_unused(), op_fp(one));
+                let opc = if inc { Opcode::Addf } else { Opcode::Subf };
+                self.emit(opc, op_fp(one), mid_unused(), op_fp(off));
+            }
+        }
     }
 }
 

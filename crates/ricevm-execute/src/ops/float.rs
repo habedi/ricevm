@@ -23,9 +23,6 @@ pub(crate) fn op_mulf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 pub(crate) fn op_divf(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_real()?;
     let m = vm.mid_or_dst_real()?;
-    if s == 0.0 {
-        return vm.set_dst_real(f64::INFINITY.copysign(m));
-    }
     vm.set_dst_real(m / s)
 }
 
@@ -149,6 +146,37 @@ mod tests {
         op_divf(&mut vm).expect("divf should succeed");
         assert!(read_dst_real(&vm, fp).is_infinite());
         assert!(read_dst_real(&vm, fp).is_sign_negative());
+    }
+
+    /// Regression: 0.0 / 0.0 must produce NaN, matching IEEE 754 and the
+    /// reference xec.c behavior. An earlier guard returned `INFINITY.copysign(m)`
+    /// for any `s == 0.0`, which yielded `+∞` for 0/0 instead of NaN.
+    #[test]
+    fn divf_zero_by_zero_is_nan() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = setup_real_binop(&mut vm, 0.0, 0.0);
+        op_divf(&mut vm).expect("divf should succeed");
+        assert!(
+            read_dst_real(&vm, fp).is_nan(),
+            "0.0 / 0.0 should produce NaN, got {}",
+            read_dst_real(&vm, fp)
+        );
+    }
+
+    /// Regression: `x / -0.0` must preserve IEEE 754 sign semantics:
+    /// +5.0 / -0.0 is -∞ because the result sign is the XOR of input signs.
+    /// The earlier guard checked only `s == 0.0` (true for both signed zeros)
+    /// and returned `INFINITY.copysign(m)`, flipping the expected sign.
+    #[test]
+    fn divf_by_negative_zero_preserves_sign() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = setup_real_binop(&mut vm, -0.0, 5.0);
+        op_divf(&mut vm).expect("divf should succeed");
+        let got = read_dst_real(&vm, fp);
+        assert!(got.is_infinite(), "expected -∞, got {got}");
+        assert!(got.is_sign_negative(), "expected negative sign, got {got}");
     }
 
     #[test]

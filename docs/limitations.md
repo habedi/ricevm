@@ -34,11 +34,15 @@ incomplete.
 
 The built-in Limbo compiler (`ricevm-limbo`) handles a large subset of the language but has gaps:
 
-- No type checker: type inference is used during code generation, but there is no validation pass that reports type errors before execution.
+- No type checker: type inference is used during code generation, but there is no validation pass that reports type errors before execution. Programs
+  that the reference compiler would reject as type-incorrect (for example, mixed-width arithmetic without an explicit cast) compile silently and can
+  produce results.
 - No alt statement codegen: the `alt` statement parses but does not generate the alt table format required by the VM.
 - No exception handler block codegen: `raise` works, but `{ ... } exception { ... }` blocks do not generate handler table entries.
-- Simplified ADT support: inline ADTs work for simple fields; complex nested ADTs, pick types, and cyclic types are not fully supported in code
-  generation.
+- ADT pick types and cyclic types: standard ADTs with int, byte, big, real, string, list, ref, and array fields work end-to-end (including correct
+  field offsets, kind-matched moves, and nested access). Pick types (`pick { tag => ... }`) and cyclic ADT references are not yet supported.
+- Field-access heuristics for unknown ADTs: when the compiler cannot resolve a value's ADT (for example, fields read off an opaque module return),
+  field offsets and types fall back to a name-based heuristic with `Movw`. Resolving these fully requires the type checker.
 - No import signature hashes: all import signatures are 0; the VM uses name-based function matching.
 
 ## Compatibility

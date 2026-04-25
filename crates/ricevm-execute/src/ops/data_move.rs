@@ -221,6 +221,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::ops::pointer::op_movp;
 
     fn test_module() -> Module {
         Module {
@@ -426,5 +427,206 @@ mod tests {
             &[0xBB; 8],
             "movmp should not overcopy into adjacent data"
         );
+    }
+
+    #[test]
+    fn movw_copies_word_between_frame_locations() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        crate::memory::write_word(&mut vm.frames.data, fp, 12345);
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_movw(&mut vm).expect("movw should succeed");
+        assert_eq!(crate::memory::read_word(&vm.frames.data, fp + 4), 12345);
+    }
+
+    #[test]
+    fn movw_copies_negative_word() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        crate::memory::write_word(&mut vm.frames.data, fp, -42);
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_movw(&mut vm).expect("movw should succeed");
+        assert_eq!(crate::memory::read_word(&vm.frames.data, fp + 4), -42);
+    }
+
+    #[test]
+    fn movw_immediate_to_frame() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 9999;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_movw(&mut vm).expect("movw from immediate should succeed");
+        assert_eq!(crate::memory::read_word(&vm.frames.data, fp), 9999);
+    }
+
+    #[test]
+    fn movb_copies_byte() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.frames.data[fp] = 0xAB;
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 1);
+
+        op_movb(&mut vm).expect("movb should succeed");
+        assert_eq!(vm.frames.data[fp + 1], 0xAB);
+    }
+
+    #[test]
+    fn movb_immediate_to_frame() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 0x42;
+        vm.dst = AddrTarget::Frame(fp + 2);
+
+        op_movb(&mut vm).expect("movb from immediate should succeed");
+        assert_eq!(vm.frames.data[fp + 2], 0x42);
+    }
+
+    #[test]
+    fn movf_copies_float() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        crate::memory::write_real(&mut vm.frames.data, fp, 3.14159);
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 8);
+
+        op_movf(&mut vm).expect("movf should succeed");
+        let result = crate::memory::read_real(&vm.frames.data, fp + 8);
+        assert!((result - 3.14159).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn movf_negative_float() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        crate::memory::write_real(&mut vm.frames.data, fp, -2.71828);
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 8);
+
+        op_movf(&mut vm).expect("movf should succeed");
+        let result = crate::memory::read_real(&vm.frames.data, fp + 8);
+        assert!((result - (-2.71828)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn movl_copies_big_value() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        crate::memory::write_big(&mut vm.frames.data, fp, 0x0102030405060708i64);
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 8);
+
+        op_movl(&mut vm).expect("movl should succeed");
+        assert_eq!(
+            crate::memory::read_big(&vm.frames.data, fp + 8),
+            0x0102030405060708i64
+        );
+    }
+
+    #[test]
+    fn movl_negative_big() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        crate::memory::write_big(&mut vm.frames.data, fp, -1i64);
+        vm.src = AddrTarget::Frame(fp);
+        vm.dst = AddrTarget::Frame(fp + 8);
+
+        op_movl(&mut vm).expect("movl should succeed");
+        assert_eq!(crate::memory::read_big(&vm.frames.data, fp + 8), -1i64);
+    }
+
+    #[test]
+    fn movp_moves_pointer_with_refcounting() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let id = vm.heap.alloc(0, HeapData::Record(vec![0; 8]));
+        assert_eq!(vm.heap.get(id).unwrap().ref_count, 1);
+
+        // Store the pointer in src
+        crate::memory::write_word(&mut vm.frames.data, fp, id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        // dst starts as NIL
+        crate::memory::write_word(&mut vm.frames.data, fp + 4, heap::NIL as i32);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_movp(&mut vm).expect("movp should succeed");
+
+        // dst should now hold the pointer
+        assert_eq!(crate::memory::read_word(&vm.frames.data, fp + 4), id as i32);
+        // ref count should be incremented (src_ptr reads, move_ptr_to_dst increments)
+        assert_eq!(vm.heap.get(id).unwrap().ref_count, 2);
+    }
+
+    #[test]
+    fn movm_copies_block_of_bytes() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.frames.data[fp..fp + 6].copy_from_slice(&[10, 20, 30, 40, 50, 60]);
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 6;
+        vm.dst = AddrTarget::Frame(fp + 16);
+
+        op_movm(&mut vm).expect("movm should succeed");
+        assert_eq!(&vm.frames.data[fp + 16..fp + 22], &[10, 20, 30, 40, 50, 60]);
+    }
+
+    #[test]
+    fn movm_zero_size_is_noop() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.frames.data[fp + 16] = 0xFF;
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Frame(fp + 16);
+
+        op_movm(&mut vm).expect("movm with size 0 should succeed");
+        assert_eq!(vm.frames.data[fp + 16], 0xFF, "dst should be unchanged");
+    }
+
+    #[test]
+    fn movpc_copies_program_counter_value() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 42;
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_movpc(&mut vm).expect("movpc should succeed");
+        assert_eq!(crate::memory::read_word(&vm.frames.data, fp), 42);
     }
 }

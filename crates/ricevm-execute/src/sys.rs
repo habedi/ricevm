@@ -42,10 +42,8 @@ fn write_ret_word(vm: &mut VmState<'_>, frame_base: usize, field_offset: usize, 
             crate::address::AddrTarget::Frame(off) => {
                 memory::write_word(&mut vm.frames.data, off + field_offset, val);
             }
-            crate::address::AddrTarget::Mp(off) => {
-                if off + field_offset + 4 <= vm.mp.len() {
-                    memory::write_word(&mut vm.mp, off + field_offset, val);
-                }
+            crate::address::AddrTarget::Mp(off) if off + field_offset + 4 <= vm.mp.len() => {
+                memory::write_word(&mut vm.mp, off + field_offset, val);
             }
             _ => {}
         }
@@ -356,7 +354,7 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
         name: "$Sys",
         funcs: vec![
             bf("announce", 0x0b7c4ac0, 40, sys_announce),
-            bf("aprint", 0x77442d46, 64, sys_aprint),
+            bf("aprint", 0x77442d46, 256, sys_aprint),
             bf("bind", 0x66326d91, 48, sys_bind),
             bf("byte2char", 0x3d6094f9, 40, sys_byte2char),
             bf("char2byte", 0x2ba5ab41, 48, sys_char2byte),
@@ -370,7 +368,7 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
             bf("fd2path", 0x749c6042, 40, sys_fd2path),
             bf("fildes", 0x1478f993, 40, sys_fildes),
             bf("file2chan", 0x9f34d686, 40, sys_file2chan),
-            bf("fprint", 0xf46486c8, 64, sys_fprint),
+            bf("fprint", 0xf46486c8, 256, sys_fprint),
             bf("fstat", 0xda4499c2, 40, sys_fstat),
             bf("fversion", 0xfe9c0a06, 48, sys_fversion),
             bf("fwstat", 0x50a6c7e0, 104, sys_fwstat),
@@ -382,14 +380,14 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
             bf("pctl", 0x05df27fb, 40, sys_pctl),
             bf("pipe", 0x1f2c52ea, 40, sys_pipe),
             bf("pread", 0x09d8aac6, 56, sys_pread),
-            bf("print", 0xac849033, 64, sys_print),
+            bf("print", 0xac849033, 256, sys_print),
             bf("pwrite", 0x09d8aac6, 56, sys_pwrite),
             bf("read", 0x7cfef557, 48, sys_read),
             bf("readn", 0x7cfef557, 48, sys_read),
             bf("remove", 0xc6935858, 40, sys_remove),
             bf("seek", 0xaeccaddb, 56, sys_seek),
             bf("sleep", 0xe67bf126, 40, sys_sleep),
-            bf("sprint", 0x4c0624b6, 64, sys_sprint),
+            bf("sprint", 0x4c0624b6, 256, sys_sprint),
             bf("stat", 0x319328dd, 40, sys_stat),
             bf("stream", 0xb9e8f9ea, 48, sys_stream),
             bf("tokenize", 0x57338f20, 40, sys_tokenize),
@@ -1385,13 +1383,7 @@ fn get_fd_num(vm: &VmState<'_>, fd_id: HeapId) -> i32 {
     }
     match vm.heap.get(fd_id) {
         Some(obj) => match &obj.data {
-            HeapData::Record(data) => {
-                if data.len() >= 4 {
-                    memory::read_word(data, 0)
-                } else {
-                    -1
-                }
-            }
+            HeapData::Record(data) if data.len() >= 4 => memory::read_word(data, 0),
             _ => -1,
         },
         None => -1,
@@ -1676,5 +1668,205 @@ mod tests {
         let bytes_consumed = memory::read_word(&vm.frames.data, ret_off + 4);
         assert_eq!(char_val, 945, "should decode α at offset 1");
         assert_eq!(bytes_consumed, 2, "α is 2 UTF-8 bytes");
+    }
+
+    #[test]
+    fn format_string_plain_d() {
+        let result = run_format("%d", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, -123);
+        });
+        assert_eq!(result, "-123");
+    }
+
+    #[test]
+    fn format_string_plain_s() {
+        let result = run_format("hello %s!", |vm, off| {
+            let s_id = vm.heap.alloc(0, HeapData::Str("world".to_string()));
+            write_ptr(&mut vm.frames.data, off, s_id);
+        });
+        assert_eq!(result, "hello world!");
+    }
+
+    #[test]
+    fn format_string_plain_x() {
+        let result = run_format("%x", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 255);
+        });
+        assert_eq!(result, "ff");
+    }
+
+    #[test]
+    fn format_string_octal() {
+        let result = run_format("%o", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 8);
+        });
+        assert_eq!(result, "10");
+    }
+
+    #[test]
+    fn format_string_char() {
+        let result = run_format("%c", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 65); // 'A'
+        });
+        assert_eq!(result, "A");
+    }
+
+    #[test]
+    fn format_string_g_float() {
+        let result = run_format("%g", |vm, off| {
+            memory::write_real(&mut vm.frames.data, off, 3.14);
+        });
+        assert_eq!(result, "3.14");
+    }
+
+    #[test]
+    fn format_string_percent_literal() {
+        let result = run_format("100%%", |_vm, _off| {});
+        assert_eq!(result, "100%");
+    }
+
+    #[test]
+    fn format_string_multiple_args() {
+        let result = run_format("%d and %d", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 1);
+            memory::write_word(&mut vm.frames.data, off + 4, 2);
+        });
+        assert_eq!(result, "1 and 2");
+    }
+
+    #[test]
+    fn format_string_plus_d() {
+        let result = run_format("%+d", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 42);
+        });
+        assert_eq!(result, "+42");
+    }
+
+    #[test]
+    fn sys_millisec_returns_positive() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        sys_millisec(&mut vm).expect("millisec should succeed");
+        let frame_base = vm.frames.current_data_offset();
+        let ms = memory::read_word(&vm.frames.data, frame_base);
+        // The value wraps in i32 but should be non-zero
+        assert_ne!(ms, 0, "millisec should return a non-zero timestamp");
+    }
+
+    #[test]
+    fn sys_fildes_valid_fds() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+
+        for fd_num in [0, 1, 2] {
+            let frame_base = vm.frames.current_data_offset();
+            memory::write_word(&mut vm.frames.data, frame_base + ARG_START, fd_num);
+            sys_fildes(&mut vm).expect("fildes should succeed");
+            let result = memory::read_word(&vm.frames.data, frame_base);
+            assert_ne!(
+                result, 0,
+                "fildes({fd_num}) should return a non-nil FD record"
+            );
+        }
+    }
+
+    #[test]
+    fn sys_fildes_invalid_fd() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let frame_base = vm.frames.current_data_offset();
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START, 999);
+        sys_fildes(&mut vm).expect("fildes should succeed");
+        let result = memory::read_word(&vm.frames.data, frame_base);
+        assert_eq!(result, 0, "fildes(999) should return nil");
+    }
+
+    #[test]
+    fn sys_tokenize_splits_by_space() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let frame_base = vm.frames.current_data_offset();
+
+        let str_id = vm
+            .heap
+            .alloc(0, HeapData::Str("hello world foo".to_string()));
+        let delim_id = vm.heap.alloc(0, HeapData::Str(" ".to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, str_id);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, delim_id);
+
+        // Set up ret pointer so write_ret_word can write results
+        let ret_off = frame_base;
+        memory::write_word(&mut vm.frames.data, frame_base + 16, ret_off as i32);
+
+        sys_tokenize(&mut vm).expect("tokenize should succeed");
+
+        let count = memory::read_word(&vm.frames.data, ret_off);
+        assert_eq!(count, 3, "should split into 3 tokens");
+
+        // Walk the list to verify tokens
+        let list_id = memory::read_word(&vm.frames.data, ret_off + 4) as HeapId;
+        let mut tokens = Vec::new();
+        let mut current = list_id;
+        while current != heap::NIL as HeapId {
+            if let Some(obj) = vm.heap.get(current) {
+                if let HeapData::List { ref head, tail } = obj.data {
+                    let tok_id = memory::read_word(head, 0) as HeapId;
+                    if let Some(s) = vm.heap.get_string(tok_id) {
+                        tokens.push(s.to_string());
+                    }
+                    current = tail;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        assert_eq!(tokens, vec!["hello", "world", "foo"]);
+    }
+
+    #[test]
+    fn sys_tokenize_multiple_delimiters() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let frame_base = vm.frames.current_data_offset();
+
+        let str_id = vm.heap.alloc(0, HeapData::Str("a,b;c".to_string()));
+        let delim_id = vm.heap.alloc(0, HeapData::Str(",;".to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, str_id);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, delim_id);
+        memory::write_word(&mut vm.frames.data, frame_base + 16, frame_base as i32);
+
+        sys_tokenize(&mut vm).expect("tokenize should succeed");
+
+        let count = memory::read_word(&vm.frames.data, frame_base);
+        assert_eq!(count, 3, "should split into 3 tokens");
+    }
+
+    #[test]
+    fn format_string_r_specifier_with_error() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let frame_base = vm.frames.current_data_offset();
+
+        vm.last_error = "file not found".to_string();
+        let fmt_id = vm.heap.alloc(0, HeapData::Str("err: %r".to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fmt_id);
+
+        let result = format_string(&vm, frame_base, ARG_START, ARG_START + 4);
+        assert_eq!(result, "err: file not found");
+    }
+
+    #[test]
+    fn format_string_r_specifier_no_error() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let frame_base = vm.frames.current_data_offset();
+
+        let fmt_id = vm.heap.alloc(0, HeapData::Str("%r".to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fmt_id);
+
+        let result = format_string(&vm, frame_base, ARG_START, ARG_START + 4);
+        assert_eq!(result, "(no error)");
     }
 }

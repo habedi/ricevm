@@ -822,10 +822,10 @@ impl<'m> VmState<'m> {
             match &mut obj.data {
                 heap::HeapData::Array { data, .. }
                 | heap::HeapData::Record(data)
-                | heap::HeapData::Adt { data, .. } => {
-                    if offset + bytes.len() <= data.len() {
-                        data[offset..offset + bytes.len()].copy_from_slice(bytes);
-                    }
+                | heap::HeapData::Adt { data, .. }
+                    if offset + bytes.len() <= data.len() =>
+                {
+                    data[offset..offset + bytes.len()].copy_from_slice(bytes);
                 }
                 _ => {}
             }
@@ -1309,6 +1309,243 @@ mod tests {
                 length: data.len(),
             },
         )
+    }
+
+    #[test]
+    fn vmstate_new_creates_valid_initial_state() {
+        let module = test_module();
+        let vm = VmState::new(&module).expect("vm should initialize");
+        assert!(!vm.halted, "should not start halted");
+        assert_eq!(vm.pc, 0, "pc should start at entry_pc (0)");
+        assert!(
+            vm.thread_queue.is_empty(),
+            "thread queue should start empty"
+        );
+        assert!(vm.loaded_modules.is_empty(), "no loaded modules initially");
+        assert!(vm.blocked_channel.is_none(), "should not start blocked");
+    }
+
+    #[test]
+    fn read_write_word_at_frame() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.write_word_at(AddrTarget::Frame(fp + 4), 12345)
+            .expect("write to frame");
+        let val = vm
+            .read_word_at(AddrTarget::Frame(fp + 4), 0)
+            .expect("read from frame");
+        assert_eq!(val, 12345);
+    }
+
+    #[test]
+    fn read_write_word_at_mp() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        // Ensure mp is large enough
+        if vm.mp.len() < 8 {
+            vm.mp.resize(8, 0);
+        }
+
+        vm.write_word_at(AddrTarget::Mp(0), 42)
+            .expect("write to mp");
+        let val = vm.read_word_at(AddrTarget::Mp(0), 0).expect("read from mp");
+        assert_eq!(val, 42);
+    }
+
+    #[test]
+    fn read_word_at_immediate() {
+        let module = test_module();
+        let vm = VmState::new(&module).expect("vm init");
+        let val = vm
+            .read_word_at(AddrTarget::Immediate, 999)
+            .expect("read immediate");
+        assert_eq!(val, 999);
+    }
+
+    #[test]
+    fn write_word_at_immediate_errors() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let result = vm.write_word_at(AddrTarget::Immediate, 42);
+        assert!(result.is_err(), "writing to immediate should fail");
+    }
+
+    #[test]
+    fn read_word_at_none_returns_zero() {
+        let module = test_module();
+        let vm = VmState::new(&module).expect("vm init");
+        let val = vm.read_word_at(AddrTarget::None, 0).expect("read none");
+        assert_eq!(val, 0);
+    }
+
+    #[test]
+    fn raise_exception_finds_matching_handler() {
+        use ricevm_core::{ExceptionCase, Handler};
+
+        let module = Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "exc_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![Handler {
+                exception_offset: 0,
+                begin_pc: 0,
+                end_pc: 10,
+                type_descriptor: None,
+                cases: vec![ExceptionCase {
+                    name: Some("file".to_string()),
+                    pc: 42,
+                }],
+            }],
+        };
+
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.pc = 0;
+
+        let result = vm.raise_exception("file not found");
+        assert!(result.is_ok(), "matching handler should be found");
+        assert_eq!(vm.next_pc, 42, "should jump to handler pc");
+    }
+
+    #[test]
+    fn raise_exception_wildcard_handler() {
+        use ricevm_core::{ExceptionCase, Handler};
+
+        let module = Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "exc_wild_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![Handler {
+                exception_offset: 0,
+                begin_pc: 0,
+                end_pc: 10,
+                type_descriptor: None,
+                cases: vec![ExceptionCase {
+                    name: None, // wildcard
+                    pc: 99,
+                }],
+            }],
+        };
+
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.pc = 5;
+
+        let result = vm.raise_exception("anything");
+        assert!(result.is_ok(), "wildcard should match");
+        assert_eq!(vm.next_pc, 99);
+    }
+
+    #[test]
+    fn raise_exception_no_handler_returns_error() {
+        let module = test_module(); // no handlers
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.pc = 0;
+
+        let result = vm.raise_exception("some error");
+        assert!(result.is_err(), "unhandled exception should return error");
+    }
+
+    #[test]
+    fn raise_exception_out_of_range_not_matched() {
+        use ricevm_core::{ExceptionCase, Handler};
+
+        let module = Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "exc_range_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![Handler {
+                exception_offset: 0,
+                begin_pc: 5,
+                end_pc: 10,
+                type_descriptor: None,
+                cases: vec![ExceptionCase { name: None, pc: 50 }],
+            }],
+        };
+
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.pc = 0; // outside [5, 10)
+
+        let result = vm.raise_exception("error");
+        assert!(
+            result.is_err(),
+            "handler with non-matching PC range should not match"
+        );
     }
 
     #[test]

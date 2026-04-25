@@ -2,6 +2,8 @@ name: Run Tests
 
 on:
   workflow_dispatch:
+  schedule: # Run every day at midnight (UTC)
+    - cron: '0 0 * * *'
   workflow_call:
   push:
     branches:
@@ -36,7 +38,7 @@ jobs:
         rust-version: [ "1.92.0", "stable" ]
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -47,18 +49,18 @@ jobs:
         with:
           toolchain: ${{ matrix.rust-version }}
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y make
           make install-deps
 
-      - name: Run Tests and Generate Coverage Report
+      - name: Run tests and generate coverage report
         run: |
           make test-limbo
           make coverage
 
-      - name: Upload Coverage Reports to Codecov
+      - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

@@ -847,8 +847,8 @@ pub(crate) fn op_brkpt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 #[cfg(test)]
 mod tests {
     use ricevm_core::{
-        Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap, RuntimeFlags,
-        TypeDescriptor, XMAGIC,
+        ExceptionCase, Handler, Header, Instruction, MiddleOperand, Module, Opcode, Operand,
+        PointerMap, RuntimeFlags, TypeDescriptor, XMAGIC,
     };
 
     use super::*;
@@ -1100,6 +1100,147 @@ mod tests {
     }
 
     #[test]
+    fn op_exit_sets_halted() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        assert!(!vm.halted);
+        op_exit(&mut vm).expect("exit should succeed");
+        assert!(vm.halted, "exit should set halted flag");
+    }
+
+    #[test]
+    fn op_jmp_sets_next_pc() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = 42;
+        vm.next_pc = 0;
+
+        op_jmp(&mut vm).expect("jmp should succeed");
+        assert_eq!(vm.next_pc, 42, "jmp should set next_pc to dst value");
+    }
+
+    #[test]
+    fn op_jmp_to_zero() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = 0;
+        vm.next_pc = 100;
+
+        op_jmp(&mut vm).expect("jmp should succeed");
+        assert_eq!(vm.next_pc, 0, "jmp to 0 should work");
+    }
+
+    #[test]
+    fn op_call_and_ret_frame_push_pop() {
+        let module = Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 2,
+                data_size: 0,
+                type_size: 2,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+            ],
+            types: vec![
+                TypeDescriptor {
+                    id: 0,
+                    size: 128,
+                    pointer_map: PointerMap { bytes: vec![] },
+                    pointer_count: 0,
+                },
+                TypeDescriptor {
+                    id: 1,
+                    size: 32,
+                    pointer_map: PointerMap { bytes: vec![] },
+                    pointer_count: 0,
+                },
+            ],
+            data: vec![],
+            name: "call_ret_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        };
+
+        let mut vm = VmState::new(&module).expect("vm init");
+        let original_base = vm.frames.current_base;
+
+        // Allocate a pending frame
+        let pending_off = vm.frames.alloc_pending(32).expect("alloc_pending");
+        // Store type index in header
+        memory::write_word(&mut vm.frames.data, pending_off - 8, 1);
+
+        // Set up for call: src = frame pointer, dst = target PC
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending_off as i32;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = 1; // target PC
+        vm.next_pc = 0; // return address
+
+        op_call(&mut vm).expect("call should succeed");
+        assert_eq!(vm.next_pc, 1, "call should set next_pc to target");
+        assert_ne!(
+            vm.frames.current_base, original_base,
+            "call should push a new frame"
+        );
+
+        // Now ret
+        op_ret(&mut vm).expect("ret should succeed");
+        assert_eq!(
+            vm.frames.current_base, original_base,
+            "ret should restore the original frame"
+        );
+        assert_eq!(vm.next_pc, 0, "ret should restore return address");
+    }
+
+    #[test]
+    fn op_ret_from_entry_halts() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        // The entry frame has return PC = -1 (sentinel)
+        assert!(!vm.halted);
+        op_ret(&mut vm).expect("ret should succeed");
+        assert!(vm.halted, "ret from entry frame should halt");
+    }
+
+    #[test]
+    fn op_frame_allocates_pending_frame() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+
+        // type 0 has size 64
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 0; // type index
+        let fp = vm.frames.current_data_offset();
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_frame(&mut vm).expect("frame should succeed");
+
+        let pending_off = memory::read_word(&vm.frames.data, fp + 4);
+        assert!(pending_off > 0, "frame should write a valid pending offset");
+    }
+
+    #[test]
     fn builtin_mcall_writes_return_value_to_heap_record_field() {
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm init");
@@ -1150,5 +1291,445 @@ mod tests {
             other => panic!("expected record, got {other:?}"),
         };
         assert_eq!(memory::read_word(data, 4), 1234);
+    }
+
+    /// Build a module with a single exception handler that covers PCs
+    /// `begin_pc..end_pc` and the given cases. The handler writes the
+    /// exception pointer at `exception_offset` into the current frame.
+    fn module_with_handler(
+        begin_pc: i32,
+        end_pc: i32,
+        exception_offset: i32,
+        cases: Vec<ExceptionCase>,
+    ) -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 128,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "raise_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![Handler {
+                exception_offset,
+                begin_pc,
+                end_pc,
+                type_descriptor: None,
+                cases,
+            }],
+        }
+    }
+
+    /// Regression: casel entries must be 24 bytes (6 words), not 20.
+    /// The reference Dis VM pads each entry with 4 bytes after the pc word
+    /// so the next lo_big starts on an 8-byte boundary. A 20-byte stride
+    /// misreads every entry after the first.
+    #[test]
+    fn casel_binary_search_with_24_byte_entries() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Place the case table in the frame, starting at an 8-byte-aligned offset.
+        // Layout:
+        //   [fp+8]   count = 3 (word)
+        //   [fp+12]  padding (word)
+        //   [fp+16]  entry 0: lo=-100 hi=0   pc=100  pad
+        //   [fp+40]  entry 1: lo=0    hi=100 pc=200  pad
+        //   [fp+64]  entry 2: lo=100  hi=200 pc=300  pad
+        //   [fp+88]  default_pc = 999
+        let table_off = fp + 8;
+        memory::write_word(&mut vm.frames.data, table_off, 3);
+        memory::write_word(&mut vm.frames.data, table_off + 4, 0);
+        // entry 0
+        memory::write_big(&mut vm.frames.data, table_off + 8, -100);
+        memory::write_big(&mut vm.frames.data, table_off + 16, 0);
+        memory::write_word(&mut vm.frames.data, table_off + 24, 100);
+        // entry 1
+        memory::write_big(&mut vm.frames.data, table_off + 32, 0);
+        memory::write_big(&mut vm.frames.data, table_off + 40, 100);
+        memory::write_word(&mut vm.frames.data, table_off + 48, 200);
+        // entry 2
+        memory::write_big(&mut vm.frames.data, table_off + 56, 100);
+        memory::write_big(&mut vm.frames.data, table_off + 64, 200);
+        memory::write_word(&mut vm.frames.data, table_off + 72, 300);
+        // default at byte offset 8 + 3*24 = 80 from table_off
+        memory::write_word(&mut vm.frames.data, table_off + 80, 999);
+
+        vm.dst = AddrTarget::Frame(table_off);
+        vm.imm_dst = 0;
+
+        let cases = [
+            (-100i64, 100), // lo boundary of entry 0
+            (-1, 100),      // inside entry 0
+            (0, 200),       // lo boundary of entry 1 (hi of entry 0 is exclusive)
+            (99, 200),      // last value in entry 1
+            (100, 300),     // lo boundary of entry 2
+            (199, 300),     // last value in entry 2
+            (200, 999),     // just past last entry -> default
+            (-101, 999),    // before first entry -> default
+        ];
+        for (value, expected_pc) in cases {
+            // Put the big value in a frame slot and read from there so values
+            // outside i32 range still work.
+            memory::write_big(&mut vm.frames.data, fp, value);
+            vm.src = AddrTarget::Frame(fp);
+            vm.imm_src = 0;
+            vm.next_pc = 0;
+            op_casel(&mut vm).expect("casel should succeed");
+            assert_eq!(
+                vm.next_pc, expected_pc as usize,
+                "value {value} should dispatch to pc {expected_pc}"
+            );
+        }
+    }
+
+    /// casel with an i64 value outside the i32 range exercises the Big type
+    /// path. If the implementation truncated to i32, this would misdispatch.
+    #[test]
+    fn casel_handles_values_beyond_word_range() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Single entry covering [i32::MAX + 1 ..= i64::MAX).
+        let table_off = fp + 16;
+        memory::write_word(&mut vm.frames.data, table_off, 1);
+        memory::write_big(&mut vm.frames.data, table_off + 8, i32::MAX as i64 + 1);
+        memory::write_big(&mut vm.frames.data, table_off + 16, i64::MAX);
+        memory::write_word(&mut vm.frames.data, table_off + 24, 77);
+        memory::write_word(&mut vm.frames.data, table_off + 32, 88); // default
+
+        vm.dst = AddrTarget::Frame(table_off);
+        vm.imm_dst = 0;
+        vm.src = AddrTarget::Frame(fp);
+        vm.imm_src = 0;
+
+        // In range: truncating to i32 would flip the sign and miss.
+        memory::write_big(&mut vm.frames.data, fp, i32::MAX as i64 + 42);
+        vm.next_pc = 0;
+        op_casel(&mut vm).expect("casel should succeed");
+        assert_eq!(vm.next_pc, 77, "i64 value above i32::MAX should match");
+
+        // Below range
+        memory::write_big(&mut vm.frames.data, fp, i32::MAX as i64);
+        vm.next_pc = 0;
+        op_casel(&mut vm).expect("casel should succeed");
+        assert_eq!(vm.next_pc, 88, "below range should go to default");
+    }
+
+    /// casec with multi-entry table. Binary search must find exact matches,
+    /// values in the (lo, hi] range, and fall through to default otherwise.
+    #[test]
+    fn casec_binary_search_finds_matches_and_ranges() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Intern the strings used as case keys and lookup values.
+        let s_banana = vm.heap.alloc(0, HeapData::Str("banana".to_string())) as i32;
+        let s_cherry = vm.heap.alloc(0, HeapData::Str("cherry".to_string())) as i32;
+        let s_mango = vm.heap.alloc(0, HeapData::Str("mango".to_string())) as i32;
+        let s_pear = vm.heap.alloc(0, HeapData::Str("pear".to_string())) as i32;
+
+        // Entries (sorted ascending by lo):
+        //   ("banana", nil)      -> pc 11   (exact match on "banana")
+        //   ("cherry", "mango")  -> pc 22   (cherry < v <= mango)
+        //   ("pear",   nil)      -> pc 33   (exact match on "pear")
+        // default -> pc 99
+        let table_off = fp + 4;
+        memory::write_word(&mut vm.frames.data, table_off, 3);
+        memory::write_word(&mut vm.frames.data, table_off + 4, s_banana);
+        memory::write_word(&mut vm.frames.data, table_off + 8, heap::NIL as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, 11);
+        memory::write_word(&mut vm.frames.data, table_off + 16, s_cherry);
+        memory::write_word(&mut vm.frames.data, table_off + 20, s_mango);
+        memory::write_word(&mut vm.frames.data, table_off + 24, 22);
+        memory::write_word(&mut vm.frames.data, table_off + 28, s_pear);
+        memory::write_word(&mut vm.frames.data, table_off + 32, heap::NIL as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 36, 33);
+        memory::write_word(&mut vm.frames.data, table_off + 40, 99); // default
+
+        vm.dst = AddrTarget::Frame(table_off);
+        vm.imm_dst = 0;
+        vm.src = AddrTarget::Immediate;
+
+        let dispatch = |vm: &mut VmState<'_>, key: i32| -> usize {
+            vm.imm_src = key;
+            vm.next_pc = 0;
+            op_casec(vm).expect("casec should succeed");
+            vm.next_pc
+        };
+
+        // Exact match on a nil-hi entry.
+        assert_eq!(dispatch(&mut vm, s_banana), 11, "exact match on banana");
+        assert_eq!(dispatch(&mut vm, s_pear), 33, "exact match on pear");
+
+        // Strictly between cherry and mango -> inside the second entry's range.
+        let s_grape = vm.heap.alloc(0, HeapData::Str("grape".to_string())) as i32;
+        assert_eq!(
+            dispatch(&mut vm, s_grape),
+            22,
+            "grape should fall inside (cherry, mango] -> pc 22"
+        );
+
+        // Equal to hi -> still inside (lo, hi] (inclusive hi).
+        assert_eq!(dispatch(&mut vm, s_mango), 22, "equal to hi matches");
+
+        // Equal to cherry -> exact match on lo short-circuits.
+        assert_eq!(dispatch(&mut vm, s_cherry), 22, "exact match on lo");
+
+        // Below everything -> default.
+        let s_apple = vm.heap.alloc(0, HeapData::Str("apple".to_string())) as i32;
+        assert_eq!(dispatch(&mut vm, s_apple), 99, "apple -> default");
+
+        // Between banana and cherry (banana has nil hi, so no range match).
+        let s_blueberry = vm.heap.alloc(0, HeapData::Str("blueberry".to_string())) as i32;
+        assert_eq!(
+            dispatch(&mut vm, s_blueberry),
+            99,
+            "nil-hi entry must not match a non-equal value"
+        );
+
+        // Past the last entry.
+        let s_zebra = vm.heap.alloc(0, HeapData::Str("zebra".to_string())) as i32;
+        assert_eq!(dispatch(&mut vm, s_zebra), 99, "zebra -> default");
+    }
+
+    /// Regression: op_raise must look up a handler covering the current PC and
+    /// dispatch to a named case. On match, the exception string pointer must be
+    /// written at `frame_base + handler.exception_offset` so the handler body
+    /// can read it.
+    #[test]
+    fn raise_dispatches_to_named_case_and_writes_exception_pointer() {
+        let exc_off = 24;
+        let module = module_with_handler(
+            0,
+            10,
+            exc_off,
+            vec![
+                ExceptionCase {
+                    name: Some("fail:oops".to_string()),
+                    pc: 42,
+                },
+                ExceptionCase {
+                    name: Some("fail:other".to_string()),
+                    pc: 99,
+                },
+            ],
+        );
+        let mut vm = VmState::new(&module).expect("vm init");
+        let msg_id = vm.heap.alloc(0, HeapData::Str("fail:oops".to_string()));
+
+        vm.pc = 5; // inside handler range
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = msg_id as i32;
+
+        op_raise(&mut vm).expect("raise should dispatch");
+
+        assert_eq!(vm.next_pc, 42, "raise should jump to the matching case pc");
+
+        let frame_base = vm.frames.current_data_offset();
+        let stored = memory::read_word(&vm.frames.data, frame_base + exc_off as usize);
+        assert_eq!(
+            stored, msg_id as i32,
+            "exception pointer must be written at frame_base + exception_offset"
+        );
+    }
+
+    /// op_raise must treat `None` (wildcard) cases as matching any exception
+    /// name that did not match an earlier named case.
+    #[test]
+    fn raise_falls_back_to_wildcard_case() {
+        let module = module_with_handler(
+            0,
+            10,
+            0,
+            vec![
+                ExceptionCase {
+                    name: Some("specific".to_string()),
+                    pc: 7,
+                },
+                ExceptionCase { name: None, pc: 77 },
+            ],
+        );
+        let mut vm = VmState::new(&module).expect("vm init");
+        let msg_id = vm.heap.alloc(0, HeapData::Str("anything".to_string()));
+
+        vm.pc = 0;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = msg_id as i32;
+
+        op_raise(&mut vm).expect("raise should dispatch to wildcard");
+        assert_eq!(vm.next_pc, 77);
+    }
+
+    /// Current case ordering: wildcard matches before a later named case, so a
+    /// wildcard placed first swallows every name. This pins down the existing
+    /// behavior; if the dispatcher is reordered to prefer named matches, this
+    /// test becomes the signal that the contract changed.
+    #[test]
+    fn raise_matches_first_case_wins_for_wildcard() {
+        let module = module_with_handler(
+            0,
+            10,
+            0,
+            vec![
+                ExceptionCase { name: None, pc: 1 },
+                ExceptionCase {
+                    name: Some("specific".to_string()),
+                    pc: 2,
+                },
+            ],
+        );
+        let mut vm = VmState::new(&module).expect("vm init");
+        let msg_id = vm.heap.alloc(0, HeapData::Str("specific".to_string()));
+
+        vm.pc = 0;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = msg_id as i32;
+
+        op_raise(&mut vm).expect("raise should dispatch");
+        assert_eq!(vm.next_pc, 1, "first matching case wins");
+    }
+
+    /// op_raise must return a ThreadFault when no handler covers the current PC.
+    #[test]
+    fn raise_unhandled_returns_thread_fault() {
+        let module = module_with_handler(
+            0,
+            10,
+            0,
+            vec![ExceptionCase {
+                name: Some("only".to_string()),
+                pc: 5,
+            }],
+        );
+        let mut vm = VmState::new(&module).expect("vm init");
+        let msg_id = vm.heap.alloc(0, HeapData::Str("never-matched".to_string()));
+
+        vm.pc = 5;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = msg_id as i32;
+
+        match op_raise(&mut vm) {
+            Err(ExecError::ThreadFault(s)) => {
+                assert!(
+                    s.contains("never-matched"),
+                    "fault should include message, got: {s}"
+                );
+            }
+            other => panic!("expected ThreadFault, got {other:?}"),
+        }
+    }
+
+    /// op_raise must skip handlers whose PC range does not cover the current PC.
+    /// The handler's `end_pc` is exclusive, so `pc == end_pc` is out of range.
+    #[test]
+    fn raise_respects_handler_pc_range() {
+        let module = module_with_handler(2, 5, 0, vec![ExceptionCase { name: None, pc: 8 }]);
+        let mut vm = VmState::new(&module).expect("vm init");
+        let msg_id = vm.heap.alloc(0, HeapData::Str("anything".to_string()));
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = msg_id as i32;
+
+        // begin boundary: begin_pc is inclusive.
+        vm.pc = 2;
+        vm.next_pc = 0;
+        op_raise(&mut vm).expect("pc == begin_pc is inside");
+        assert_eq!(vm.next_pc, 8);
+
+        // end boundary: end_pc is exclusive -> unhandled.
+        vm.pc = 5;
+        match op_raise(&mut vm) {
+            Err(ExecError::ThreadFault(_)) => {}
+            other => panic!("pc == end_pc must be outside handler range, got {other:?}"),
+        }
+
+        // Before range -> unhandled.
+        vm.pc = 1;
+        match op_raise(&mut vm) {
+            Err(ExecError::ThreadFault(_)) => {}
+            other => panic!("pc below begin_pc must be unhandled, got {other:?}"),
+        }
+    }
+
+    /// op_goto: src is the index into a flat word table in the frame at dst.
+    /// The table contains target PCs; goto should pick `table[index]`.
+    #[test]
+    fn goto_reads_target_pc_from_frame_table() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let table_off = fp + 16;
+        memory::write_word(&mut vm.frames.data, table_off, 10);
+        memory::write_word(&mut vm.frames.data, table_off + 4, 20);
+        memory::write_word(&mut vm.frames.data, table_off + 8, 30);
+        memory::write_word(&mut vm.frames.data, table_off + 12, 40);
+
+        vm.dst = AddrTarget::Frame(table_off);
+        vm.imm_dst = 0;
+        vm.src = AddrTarget::Immediate;
+
+        for (index, expected) in [(0, 10), (1, 20), (2, 30), (3, 40)] {
+            vm.imm_src = index;
+            vm.next_pc = 0;
+            op_goto(&mut vm).expect("goto should succeed");
+            assert_eq!(vm.next_pc, expected, "goto index {index} -> pc {expected}");
+        }
+    }
+
+    /// op_goto: same contract for a table stored in the module's MP.
+    #[test]
+    fn goto_reads_target_pc_from_mp_table() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.mp.resize(64, 0);
+
+        let table_off = 8;
+        memory::write_word(&mut vm.mp, table_off, 100);
+        memory::write_word(&mut vm.mp, table_off + 4, 200);
+        memory::write_word(&mut vm.mp, table_off + 8, 300);
+
+        vm.dst = AddrTarget::Mp(table_off);
+        vm.imm_dst = 0;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 2;
+        vm.next_pc = 0;
+
+        op_goto(&mut vm).expect("goto should succeed");
+        assert_eq!(vm.next_pc, 300, "goto via MP table must dispatch correctly");
+    }
+
+    /// op_brkpt halts execution so the debugger/host can regain control.
+    #[test]
+    fn brkpt_halts_vm() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        assert!(!vm.halted);
+        op_brkpt(&mut vm).expect("brkpt should succeed");
+        assert!(vm.halted, "brkpt must set halted so the run loop stops");
     }
 }

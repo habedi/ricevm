@@ -60,7 +60,7 @@ jobs:
             ### Inferno Module Files
 
             Programs that load external modules (like Bufio, regex, or daytime) need the
-            Inferno OS `.dis` files. These are **not** included in the release binaries.
+            Inferno OS `.dis` files. These are not included in the release binaries.
             To get them:
 
             ```bash

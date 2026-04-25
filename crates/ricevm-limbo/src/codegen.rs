@@ -51,27 +51,28 @@ fn type_num_kind(ty: &Type) -> NumKind {
 /// Return the numeric kind of the value produced by a known `$Sys` builtin.
 /// Default Word covers everything not in the lookup; the kind is used to
 /// pick the right Mov/Cvt opcode when copying the return value out.
-/// Extract the array element BasicType from a VarDecl, if any. Looks at the
+/// Extract the array element Type from a VarDecl, if any. Looks at the
 /// explicit type annotation first, then the init expression's array forms
 /// (`array[N] of T`, `array[] of {...}`, `array of byte stringExpr`).
-fn decl_array_elem_basic(v: &VarDecl) -> Option<BasicType> {
-    if let Some(Type::Array(elem)) = &v.ty
-        && let Type::Basic(b) = elem.as_ref()
-    {
-        return Some(*b);
+fn decl_array_elem_type(v: &VarDecl) -> Option<Type> {
+    if let Some(Type::Array(elem)) = &v.ty {
+        return Some((**elem).clone());
     }
     match v.init.as_ref()? {
-        Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) => match ty.as_ref() {
-            Type::Basic(b) => Some(*b),
-            _ => None,
-        },
+        Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) => Some((**ty).clone()),
         Expr::Cast(ty, _, _) => match ty.as_ref() {
-            Type::Array(elem) => match elem.as_ref() {
-                Type::Basic(b) => Some(*b),
-                _ => None,
-            },
+            Type::Array(elem) => Some((**elem).clone()),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+/// Reduce a Type to a BasicType when possible. Used by sites that pick a
+/// kind-aware opcode pair from an element type.
+fn type_basic(ty: &Type) -> Option<BasicType> {
+    match ty {
+        Type::Basic(b) => Some(*b),
         _ => None,
     }
 }
@@ -89,6 +90,39 @@ fn decl_chan_elem_basic(v: &VarDecl) -> Option<BasicType> {
         return Some(*b);
     }
     None
+}
+
+/// Field width and alignment for ADT layout. Matches the reference Limbo
+/// ABI: word/byte/ptr fields are 4-byte sized and 4-byte aligned, and
+/// big/real are 8-byte sized with 8-byte alignment.
+fn type_size_align(ty: &Type) -> (i32, i32) {
+    match ty {
+        Type::Basic(BasicType::Big) | Type::Basic(BasicType::Real) => (8, 8),
+        // byte stored in a 4-byte slot in records (matches reference).
+        _ => (4, 4),
+    }
+}
+
+/// Compute an ADT's field layout: list of `(name, type, byte_offset)`.
+fn compute_adt_layout(adt: &AdtDecl) -> Vec<(String, Type, i32)> {
+    let mut fields = Vec::new();
+    let mut off = 0i32;
+    for member in &adt.members {
+        if let AdtMember::Field(v) = member {
+            let ty = match &v.ty {
+                Some(t) => t.clone(),
+                None => continue,
+            };
+            let (size, align) = type_size_align(&ty);
+            // Round `off` up to alignment.
+            off = (off + align - 1) & !(align - 1);
+            for name in &v.names {
+                fields.push((name.clone(), ty.clone(), off));
+                off += size;
+            }
+        }
+    }
+    fields
 }
 
 /// Pick the Newc* opcode for a channel of the given element BasicType.
@@ -135,11 +169,12 @@ pub struct CodeGen {
     /// The return kind picks the right Mov/Cvt opcode when copying the
     /// callee's return value into the caller's slot.
     func_table: Vec<(String, i32, i32, NumKind)>,
-    /// Sidecar map for array locals: name -> element BasicType.
-    /// Populated by VarDecl/Param when the declared type is `array of T`.
-    /// Used by Expr::Index and Expr::Assign(Index, _) to pick Indw/Indl/
-    /// Indf/Indb and Movw/Movl/Movf/Movb based on the element width.
-    local_array_elem: std::collections::HashMap<String, BasicType>,
+    /// Sidecar map for array locals: name -> element Type.
+    /// Storing the full Type (not just BasicType) lets us express nested
+    /// types like `array of array of big` — `aa[i]` returns a slot whose
+    /// element type is `array of big`, which the recursive Index handler
+    /// then peels to compute the inner indexing.
+    local_array_elem: std::collections::HashMap<String, Type>,
     /// Sidecar map for channel locals: name -> element BasicType. Lets
     /// Send/Recv size the data temp by the channel's element width and
     /// pick the right Newc* opcode at allocation time.
@@ -148,6 +183,18 @@ pub struct CodeGen {
     /// Lets `(a, b, c) := func()` allocate per-field locals at correct
     /// offsets and use kind-matched Mov for each field.
     func_tuple_ret: std::collections::HashMap<String, Vec<Type>>,
+    /// Pending PC fixups for forward-referenced local calls and spawns.
+    /// `(code_idx, callee_name)` — the destination operand of code[code_idx]
+    /// will be patched to the callee's actual entry PC after all functions
+    /// have been generated.
+    pending_call_fixups: Vec<(usize, String)>,
+    /// ADT layouts: ADT name -> ordered (field_name, field_type, byte_off).
+    /// Built once from the AST so Dot/Arrow accesses can pick a kind-aware
+    /// Mov opcode and the correct field offset instead of a heuristic.
+    adt_layouts: std::collections::HashMap<String, Vec<(String, Type, i32)>>,
+    /// Sidecar map for ADT-typed locals: local name -> ADT name. Lets Dot
+    /// access resolve `local.field` to the right ADT layout.
+    local_adt_type: std::collections::HashMap<String, String>,
     /// Frame sizes for each compiled function, in order.
     func_frames: Vec<i32>,
     /// Exception handlers for the module.
@@ -181,6 +228,9 @@ impl CodeGen {
             func_frames: Vec::new(),
             local_array_elem: std::collections::HashMap::new(),
             local_chan_elem: std::collections::HashMap::new(),
+            pending_call_fixups: Vec::new(),
+            adt_layouts: std::collections::HashMap::new(),
+            local_adt_type: std::collections::HashMap::new(),
             func_tuple_ret: std::collections::HashMap::new(),
             handlers: Vec::new(),
         }
@@ -196,6 +246,7 @@ impl CodeGen {
         self.sys_path_mp = self.intern_string("$Sys");
         self.sys_mp_ref = self.alloc_mp(4);
         self.collect_strings(file);
+        self.collect_adts(file);
         self.imports.push(ImportModule { functions: vec![] });
 
         // Pre-scan to count functions and allocate type indices
@@ -205,9 +256,50 @@ impl CodeGen {
             .filter_map(|d| if let Decl::Func(f) = d { Some(f) } else { None })
             .collect();
 
-        // Generate code for each function
+        // Pre-register every function name in func_table with a placeholder
+        // PC. This lets `spawn func()` and `func()` calls resolve their
+        // callee even when the callee is defined later in the source. The
+        // actual PC is filled in by gen_func when it lays out the body.
+        for func in &funcs {
+            let full_name = if let Some(q) = &func.name.qualifier {
+                format!("{q}.{}", func.name.name)
+            } else {
+                func.name.name.clone()
+            };
+            let ret_kind = func
+                .sig
+                .ret
+                .as_ref()
+                .map(type_num_kind)
+                .unwrap_or(NumKind::Word);
+            if let Some(Type::Tuple(fields)) = &func.sig.ret {
+                self.func_tuple_ret
+                    .insert(full_name.clone(), fields.clone());
+            }
+            // PC = -1 placeholder, frame_size = 0 placeholder.
+            self.func_table.push((full_name, -1, 0, ret_kind));
+        }
+
+        // Generate code for each function. gen_func patches the matching
+        // func_table entry's PC and frame_size.
         for func in &funcs {
             self.gen_func(func)?;
+        }
+
+        // Patch any forward-referenced Call/Spawn destinations now that
+        // every function's entry PC is known.
+        let fixups = std::mem::take(&mut self.pending_call_fixups);
+        for (code_idx, name) in fixups {
+            let pc = self
+                .func_table
+                .iter()
+                .find(|(n, _, _, _)| n == &name)
+                .map(|(_, pc, _, _)| *pc)
+                .unwrap_or(-1);
+            if pc < 0 {
+                return Err(format!("unresolved forward reference to function `{name}`"));
+            }
+            self.code[code_idx].destination = op_imm(pc);
         }
 
         self.build_types();
@@ -327,6 +419,63 @@ impl CodeGen {
                     self.scan_stmt_strings(stmt);
                 }
             }
+        }
+    }
+
+    /// Walk top-level declarations and module-member declarations to record
+    /// every ADT's field layout. Subsequent Dot/Arrow access can then
+    /// resolve `obj.field` to the right offset and type.
+    fn collect_adts(&mut self, file: &SourceFile) {
+        for decl in &file.decls {
+            match decl {
+                Decl::Adt(adt) => {
+                    self.adt_layouts
+                        .insert(adt.name.clone(), compute_adt_layout(adt));
+                }
+                Decl::Module(m) => {
+                    for member in &m.members {
+                        if let ModuleMember::Adt(adt) = member {
+                            self.adt_layouts
+                                .insert(adt.name.clone(), compute_adt_layout(adt));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Look up `(field_offset, field_type)` for `adt_name.field_name`.
+    fn adt_field_info(&self, adt_name: &str, field_name: &str) -> Option<(i32, Type)> {
+        let layout = self.adt_layouts.get(adt_name)?;
+        layout
+            .iter()
+            .find(|(n, _, _)| n == field_name)
+            .map(|(_, t, off)| (*off, t.clone()))
+    }
+
+    /// Extract the ADT name from a Limbo Type, peeling `ref` wrappers.
+    fn adt_name_for_type(ty: &Type) -> Option<String> {
+        match ty {
+            Type::Named(q) => Some(q.name.clone()),
+            Type::Ref(inner) => Self::adt_name_for_type(inner),
+            _ => None,
+        }
+    }
+
+    /// Resolve an expression to the ADT name of the value it produces, when
+    /// derivable. Handles Ident lookup and one level of Dot navigation
+    /// (`outer.inner.field` works iff the outer type's `inner` field is
+    /// itself an ADT-typed field).
+    fn adt_name_for_expr(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident(name, _) => self.local_adt_type.get(name).cloned(),
+            Expr::Dot(inner, field, _) => {
+                let outer = self.adt_name_for_expr(inner)?;
+                let (_, ty) = self.adt_field_info(&outer, field)?;
+                Self::adt_name_for_type(&ty)
+            }
+            _ => None,
         }
     }
 
@@ -475,12 +624,12 @@ impl CodeGen {
                 let kind = type_num_kind(&param.ty);
                 if name != "nil" {
                     self.locals.push((name.clone(), param_off, ty, kind));
-                    // Track array params' element BasicType so indexing into
-                    // them later picks the right Ind/Mov opcode pair.
-                    if let Type::Array(elem) = &param.ty
-                        && let Type::Basic(b) = elem.as_ref()
-                    {
-                        self.local_array_elem.insert(name.clone(), *b);
+                    // Track array params' element Type so indexing into
+                    // them later picks the right Ind/Mov opcode pair, and
+                    // recursive nested types (`array of array of T`) work
+                    // by peeling one layer per Index.
+                    if let Type::Array(elem) = &param.ty {
+                        self.local_array_elem.insert(name.clone(), (**elem).clone());
                     }
                     // Same for chan params so Send/Recv on them know the
                     // element width.
@@ -488,6 +637,11 @@ impl CodeGen {
                         && let Type::Basic(b) = elem.as_ref()
                     {
                         self.local_chan_elem.insert(name.clone(), *b);
+                    }
+                    // ADT-typed params (`p: ref Foo` or `p: Foo`): record the
+                    // ADT name so field access through `p` finds the layout.
+                    if let Some(adt) = Self::adt_name_for_type(&param.ty) {
+                        self.local_adt_type.insert(name.clone(), adt);
                     }
                 }
                 // Frame param slots are 4-byte aligned in the reference ABI;
@@ -511,26 +665,23 @@ impl CodeGen {
             self.emit(Opcode::Ret, op_unused(), mid_unused(), op_unused());
         }
 
-        // Record function info
+        // Patch the pre-registered func_table entry with the actual PC
+        // and frame size. The pre-registration pass in `compile()` filled
+        // name and ret_kind so spawn/call could look up forward-defined
+        // functions while emitting code; here we finalize the layout.
         let full_name = if let Some(q) = &func.name.qualifier {
             format!("{q}.{}", func.name.name)
         } else {
             func.name.name.clone()
         };
-        let ret_kind = func
-            .sig
-            .ret
-            .as_ref()
-            .map(type_num_kind)
-            .unwrap_or(NumKind::Word);
-        // Record tuple-return field shape so callers unpacking via
-        // `(a, b) := f()` can pick the correct Mov{w/l/f/b} per field.
-        if let Some(Type::Tuple(fields)) = &func.sig.ret {
-            self.func_tuple_ret
-                .insert(full_name.clone(), fields.clone());
+        if let Some(entry) = self
+            .func_table
+            .iter_mut()
+            .find(|(n, pc, _, _)| n == &full_name && *pc < 0)
+        {
+            entry.1 = entry_pc as i32;
+            entry.2 = self.frame_size;
         }
-        self.func_table
-            .push((full_name, entry_pc as i32, self.frame_size, ret_kind));
         self.func_frames.push(self.frame_size);
 
         let func_idx = self.func_frames.len() as i32 - 1;
@@ -559,20 +710,37 @@ impl CodeGen {
         }
     }
 
-    /// Look up an array local's element BasicType. Returns None for locals
-    /// that aren't recorded as arrays (or don't exist at all).
-    fn array_elem_basic(&self, name: &str) -> Option<BasicType> {
-        self.local_array_elem.get(name).copied()
+    /// Look up an array local's element Type, or None if not an array.
+    fn array_elem_type(&self, name: &str) -> Option<Type> {
+        self.local_array_elem.get(name).cloned()
     }
 
-    /// Resolve the array element BasicType for an arr expression. Currently
-    /// only handles `Ident` (lookup in sidecar); other forms (e.g.,
-    /// `f()[i]`) fall back to None so the caller can default to Word width.
-    fn array_elem_basic_for_expr(&self, expr: &Expr) -> Option<BasicType> {
+    /// Resolve the array element Type for an arr expression. Handles
+    /// `Ident` (look up sidecar) and `Index(inner, _)` (recursively peel
+    /// one layer of nesting); other forms fall back to None.
+    fn array_elem_type_for_expr(&self, expr: &Expr) -> Option<Type> {
         match expr {
-            Expr::Ident(name, _) => self.array_elem_basic(name),
+            Expr::Ident(name, _) => self.array_elem_type(name),
+            Expr::Index(inner_arr, _, _) => {
+                // Outer Index returns an element of inner's elem type. If
+                // that elem type is itself `array of X`, we want X.
+                let inner_elem = self.array_elem_type_for_expr(inner_arr)?;
+                if let Type::Array(elem) = inner_elem {
+                    Some(*elem)
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
+    }
+
+    /// Convenience for sites that need a BasicType (to pick Indw vs Indl
+    /// etc.). Returns None when the element type isn't a single basic type
+    /// — e.g., nested arrays or ADT-typed elements collapse to Word/Indw
+    /// at the call site.
+    fn array_elem_basic_for_expr(&self, expr: &Expr) -> Option<BasicType> {
+        type_basic(&self.array_elem_type_for_expr(expr)?)
     }
 
     /// Pick the (Ind*, Mov*) opcode pair for an array element of the given
@@ -595,17 +763,22 @@ impl CodeGen {
             Stmt::VarDecl(v) => {
                 let ty = self.infer_decl_type(v);
                 let kind = self.decl_num_kind(v);
-                // If the declared (or inferred) Limbo type is an array of a
-                // basic element, record that for later Indexing.
-                let elem_basic = decl_array_elem_basic(v);
+                // If the declared (or inferred) Limbo type is an array,
+                // record its full element Type so nested `array of array
+                // of T` works through recursive peeling.
+                let elem_type = decl_array_elem_type(v);
                 let chan_elem_basic = decl_chan_elem_basic(v);
+                let adt_name = v.ty.as_ref().and_then(Self::adt_name_for_type);
                 for name in &v.names {
                     self.alloc_local(name, ty, kind);
-                    if let Some(b) = elem_basic {
-                        self.local_array_elem.insert(name.clone(), b);
+                    if let Some(t) = &elem_type {
+                        self.local_array_elem.insert(name.clone(), t.clone());
                     }
                     if let Some(b) = chan_elem_basic {
                         self.local_chan_elem.insert(name.clone(), b);
+                    }
+                    if let Some(a) = &adt_name {
+                        self.local_adt_type.insert(name.clone(), a.clone());
                     }
                 }
                 if let Some(init) = &v.init {
@@ -725,7 +898,14 @@ impl CodeGen {
                             );
                             arg_off += kind.byte_size();
                         }
+                        let spawn_idx = self.code.len();
                         self.emit(Opcode::Spawn, op_fp(frame_tmp), mid_unused(), op_imm(pc));
+                        if pc < 0 {
+                            // Forward reference: patch the destination's
+                            // immediate after the callee is generated.
+                            self.pending_call_fixups
+                                .push((spawn_idx, func_name.clone()));
+                        }
                         return Ok(());
                     }
                 }
@@ -892,6 +1072,19 @@ impl CodeGen {
             Expr::Hd(_, _) => ValType::Ptr,
             Expr::Tl(_, _) => ValType::Ptr,
             Expr::Len(_, _) => ValType::Word,
+            Expr::Index(arr, _, _) => {
+                // Element type drives the resulting ValType: word/byte/big/
+                // real → Word; nested arrays → Array; everything else (string,
+                // adt, ref, list, chan) → Ptr.
+                match self.array_elem_type_for_expr(arr) {
+                    Some(Type::Basic(_)) => ValType::Word,
+                    Some(Type::Array(_)) => ValType::Array,
+                    Some(_) => ValType::Ptr,
+                    // Unknown element type: default to Word (covers
+                    // string-char indexing and anonymous arrays alike).
+                    None => ValType::Word,
+                }
+            }
             Expr::Load(_, _, _) => ValType::Ptr,
             Expr::Call(callee, _, _) => {
                 // Infer return type from callee name
@@ -1181,17 +1374,40 @@ impl CodeGen {
                     );
                     Ok(())
                 } else if let Expr::Dot(inner_expr, field, _) = lhs.as_ref() {
-                    // p.field = val → write through ref pointer
+                    // p.field = val → write through the ref pointer. Use the
+                    // ADT layout when available so big/real fields use the
+                    // wide opcode and the right offset.
                     let ref_tmp = self.alloc_temp();
-                    let val_tmp = self.alloc_temp();
+                    let (field_off, write_kind) = match self
+                        .adt_name_for_expr(inner_expr)
+                        .and_then(|a| self.adt_field_info(&a, field))
+                    {
+                        Some((off, ty)) => {
+                            let kind = type_num_kind(&ty);
+                            (off, Some((ty, kind)))
+                        }
+                        None => (self.estimate_field_offset(inner_expr, field), None),
+                    };
+                    let val_kind = write_kind
+                        .as_ref()
+                        .map(|(_, k)| *k)
+                        .unwrap_or(NumKind::Word);
+                    let val_tmp = self.alloc_temp_for(val_kind);
+                    self.gen_expr_to_kind(rhs, val_tmp, val_kind)?;
                     self.gen_expr_to(inner_expr, ref_tmp)?;
-                    self.gen_expr_to(rhs, val_tmp)?;
-                    let field_off = self.estimate_field_offset(inner_expr, field);
-                    let ty = self.infer_expr_type(rhs);
-                    let op = if ty != ValType::Word {
-                        Opcode::Movp
-                    } else {
-                        Opcode::Movw
+                    let op = match &write_kind {
+                        Some((Type::Basic(BasicType::Big), _)) => Opcode::Movl,
+                        Some((Type::Basic(BasicType::Real), _)) => Opcode::Movf,
+                        Some((Type::Basic(_), _)) => Opcode::Movw,
+                        Some((_, _)) => Opcode::Movp,
+                        None => {
+                            // Heuristic fallback: use rhs's ValType.
+                            if self.infer_expr_type(rhs) != ValType::Word {
+                                Opcode::Movp
+                            } else {
+                                Opcode::Movw
+                            }
+                        }
                     };
                     self.emit(
                         op,
@@ -1241,6 +1457,40 @@ impl CodeGen {
                     };
                     self.emit(opcode, op_fp(rhs_tmp), mid_unused(), op_fp(off));
                     Ok(())
+                } else if let Expr::Index(arr_expr, idx_expr, _) = lhs.as_ref() {
+                    // Array element compound assign: arr[i] op= val.
+                    //   Ind* arr, ref, idx       — install heap ref
+                    //   Op*  val, op_fp_ind(ref) — 2-op form: dst = dst OP src
+                    let elem = self.array_elem_basic_for_expr(arr_expr);
+                    let elem_kind = elem
+                        .map(|b| type_num_kind(&Type::Basic(b)))
+                        .unwrap_or(NumKind::Word);
+                    let val_tmp = self.alloc_temp_for(elem_kind);
+                    self.gen_expr_to_kind(rhs, val_tmp, elem_kind)?;
+                    let idx_tmp = self.alloc_temp();
+                    let arr_tmp = self.alloc_temp();
+                    self.gen_expr_to(idx_expr, idx_tmp)?;
+                    self.gen_expr_to(arr_expr, arr_tmp)?;
+                    let ref_tmp = self.alloc_temp();
+                    let (ind_op, _) = Self::array_elem_opcodes(elem);
+                    self.emit(ind_op, op_fp(arr_tmp), mid_fp(ref_tmp), op_fp(idx_tmp));
+                    let opcode = match (op, elem_kind) {
+                        (BinOp::Add, NumKind::Word) => Opcode::Addw,
+                        (BinOp::Add, NumKind::Big) => Opcode::Addl,
+                        (BinOp::Add, NumKind::Real) => Opcode::Addf,
+                        (BinOp::Sub, NumKind::Word) => Opcode::Subw,
+                        (BinOp::Sub, NumKind::Big) => Opcode::Subl,
+                        (BinOp::Sub, NumKind::Real) => Opcode::Subf,
+                        (BinOp::Mul, NumKind::Word) => Opcode::Mulw,
+                        (BinOp::Mul, NumKind::Big) => Opcode::Mull,
+                        (BinOp::Mul, NumKind::Real) => Opcode::Mulf,
+                        (BinOp::Div, NumKind::Word) => Opcode::Divw,
+                        (BinOp::Div, NumKind::Big) => Opcode::Divl,
+                        (BinOp::Div, NumKind::Real) => Opcode::Divf,
+                        _ => Opcode::Addw,
+                    };
+                    self.emit(opcode, op_fp(val_tmp), mid_unused(), op_fp_ind(ref_tmp, 0));
+                    Ok(())
                 } else {
                     Ok(())
                 }
@@ -1252,16 +1502,23 @@ impl CodeGen {
                 let off = self.alloc_local(name, ty, kind);
                 // Capture array element type when the rhs is `array[N] of T`
                 // so subsequent indexing picks the right opcode pair.
-                if let Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) = rhs.as_ref()
-                    && let Type::Basic(b) = ty.as_ref()
-                {
-                    self.local_array_elem.insert(name.to_string(), *b);
+                if let Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) = rhs.as_ref() {
+                    self.local_array_elem
+                        .insert(name.to_string(), (**ty).clone());
                 }
                 // Same for `chan of T` so Send/Recv can pick the right width.
                 if let Expr::ChanAlloc(ty, _) = rhs.as_ref()
                     && let Type::Basic(b) = ty.as_ref()
                 {
                     self.local_chan_elem.insert(name.to_string(), *b);
+                }
+                // ADT inference: `p := ref Foo(...)` carries the ADT name
+                // through the RefAlloc's Type. Cast(Foo, ...) and a Limbo
+                // type annotation (`p: ref Foo = ...`) handled elsewhere.
+                if let Expr::RefAlloc(ty, _, _) = rhs.as_ref()
+                    && let Some(a) = Self::adt_name_for_type(ty)
+                {
+                    self.local_adt_type.insert(name.to_string(), a);
                 }
                 self.gen_expr_to(rhs, off)
             }
@@ -1715,38 +1972,68 @@ impl CodeGen {
                 self.emit(Opcode::Newa, op_fp(sz_tmp), mid_imm(0), op_fp(dst));
                 Ok(())
             }
-            Expr::RefAlloc(_, args, _) => {
-                // ref Adt(field1, field2, ...) → New $type, dst; then fill fields
-                // Allocate a record with size = args.len() * 4
-                let record_size = (args.len() as i32) * 4;
-                // We need a type descriptor for this record. Use a simple one.
-                // For now, use New with an immediate size (simplified)
+            Expr::RefAlloc(ty, args, _) => {
+                // ref Adt(arg1, arg2, ...) → New $type, dst; then fill fields
+                // at the ADT's actual layout offsets with kind-aware Mov so
+                // big/real fields land in 8-byte slots. When the ADT layout
+                // is unknown (or the type is non-Named), fall back to the
+                // historical i*4 / Movw layout.
                 self.emit(Opcode::New, op_imm(1), mid_unused(), op_fp(dst));
-                // Fill fields at offsets 0, 4, 8, ...
+                let layout =
+                    Self::adt_name_for_type(ty).and_then(|a| self.adt_layouts.get(&a).cloned());
                 for (i, arg) in args.iter().enumerate() {
-                    let field_off = (i as i32) * 4;
-                    let arg_tmp = self.alloc_temp();
-                    self.gen_expr_to(arg, arg_tmp)?;
-                    let ty = self.infer_expr_type(arg);
-                    let op = if ty != ValType::Word {
-                        Opcode::Movp
-                    } else {
-                        Opcode::Movw
+                    let (field_off, field_ty) = match layout.as_ref().and_then(|l| l.get(i)) {
+                        Some((_, t, off)) => (*off, Some(t.clone())),
+                        None => ((i as i32) * 4, None),
+                    };
+                    let kind = field_ty
+                        .as_ref()
+                        .map(type_num_kind)
+                        .unwrap_or(NumKind::Word);
+                    let arg_tmp = self.alloc_temp_for(kind);
+                    self.gen_expr_to_kind(arg, arg_tmp, kind)?;
+                    let op = match field_ty.as_ref() {
+                        Some(Type::Basic(BasicType::Big)) => Opcode::Movl,
+                        Some(Type::Basic(BasicType::Real)) => Opcode::Movf,
+                        Some(Type::Basic(_)) => Opcode::Movw,
+                        Some(_) => Opcode::Movp,
+                        None => {
+                            // Heuristic fallback when the ADT layout is unknown.
+                            if self.infer_expr_type(arg) != ValType::Word {
+                                Opcode::Movp
+                            } else {
+                                Opcode::Movw
+                            }
+                        }
                     };
                     self.emit(op, op_fp(arg_tmp), mid_unused(), op_fp_ind(dst, field_off));
                 }
-                let _ = record_size;
                 Ok(())
             }
             Expr::Dot(inner, field, _) => {
-                // expr.field → read field at offset from the ref pointer
-                // Simplified: field offset = field_index * 4
+                // expr.field → read through the ref pointer using the ADT
+                // layout when known. Falls back to the historical heuristic
+                // (`estimate_field_offset` + Movw) for unknown types so the
+                // existing 155 Inferno programs keep compiling.
                 let ref_tmp = self.alloc_temp();
                 self.gen_expr_to(inner, ref_tmp)?;
-                let field_off = self.estimate_field_offset(inner, field);
-                // Double-indirect: read offset(ref(fp))
+                let (field_off, mov_op) = match self
+                    .adt_name_for_expr(inner)
+                    .and_then(|a| self.adt_field_info(&a, field))
+                {
+                    Some((off, ty)) => {
+                        let op = match &ty {
+                            Type::Basic(BasicType::Big) => Opcode::Movl,
+                            Type::Basic(BasicType::Real) => Opcode::Movf,
+                            Type::Basic(_) => Opcode::Movw,
+                            _ => Opcode::Movp,
+                        };
+                        (off, op)
+                    }
+                    None => (self.estimate_field_offset(inner, field), Opcode::Movw),
+                };
                 self.emit(
-                    Opcode::Movw,
+                    mov_op,
                     op_fp_ind(ref_tmp, field_off),
                     mid_unused(),
                     op_fp(dst),
@@ -2168,12 +2455,19 @@ impl CodeGen {
                 mid_unused(),
                 op_fp_ind(frame_tmp, 16),
             );
+            let call_idx = self.code.len();
             self.emit(
                 Opcode::Call,
                 op_fp(frame_tmp),
                 mid_unused(),
                 op_imm(func_pc),
             );
+            if func_pc < 0 {
+                // Forward reference: pre-registered placeholder PC. Patch
+                // after the callee is generated.
+                self.pending_call_fixups
+                    .push((call_idx, func_name.to_string()));
+            }
             // Suppress unused-variable warning when result_dst is None.
             let _ = ret_kind;
         }

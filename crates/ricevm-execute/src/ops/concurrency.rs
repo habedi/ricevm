@@ -252,6 +252,12 @@ pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     nested = Err(err);
                     break;
                 }
+                // A channel operation cannot suspend this thread while the
+                // callee runs on the host stack.
+                if let Err(err) = vm.fault_on_nested_block() {
+                    nested = Err(err);
+                    break;
+                }
                 vm.pc = vm.next_pc;
 
                 if vm.frames.current_data_offset() < spawn_frame_base {

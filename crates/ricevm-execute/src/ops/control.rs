@@ -490,6 +490,12 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     nested = Err(err);
                     break;
                 }
+                // A channel operation cannot suspend this thread while the
+                // callee runs on the host stack.
+                if let Err(err) = vm.fault_on_nested_block() {
+                    nested = Err(err);
+                    break;
+                }
                 vm.pc = vm.next_pc;
 
                 if vm.frames.current_data_offset() < mcall_frame_base {
@@ -568,6 +574,12 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 }
                 vm.next_pc = vm.pc + 1;
                 if let Err(err) = crate::ops::dispatch(vm, &inst) {
+                    nested = Err(err);
+                    break;
+                }
+                // A channel operation cannot suspend this thread while the
+                // callee runs on the host stack.
+                if let Err(err) = vm.fault_on_nested_block() {
                     nested = Err(err);
                     break;
                 }
@@ -1673,6 +1685,79 @@ mod tests {
         assert_eq!(
             vm.next_pc, 777,
             "raise must dispatch through the executing module's handler table"
+        );
+    }
+
+    /// A cross-module call runs the callee on the host stack, so a receive
+    /// with no data cannot suspend the thread. It must fault rather than run
+    /// on with the receive destination left unwritten.
+    #[test]
+    fn mcall_faults_when_the_callee_blocks_on_a_channel() {
+        use crate::vm::LoadedModule;
+        use ricevm_core::module::ExportEntry;
+        use ricevm_core::{AddressMode, Operand as CoreOperand};
+
+        let fp_operand = |offset: i32| CoreOperand {
+            mode: AddressMode::OffsetIndirectFp,
+            register1: offset,
+            register2: 0,
+        };
+        let mut loaded = test_module();
+        loaded.name = "blocking_callee".to_string();
+        loaded.code = vec![Instruction {
+            opcode: Opcode::Recv,
+            source: fp_operand(0),
+            middle: MiddleOperand::UNUSED,
+            destination: fp_operand(8),
+        }];
+        loaded.exports = vec![ExportEntry {
+            pc: 0,
+            frame_type: 0,
+            signature: 0,
+            name: "blocks".to_string(),
+        }];
+
+        let main = test_module();
+        let mut vm = VmState::new(&main).expect("vm init");
+        vm.loaded_modules.push(LoadedModule {
+            module: loaded,
+            mp: Vec::new(),
+        });
+        let mod_ref = vm.heap.alloc(
+            0,
+            HeapData::LoadedModule {
+                module_idx: 0,
+                func_map: vec![Some(0)],
+            },
+        );
+        let chan = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+
+        // The callee's frame holds the channel at fp[0].
+        let pending = vm.frames.alloc_pending(64).expect("alloc_pending");
+        memory::write_word(&mut vm.frames.data, pending, chan as i32);
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref as i32;
+
+        match op_mcall(&mut vm) {
+            Err(ExecError::ThreadFault(msg)) => {
+                assert!(msg.contains("deadlock"), "expected a deadlock fault: {msg}");
+            }
+            other => panic!("a blocked callee must fault, got {other:?}"),
+        }
+        assert!(
+            vm.blocked_channel.is_none(),
+            "the blocked marker must not leak into the caller's run loop"
         );
     }
 

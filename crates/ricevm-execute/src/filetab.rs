@@ -620,13 +620,13 @@ impl FileTable {
     }
 
     /// Resolve a guest path to a host path.
-    /// If a root is set and the path starts with `/`, prepend the root.
-    /// Otherwise, use the path as-is.
+    /// Without a root, the path is used as-is.
     ///
-    /// Absolute guest paths are normalized first, so `..` components can never
+    /// With a root, every guest path resolves inside it, relative ones
+    /// included: the path is normalized first, so `..` components can never
     /// climb above the root and reach the rest of the host filesystem.
     pub fn resolve_path(&self, path: &str) -> String {
-        if self.root.is_empty() || !path.starts_with('/') {
+        if self.root.is_empty() {
             return path.to_string();
         }
         let mut parts: Vec<&str> = Vec::new();
@@ -639,7 +639,16 @@ impl FileTable {
                 other => parts.push(other),
             }
         }
-        format!("{}/{}", self.root.trim_end_matches('/'), parts.join("/"))
+        let root = self.root.trim_end_matches('/');
+        if parts.is_empty() {
+            return root.to_string();
+        }
+        format!("{}/{}", root, parts.join("/"))
+    }
+
+    /// Whether guest paths are confined to a root directory.
+    pub fn is_rooted(&self) -> bool {
+        !self.root.is_empty()
     }
 
     /// Open a file and return its fd number.
@@ -804,13 +813,36 @@ impl FileTable {
         (read_fd, write_fd)
     }
 
-    /// Get an fd entry for reading.
+    /// Read from an fd without waiting.
+    ///
+    /// A handle with no data yet reports `WouldBlock`, never a short EOF, so
+    /// the caller can let another VM thread run and try again.
     pub fn read(&mut self, fd: i32, buf: &mut [u8]) -> io::Result<usize> {
         let entry = self
             .files
             .get_mut(&fd)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
         entry.inner.read(buf)
+    }
+
+    /// Read from an fd, waiting for the host to supply data.
+    ///
+    /// Only call this when no VM thread could run: every VM thread shares this
+    /// OS thread, so the wait stops all of them. A handle fed by another VM
+    /// thread (a pipe) still reports `WouldBlock` at once, because no amount of
+    /// waiting here can let its writer run.
+    pub fn read_blocking(&mut self, fd: i32, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let entry = self
+                .files
+                .get_mut(&fd)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "bad fd"))?;
+            match entry.inner.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock && entry.inner.waits_on_host() => {}
+                result => return result,
+            }
+            std::thread::sleep(HOST_POLL_INTERVAL);
+        }
     }
 
     /// Write to an fd.
@@ -839,8 +871,14 @@ impl FileTable {
 
     /// Duplicate an fd onto `new_fd`, closing whatever it held.
     /// A negative `new_fd` allocates a fresh descriptor.
-    /// Returns the new fd number, or -1 if the handle cannot be duplicated.
+    /// Returns the new fd number, or -1 if the handle cannot be duplicated or
+    /// `new_fd` is out of range.
     pub fn dup(&mut self, old_fd: i32, new_fd: i32) -> i32 {
+        // `new_fd` comes straight from guest memory: an absurd value must be
+        // rejected rather than overflow the next-fd counter.
+        if new_fd > MAX_FD {
+            return -1;
+        }
         let Some(entry) = self.files.get(&old_fd) else {
             return -1;
         };
@@ -967,7 +1005,7 @@ impl FileTable {
         self.files.insert(
             fd,
             FileEntry {
-                inner: Box::new(MemoryFile(std::io::Cursor::new(data.to_vec()))),
+                inner: Box::new(MemoryFile::new(data.to_vec())),
                 path: Some(path.to_string()),
             },
         );
@@ -1010,7 +1048,7 @@ impl FileTable {
             FileEntry {
                 inner: Box::new(AudioCtlFile {
                     state: Arc::clone(&self.audio),
-                    pos: 0,
+                    pos: Arc::new(Mutex::new(0)),
                 }),
                 path: Some(path.to_string()),
             },
@@ -1123,8 +1161,8 @@ mod tests {
         assert_eq!(ft.resolve_path("/foo/bar"), "/host/inferno/foo/bar");
         assert_eq!(
             ft.resolve_path("relative"),
-            "relative",
-            "relative paths should not be prefixed"
+            "/host/inferno/relative",
+            "relative paths resolve inside the root too"
         );
     }
 
@@ -1334,12 +1372,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stdin_read_waits_for_late_data() {
+    /// Install a stdin handle fed by the returned buffer instead of the real
+    /// console, so a test can control when input arrives.
+    fn file_table_with_test_stdin() -> (FileTable, Arc<Mutex<StdinBuffer>>) {
+        let mut ft = FileTable::new();
         let buffer = Arc::new(Mutex::new(StdinBuffer {
             data: VecDeque::new(),
             eof: false,
         }));
+        ft.files.insert(
+            0,
+            FileEntry {
+                inner: Box::new(StdinFile {
+                    buffer: Arc::clone(&buffer),
+                }),
+                path: Some("/dev/stdin".to_string()),
+            },
+        );
+        (ft, buffer)
+    }
+
+    #[test]
+    fn stdin_read_waits_for_late_data() {
+        let (mut ft, buffer) = file_table_with_test_stdin();
         let writer = Arc::clone(&buffer);
         let handle = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(400));
@@ -1351,9 +1406,26 @@ mod tests {
         });
 
         let mut buf = [0u8; 8];
-        let n = read_stdin_buffer(&buffer, &mut buf).expect("stdin read");
+        let n = ft.read_blocking(0, &mut buf).expect("stdin read");
         handle.join().expect("writer thread");
         assert_eq!(&buf[..n], b"hi", "slow input must not look like EOF");
+    }
+
+    #[test]
+    fn blocking_read_of_an_empty_pipe_does_not_wait_for_a_writer() {
+        let mut ft = FileTable::new();
+        let (read_fd, _write_fd) = ft.pipe();
+        let mut buf = [0u8; 8];
+
+        let start = std::time::Instant::now();
+        let err = ft
+            .read_blocking(read_fd, &mut buf)
+            .expect_err("no VM thread can run to fill the pipe");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "waiting for an in-VM writer must not hang the VM"
+        );
     }
 
     #[test]
@@ -1435,11 +1507,12 @@ mod tests {
     fn dup_shares_the_read_offset_of_a_virtual_file() {
         let mut ft = FileTable::new();
         let fd = ft.open("/dev/sysctl", 0).expect("open /dev/sysctl");
+        let dup_fd = ft.dup(fd, -1);
+
         let mut buf = [0u8; 4];
         let n = ft.read(fd, &mut buf).expect("read");
         assert_eq!(&buf[..n], b"Rice");
 
-        let dup_fd = ft.dup(fd, -1);
         let n = ft.read(dup_fd, &mut buf).expect("read from dup'd fd");
         assert_eq!(
             &buf[..n],
@@ -1452,12 +1525,13 @@ mod tests {
     fn dup_shares_the_read_position_of_audioctl() {
         let mut ft = FileTable::new();
         let fd = ft.open("/dev/audioctl", 0).expect("open /dev/audioctl");
+        let dup_fd = ft.dup(fd, -1);
+
         let mut buf = [0u8; 4];
         let first = ft.read(fd, &mut buf).expect("audioctl read");
         assert_eq!(first, 4);
         let head = buf;
 
-        let dup_fd = ft.dup(fd, -1);
         let n = ft.read(dup_fd, &mut buf).expect("read from dup'd fd");
         assert!(
             n == 0 || buf[..n] != head[..n],
@@ -1503,7 +1577,7 @@ mod tests {
         let mut buf = [0u8; 8];
 
         let start = std::time::Instant::now();
-        let err = read_stdin_buffer(&buffer, &mut buf, ReadWait::Poll)
+        let err = read_stdin_buffer(&buffer, &mut buf)
             .expect_err("a poll with no input yet must not report EOF");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
         assert!(

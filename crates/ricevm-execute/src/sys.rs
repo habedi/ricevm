@@ -157,10 +157,12 @@ fn format_string(
             }
         }
 
-        // Helper: apply width/alignment to an already-formatted string
+        // Helper: apply width/alignment to an already-formatted string.
+        // Width counts characters, like precision does and like the `{:>w$}`
+        // formats below, so a multi-byte argument still lines up in columns.
         let apply_width = |s: String| -> String {
             let w = width.unwrap_or(0);
-            if w == 0 || s.len() >= w {
+            if w == 0 || s.chars().count() >= w {
                 return s;
             }
             if left_align {
@@ -561,6 +563,153 @@ fn sys_create(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// Instructions another VM thread may run when a read hands it the OS thread.
+/// One scheduler quantum, so a hand-off costs no more than a thread switch.
+const YIELD_QUANTUM: usize = 2048;
+
+thread_local! {
+    /// Set while a read is running another VM thread, so a read performed by
+    /// that thread cannot swap out the thread waiting for it.
+    static YIELDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Read from `fd`, letting other VM threads run while there is no data yet.
+///
+/// Every VM thread shares one OS thread, so a handle that has nothing to give
+/// yet (an empty pipe, stdin before the user types) reports `WouldBlock` rather
+/// than waiting: waiting inside the read is exactly what would keep the writer
+/// from ever running. The waiting happens here instead, by running the threads
+/// that can produce the data, and falls back to waiting on the host only once
+/// no VM thread can run at all.
+fn read_fd(
+    vm: &mut VmState<'_>,
+    fd: i32,
+    buf: &mut [u8],
+) -> Result<std::io::Result<usize>, ExecError> {
+    loop {
+        match vm.files.read(fd, buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            result => return Ok(result),
+        }
+        if !run_other_vm_thread(vm)? {
+            // Nothing else can run, so only the host can still supply data.
+            // For a pipe not even that, and `read_blocking` says so at once
+            // instead of hanging the VM.
+            return Ok(vm.files.read_blocking(fd, buf));
+        }
+    }
+}
+
+/// Hand the OS thread to one other ready VM thread for up to a quantum, so it
+/// can make the progress a waiting read needs. Returns whether a thread ran.
+fn run_other_vm_thread(vm: &mut VmState<'_>) -> Result<bool, ExecError> {
+    if YIELDING.with(std::cell::Cell::get) {
+        return Ok(false);
+    }
+    // A queue entry without frames is a mirror of a thread another scheduler
+    // owns; only a real suspended thread can be run from here.
+    let Some(idx) = vm
+        .thread_queue
+        .iter()
+        .position(|t| t.blocked_on.is_none() && !t.frames.data.is_empty())
+    else {
+        return Ok(false);
+    };
+    let Some(other) = vm.thread_queue.remove(idx) else {
+        return Ok(false);
+    };
+
+    // Park the reading thread on the host stack while the other one runs.
+    let saved_frames = std::mem::replace(&mut vm.frames, other.frames);
+    let saved_mp = std::mem::replace(&mut vm.mp, other.mp);
+    let saved_heap_refs = std::mem::replace(&mut vm.heap_refs, other.heap_refs);
+    let saved_last_error = std::mem::replace(&mut vm.last_error, other.last_error);
+    let saved_loaded_module =
+        std::mem::replace(&mut vm.current_loaded_module, other.current_loaded_module);
+    let saved_caller_mp = std::mem::replace(&mut vm.caller_mp_stack, other.caller_mp_stack);
+    let saved_unwind_floor = std::mem::replace(&mut vm.unwind_floor, 0);
+    let saved_pc = vm.pc;
+    let saved_next_pc = vm.next_pc;
+    let saved_halted = vm.halted;
+    let saved_operands = (vm.src, vm.mid, vm.dst, vm.imm_src, vm.imm_mid, vm.imm_dst);
+    vm.pc = other.pc;
+    vm.halted = false;
+
+    YIELDING.with(|f| f.set(true));
+    let outcome = run_thread_slice(vm);
+    YIELDING.with(|f| f.set(false));
+
+    // Take the thread back out and restore the reader.
+    let ran = crate::vm::SuspendedThread {
+        frames: std::mem::replace(&mut vm.frames, saved_frames),
+        mp: std::mem::replace(&mut vm.mp, saved_mp),
+        pc: vm.pc,
+        heap_refs: std::mem::replace(&mut vm.heap_refs, saved_heap_refs),
+        last_error: std::mem::replace(&mut vm.last_error, saved_last_error),
+        current_loaded_module: std::mem::replace(
+            &mut vm.current_loaded_module,
+            saved_loaded_module,
+        ),
+        caller_mp_stack: std::mem::replace(&mut vm.caller_mp_stack, saved_caller_mp),
+        blocked_on: *outcome.as_ref().unwrap_or(&None),
+    };
+    let finished = vm.halted;
+    vm.pc = saved_pc;
+    vm.next_pc = saved_next_pc;
+    vm.halted = saved_halted;
+    vm.unwind_floor = saved_unwind_floor;
+    // A channel wait belongs to the thread that made it, never to the reader.
+    vm.blocked_channel = None;
+    (vm.src, vm.mid, vm.dst, vm.imm_src, vm.imm_mid, vm.imm_dst) = saved_operands;
+
+    if !finished {
+        vm.thread_queue.push_back(ran);
+    }
+    outcome?;
+    Ok(true)
+}
+
+/// Run the thread currently installed in `vm` for up to one quantum.
+/// Returns the channel it blocked on, if it blocked.
+fn run_thread_slice(vm: &mut VmState<'_>) -> Result<Option<HeapId>, ExecError> {
+    for _ in 0..YIELD_QUANTUM {
+        if vm.halted {
+            break;
+        }
+        let code = match vm.current_loaded_module {
+            Some(idx) => match vm.loaded_modules.get(idx) {
+                Some(loaded) => &loaded.module.code,
+                None => break,
+            },
+            None => &vm.module.code,
+        };
+        let Some(inst) = code.get(vm.pc).cloned() else {
+            // Running off the end of the code ends the thread.
+            vm.halted = true;
+            break;
+        };
+        vm.resolve_operands(&inst)?;
+        vm.next_pc = vm.pc + 1;
+        match crate::ops::dispatch(vm, &inst) {
+            Ok(()) => {}
+            Err(ExecError::ThreadFault(ref msg))
+                if msg.contains("nil")
+                    || msg.contains("out of bounds")
+                    || msg.contains("not a module") =>
+            {
+                vm.raise_exception(msg)?;
+            }
+            Err(e) => return Err(e),
+        }
+        if let Some(chan_id) = vm.blocked_channel.take() {
+            // Keep the PC, so the operation runs again once it can succeed.
+            return Ok(Some(chan_id));
+        }
+        vm.pc = vm.next_pc;
+    }
+    Ok(None)
+}
+
 /// Clamp a guest-supplied byte count to the buffer it applies to.
 /// Returns None when the buffer is nil or the count is negative, which
 /// Inferno reports as a transfer of zero bytes.
@@ -583,7 +732,7 @@ fn sys_read(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
     let fd_num = get_fd_num(vm, fd_id);
     let mut tmp = vec![0u8; count];
-    let n = match vm.files.read(fd_num, &mut tmp) {
+    let n = match read_fd(vm, fd_num, &mut tmp)? {
         Ok(n) => n as i32,
         Err(e) => {
             vm.last_error = format!("{e}");
@@ -616,7 +765,7 @@ fn sys_readn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let mut total = 0usize;
     let mut result = 0i32;
     while total < count {
-        match vm.files.read(fd_num, &mut tmp[total..]) {
+        match read_fd(vm, fd_num, &mut tmp[total..])? {
             Ok(0) => break, // EOF
             Ok(n) => total += n,
             Err(e) => {
@@ -929,16 +1078,25 @@ fn sys_utfbytes(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 // --- Helper ---
 
+/// Host directory a guest `chdir` should switch to.
+///
+/// Inferno's `/usr/<name>` maps to the host home directory, but only for an
+/// unconfined guest: under a root every path, that one included, resolves
+/// inside the root.
+fn chdir_target(files: &crate::filetab::FileTable, raw_path: &str) -> String {
+    if !files.is_rooted()
+        && let Some(user) = raw_path.strip_prefix("/usr/")
+    {
+        return std::env::var("HOME").unwrap_or_else(|_| format!("/home/{user}"));
+    }
+    files.resolve_path(raw_path)
+}
+
 fn sys_chdir(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let raw_path = vm.heap.get_string(path_id).unwrap_or("").to_string();
-    // Map Inferno /usr/<name> to the host home directory
-    let path = if let Some(user) = raw_path.strip_prefix("/usr/") {
-        std::env::var("HOME").unwrap_or_else(|_| format!("/home/{user}"))
-    } else {
-        vm.files.resolve_path(&raw_path)
-    };
+    let path = chdir_target(&vm.files, &raw_path);
     let result = match std::env::set_current_dir(&path) {
         Ok(()) => 0,
         Err(e) => {
@@ -1169,15 +1327,21 @@ fn sys_dirread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             let mut names: Vec<std::fs::DirEntry> = entries.flatten().collect();
             names.sort_by_key(|e| e.file_name());
             let mut dir_ids: Vec<HeapId> = Vec::new();
+            let mut consumed = 0usize;
             for entry in names.into_iter().skip(start) {
-                if let Ok(meta) = entry.metadata() {
+                consumed += 1;
+                // Stat the target, as `stat` does. An entry that cannot be
+                // stat'd (a dangling symlink, a racing unlink) is left out of
+                // the result but still counted, so the next call resumes after
+                // it instead of returning the entries behind it twice.
+                if let Ok(meta) = std::fs::metadata(entry.path()) {
                     let name = entry.file_name().to_string_lossy().to_string();
                     let dir_id = build_dir_record(vm, &meta, &name);
                     dir_ids.push(dir_id);
                 }
             }
             let count = dir_ids.len();
-            vm.files.set_dir_offset(fd_num, start + count);
+            vm.files.set_dir_offset(fd_num, start + consumed);
             // Build array of Dir pointers
             let mut arr_data = vec![0u8; count * 4];
             for (i, &id) in dir_ids.iter().enumerate() {
@@ -1384,7 +1548,10 @@ fn sys_wstat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let dir_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
-    let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    let raw_path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    // Guest paths are resolved against the root, so a confined guest cannot
+    // change the permissions of a host file outside it.
+    let path = vm.files.resolve_path(&raw_path);
 
     let result = apply_dir_permissions(vm, &path, dir_id);
     memory::write_word(&mut vm.frames.data, frame_base, result);
@@ -1481,7 +1648,7 @@ fn sys_stream(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let mut total: i64 = 0;
     let mut buf = vec![0u8; bufsiz];
     loop {
-        let n = match vm.files.read(src_fd, &mut buf) {
+        let n = match read_fd(vm, src_fd, &mut buf)? {
             Ok(0) => break, // EOF
             Ok(n) => n,
             Err(e) => {
@@ -2157,6 +2324,128 @@ mod tests {
         writer.join().expect("writer thread");
     }
 
+    /// A suspended thread whose program is the test module's single `exit`,
+    /// so running it for one quantum finishes it.
+    fn ready_thread() -> crate::vm::SuspendedThread {
+        let mut frames = crate::frame::FrameStack::new();
+        frames.push_entry(64, -1);
+        crate::vm::SuspendedThread {
+            frames,
+            mp: Vec::new(),
+            pc: 0,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            current_loaded_module: None,
+            caller_mp_stack: Vec::new(),
+            blocked_on: None,
+        }
+    }
+
+    /// Set up `sys_read` of `count` bytes from a pipe's read end.
+    fn vm_reading_from_a_pipe(module: &Module) -> (VmState<'_>, usize) {
+        let mut vm = VmState::new(module).expect("vm should initialize");
+        let (read_fd, _write_fd) = vm.files.pipe();
+        let fd_id = alloc_fd_record(&mut vm, read_fd);
+        let buf_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: vec![0; 8],
+                length: 8,
+            },
+        );
+        let frame_base = vm.frames.current_data_offset();
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, buf_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 8);
+        (vm, frame_base)
+    }
+
+    #[test]
+    fn read_hands_the_os_thread_to_the_threads_that_could_fill_the_pipe() {
+        let module = test_module();
+        let (mut vm, frame_base) = vm_reading_from_a_pipe(&module);
+        vm.thread_queue.push_back(ready_thread());
+        vm.thread_queue.push_back(ready_thread());
+
+        let start = std::time::Instant::now();
+        sys_read(&mut vm).expect("read should return");
+
+        assert!(
+            vm.thread_queue.is_empty(),
+            "a read with no data must let every ready thread run, not spin or sleep"
+        );
+        assert_eq!(
+            memory::read_word(&vm.frames.data, frame_base),
+            -1,
+            "once nothing can fill the pipe the read reports the failure"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "a read must not burn a fixed timeout, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn read_of_an_empty_pipe_restores_the_reading_thread() {
+        let module = test_module();
+        let (mut vm, frame_base) = vm_reading_from_a_pipe(&module);
+        let frames_before = vm.frames.data.clone();
+        let pc_before = vm.pc;
+        vm.thread_queue.push_back(ready_thread());
+
+        sys_read(&mut vm).expect("read should return");
+
+        assert_eq!(
+            vm.pc, pc_before,
+            "the reader's PC must survive the hand-off"
+        );
+        assert_eq!(
+            vm.frames.data[..frame_base],
+            frames_before[..frame_base],
+            "the reader's frames must survive the hand-off"
+        );
+        assert!(
+            !vm.halted,
+            "the reader must not inherit the other thread's exit"
+        );
+    }
+
+    #[test]
+    fn read_returns_data_a_pipe_already_holds() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let (read_fd, write_fd) = vm.files.pipe();
+        vm.files.write(write_fd, b"ping").expect("pipe write");
+        let fd_id = alloc_fd_record(&mut vm, read_fd);
+        let buf_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: vec![0; 8],
+                length: 8,
+            },
+        );
+        let frame_base = vm.frames.current_data_offset();
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, buf_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 8);
+        vm.thread_queue.push_back(ready_thread());
+
+        sys_read(&mut vm).expect("read should succeed");
+
+        assert_eq!(memory::read_word(&vm.frames.data, frame_base), 4);
+        assert_eq!(&array_bytes(&vm, buf_id)[..4], b"ping");
+        assert_eq!(
+            vm.thread_queue.len(),
+            1,
+            "a read that can be served must not disturb the scheduler"
+        );
+    }
+
     #[test]
     fn fprint_with_nil_fd_returns_error() {
         let module = test_module();
@@ -2223,6 +2512,97 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A Dir record whose mode field asks for `mode`.
+    #[cfg(unix)]
+    fn alloc_dir_with_mode(vm: &mut VmState<'_>, mode: i32) -> HeapId {
+        let mut data = vec![0u8; 60];
+        memory::write_word(&mut data, 32, mode);
+        vm.heap.alloc(0, HeapData::Record(data))
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .expect("stat should succeed")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wstat_resolves_paths_against_the_root() {
+        let root = temp_path("wstat_root");
+        std::fs::create_dir_all(&root).expect("create root directory");
+        let target = root.join("target.txt");
+        std::fs::write(&target, b"x").expect("write target");
+        let outside = temp_path("wstat_victim");
+        std::fs::write(&outside, b"x").expect("write victim");
+        std::fs::set_permissions(
+            &outside,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("set victim permissions");
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        vm.files = crate::filetab::FileTable::with_root(root.to_string_lossy().to_string());
+        let frame_base = vm.frames.current_data_offset();
+        let dir_id = alloc_dir_with_mode(&mut vm, 0o444);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, dir_id);
+
+        // A host path a confined guest must not be able to reach.
+        let path_id = vm
+            .heap
+            .alloc(0, HeapData::Str(outside.to_string_lossy().to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, path_id);
+        sys_wstat(&mut vm).expect("wstat should return");
+
+        assert_eq!(
+            memory::read_word(&vm.frames.data, frame_base),
+            -1,
+            "a guest under a root must not reach a host file"
+        );
+        assert_eq!(
+            mode_of(&outside),
+            0o600,
+            "the host file must keep its permissions"
+        );
+
+        // The same call inside the root still works.
+        let path_id = vm.heap.alloc(0, HeapData::Str("/target.txt".to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, path_id);
+        sys_wstat(&mut vm).expect("wstat should return");
+
+        assert_eq!(memory::read_word(&vm.frames.data, frame_base), 0);
+        assert_eq!(
+            mode_of(&target),
+            0o444,
+            "wstat should chmod inside the root"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn chdir_keeps_a_confined_guest_inside_the_root() {
+        let files = crate::filetab::FileTable::with_root("/host/inferno".to_string());
+        assert_eq!(
+            chdir_target(&files, "/usr/inferno"),
+            "/host/inferno/usr/inferno",
+            "the home directory shortcut must not escape the root"
+        );
+        assert_eq!(chdir_target(&files, "../.."), "/host/inferno");
+
+        // Without a root, /usr/<name> still maps to the host home directory.
+        let files = crate::filetab::FileTable::new();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/home/bob".to_string());
+        assert_eq!(chdir_target(&files, "/usr/bob"), home);
+        assert_eq!(chdir_target(&files, "/tmp"), "/tmp");
     }
 
     #[test]
@@ -2306,6 +2686,87 @@ mod tests {
             write_ptr(&mut vm.frames.data, off, s_id);
         });
         assert_eq!(result, "hel");
+    }
+
+    #[test]
+    fn format_string_width_counts_characters() {
+        // "héllo" is 5 characters but 6 bytes: measuring bytes drops the pad.
+        let result = run_format("%6s|", |vm, off| {
+            let s_id = vm.heap.alloc(0, HeapData::Str("héllo".to_string()));
+            write_ptr(&mut vm.frames.data, off, s_id);
+        });
+        assert_eq!(result, " héllo|", "width must pad to columns, not to bytes");
+
+        let result = run_format("%6.5s|", |vm, off| {
+            let s_id = vm.heap.alloc(0, HeapData::Str("héllo".to_string()));
+            write_ptr(&mut vm.frames.data, off, s_id);
+        });
+        assert_eq!(
+            result, " héllo|",
+            "width and precision must count the same units"
+        );
+
+        let result = run_format("%-2s|", |vm, off| {
+            let s_id = vm.heap.alloc(0, HeapData::Str("é".to_string()));
+            write_ptr(&mut vm.frames.data, off, s_id);
+        });
+        assert_eq!(result, "é |", "left alignment pads by columns too");
+    }
+
+    /// Names of the Dir records in the array `dirread` returned.
+    fn dir_names(vm: &VmState<'_>, arr_id: HeapId) -> Vec<String> {
+        let ids = match &vm.heap.get(arr_id).expect("array should exist").data {
+            HeapData::Array { data, length, .. } => (0..*length)
+                .map(|i| memory::read_word(data, i * 4) as HeapId)
+                .collect::<Vec<_>>(),
+            other => panic!("expected array, got {other:?}"),
+        };
+        ids.into_iter()
+            .map(|id| match &vm.heap.get(id).expect("dir record").data {
+                HeapData::Record(data) => {
+                    let name_id = read_ptr(data, 0);
+                    vm.heap.get_string(name_id).unwrap_or("").to_string()
+                }
+                other => panic!("expected record, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dirread_does_not_repeat_entries_it_could_not_stat() {
+        let dir = temp_path("dirread_unstatable");
+        std::fs::create_dir_all(&dir).expect("create directory");
+        std::fs::write(dir.join("a.txt"), b"a").expect("write a");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/ricevm/no/such/target", dir.join("b.txt"))
+            .expect("create dangling symlink");
+        std::fs::write(dir.join("c.txt"), b"c").expect("write c");
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fd = vm
+            .files
+            .open(dir.to_str().expect("temp path should be utf-8"), 0)
+            .expect("open directory should succeed");
+        let fd_id = alloc_fd_record(&mut vm, fd);
+        let frame_base = vm.frames.current_data_offset();
+        let ret_off = frame_base + 48;
+        memory::write_word(&mut vm.frames.data, frame_base + 16, ret_off as i32);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
+
+        sys_dirread(&mut vm).expect("dirread should succeed");
+        assert_eq!(memory::read_word(&vm.frames.data, ret_off), 2);
+        let arr_id = read_ptr(&vm.frames.data, ret_off + 4);
+        assert_eq!(dir_names(&vm, arr_id), vec!["a.txt", "c.txt"]);
+
+        sys_dirread(&mut vm).expect("dirread should succeed");
+        assert_eq!(
+            memory::read_word(&vm.frames.data, ret_off),
+            0,
+            "an entry that could not be stat'd is still consumed, so nothing repeats"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

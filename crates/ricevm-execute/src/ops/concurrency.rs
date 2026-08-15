@@ -628,6 +628,89 @@ mod tests {
         }
     }
 
+    /// Regression: `mspawn` runs a loaded module's function inline, and used to
+    /// return before swapping the module context back when that function
+    /// failed. The caller was then left with the callee's MP, the loaded
+    /// module's MP emptied by `mem::take`, a stale caller-MP-stack entry and the
+    /// callee still marked current.
+    #[test]
+    fn mspawn_restores_the_module_context_when_the_callee_fails() {
+        use crate::vm::LoadedModule;
+        use ricevm_core::AddressMode;
+        use ricevm_core::module::ExportEntry;
+
+        let fp_operand = |offset: i32| Operand {
+            mode: AddressMode::OffsetIndirectFp,
+            register1: offset,
+            register2: 0,
+        };
+        let mut loaded = test_module();
+        loaded.name = "failing_callee".to_string();
+        loaded.code = vec![Instruction {
+            opcode: Opcode::Raise,
+            source: fp_operand(0),
+            middle: MiddleOperand::UNUSED,
+            destination: Operand::UNUSED,
+        }];
+        loaded.exports = vec![ExportEntry {
+            pc: 0,
+            frame_type: 0,
+            signature: 0,
+            name: "boom".to_string(),
+        }];
+
+        let main = test_module();
+        let mut vm = VmState::new(&main).expect("vm should initialize");
+        let loaded_mp = vec![0xABu8; 32];
+        vm.loaded_modules.push(LoadedModule {
+            module: loaded,
+            mp: loaded_mp.clone(),
+        });
+        let caller_mp = vec![0xCDu8; 16];
+        vm.mp = caller_mp.clone();
+
+        let mod_ref = vm.heap.alloc(
+            0,
+            HeapData::LoadedModule {
+                module_idx: 0,
+                func_map: vec![Some(0)],
+            },
+        );
+        let exception = vm.heap.alloc(0, HeapData::Str("fail:oops".to_string()));
+        let pending = vm.frames.alloc_pending(64).expect("alloc_pending");
+        memory::write_word(&mut vm.frames.data, pending, exception as i32);
+
+        vm.pc = 7;
+        vm.next_pc = 8;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref as i32;
+
+        assert!(
+            op_mspawn(&mut vm).is_err(),
+            "an unhandled exception in the callee must fail"
+        );
+        assert_eq!(
+            vm.current_loaded_module, None,
+            "the caller's module must be current again"
+        );
+        assert_eq!(vm.mp, caller_mp, "the caller's MP must be restored");
+        assert_eq!(
+            vm.loaded_modules[0].mp, loaded_mp,
+            "the loaded module's MP must be written back, not left empty"
+        );
+        assert!(
+            vm.caller_mp_stack.is_empty(),
+            "the pushed caller MP entry must be popped"
+        );
+        assert_eq!(vm.pc, 7, "the caller's pc must be restored");
+        assert_eq!(vm.next_pc, 8, "the caller's next_pc must be restored");
+        assert_eq!(vm.unwind_floor, 0, "the unwind floor must be restored");
+    }
+
     #[test]
     fn send_recv_roundtrip_word_channel() {
         let module = test_module();

@@ -43,6 +43,10 @@ pub(crate) struct VmThread {
     pub caller_mp_stack: Vec<(usize, Vec<u8>)>,
     pub id: u32,
     pub state: ThreadState,
+    /// Preemptive-pool bookkeeping: the instruction count the VM had retired
+    /// when this thread last parked on a channel. Retrying is pointless until
+    /// some other thread retires an instruction. Unused in cooperative mode.
+    blocked_at: u64,
 }
 
 impl VmThread {
@@ -75,6 +79,7 @@ impl VmThread {
                 Some(chan_id) => ThreadState::Blocked(chan_id),
                 None => ThreadState::Ready,
             },
+            blocked_at: 0,
         }
     }
 
@@ -120,6 +125,9 @@ pub(crate) struct SharedState<'m> {
     pub trace: bool,
     /// Source of thread ids, shared so worker-spawned threads get unique ones.
     pub next_thread_id: u32,
+    /// Instructions retired by all threads. Bumped under this lock, so it
+    /// orders "the channel may have changed since I parked" for the pool.
+    pub progress: u64,
 }
 
 /// The cooperative scheduler manages multiple threads sharing a common heap and module table.
@@ -303,6 +311,8 @@ struct ThreadPool {
     queue: VecDeque<VmThread>,
     /// Threads handed to a worker and not yet returned.
     running: usize,
+    /// Highest instruction count any worker has observed.
+    progress: u64,
     /// Set once a worker reported a deadlock, so the others stop waiting.
     shutdown: bool,
 }
@@ -312,19 +322,25 @@ impl ThreadPool {
         Self {
             queue: VecDeque::new(),
             running: 0,
+            progress: 0,
             shutdown: false,
         }
     }
 
-    /// Make every blocked thread runnable again. Called after a thread makes
-    /// progress: it may have filled or drained the channel they wait on, and a
-    /// thread whose channel is still not ready simply blocks again when it
-    /// re-executes the operation.
-    fn wake_blocked(&mut self) {
-        for thread in self.queue.iter_mut() {
-            if matches!(thread.state, ThreadState::Blocked(_)) {
-                thread.state = ThreadState::Ready;
-            }
+    /// Whether a worker should pick this thread up.
+    ///
+    /// A parked thread becomes runnable again as soon as the VM has retired an
+    /// instruction since it parked: whatever it waits for may have happened, and
+    /// re-executing the operation simply parks it again when it has not. The
+    /// comparison is against the instruction count at park time rather than a
+    /// wake signal, because a signal sent while the thread is still in a
+    /// worker's hands would be lost -- and losing it reports a deadlock for a
+    /// program that only needed to retry a send.
+    fn is_runnable(&self, thread: &VmThread) -> bool {
+        match thread.state {
+            ThreadState::Ready => true,
+            ThreadState::Blocked(_) => thread.blocked_at < self.progress,
+            ThreadState::Running | ThreadState::Exited => false,
         }
     }
 }
@@ -355,6 +371,7 @@ impl<'m> PreemptiveScheduler<'m> {
             gc_counter: 0,
             trace: std::env::var("RICEVM_TRACE").is_ok(),
             next_thread_id: 1,
+            progress: 0,
         };
         Self {
             shared: Arc::new(Mutex::new(shared)),
@@ -433,8 +450,9 @@ fn worker_loop(
                 }
                 // Remove halted threads
                 pool.queue.retain(|t| t.state != ThreadState::Exited);
-                // Find a ready thread
-                if let Some(idx) = pool.queue.iter().position(|t| t.state == ThreadState::Ready) {
+                // Find a thread to run: ready, or parked with something having
+                // happened since it parked.
+                if let Some(idx) = pool.queue.iter().position(|t| pool.is_runnable(t)) {
                     let Some(mut t) = pool.queue.remove(idx) else {
                         return Ok(());
                     };
@@ -447,9 +465,10 @@ fn worker_loop(
                     if pool.queue.is_empty() {
                         return Ok(());
                     }
-                    // Only blocked threads are left and no worker is running,
-                    // so nothing will ever complete the channel operation they
-                    // wait for. Stop the other workers before reporting it.
+                    // Only parked threads are left, none of them has seen any
+                    // progress since parking, and no worker is running: nothing
+                    // will ever complete the operation they wait for. Stop the
+                    // other workers before reporting it.
                     pool.shutdown = true;
                     drop(pool);
                     condvar.notify_all();
@@ -461,30 +480,28 @@ fn worker_loop(
             }
         };
 
-        // Execute the thread for one quanta
+        // Execute the thread for one quanta. Read the instruction count under
+        // the same lock: nothing else can run while it is held, so this is the
+        // count the thread saw if it parked.
         let mut spawned = Vec::new();
-        let result = {
+        let (result, epoch) = {
             let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-            run_thread_quanta_shared(&mut state, &mut thread, DEFAULT_QUANTA, &mut spawned)
-        };
-        let executed = match &result {
-            Ok(executed) => *executed,
-            Err(_) => 0,
+            let result =
+                run_thread_quanta_shared(&mut state, &mut thread, DEFAULT_QUANTA, &mut spawned);
+            (result, state.progress)
         };
 
         // Return thread to queue, along with anything it spawned
         {
             let mut pool = threads.lock().unwrap_or_else(|e| e.into_inner());
             pool.running -= 1;
+            pool.progress = pool.progress.max(epoch);
             if thread.halted {
                 thread.state = ThreadState::Exited;
             } else if thread.state == ThreadState::Running {
                 thread.state = ThreadState::Ready;
-            }
-            if executed > 0 {
-                // This thread ran instructions, so a channel a blocked thread
-                // waits on may have become ready.
-                pool.wake_blocked();
+            } else if matches!(thread.state, ThreadState::Blocked(_)) {
+                thread.blocked_at = epoch;
             }
             pool.queue.push_back(thread);
             pool.queue.extend(spawned);
@@ -629,6 +646,7 @@ fn run_thread_quanta_shared(
 
         thread.pc = thread.next_pc;
         executed += 1;
+        state.progress += 1;
     }
     Ok(executed)
 }
@@ -942,6 +960,118 @@ mod tests {
         );
     }
 
+    /// Regression: a thread spawned while a loaded module is current must keep
+    /// running that module. The cooperative scheduler rebuilt children through
+    /// `spawn_thread`, which knows only frames/mp/pc, so the child ran the MAIN
+    /// module's code at the LOADED module's entry pc, against the wrong MP.
+    #[test]
+    fn dispatch_preserves_the_spawning_threads_module_context() {
+        let module = module_with_code("sched_ctx", vec![exit_instruction(), exit_instruction()]);
+        let loaded = module_with_code(
+            "sched_ctx_lib",
+            vec![exit_instruction(), exit_instruction()],
+        );
+        let mut sched = scheduler_with_thread(&module, 0);
+        sched.loaded_modules.push(LoadedModule {
+            module: loaded,
+            mp: Vec::new(),
+        });
+
+        let caller_mp_stack = vec![(0usize, vec![1u8, 0, 0, 0])];
+        let module_mp = vec![2u8, 0, 0, 0];
+        let pending = {
+            let thread = sched.threads.front_mut().expect("thread");
+            thread.frames.alloc_pending(64).expect("alloc_pending")
+        };
+        {
+            let thread = sched.threads.front_mut().expect("thread");
+            thread.current_loaded_module = Some(0);
+            thread.caller_mp_stack = caller_mp_stack.clone();
+            thread.mp = module_mp.clone();
+            thread.src = AddrTarget::Immediate;
+            thread.imm_src = pending as i32;
+            thread.dst = AddrTarget::Immediate;
+            thread.imm_dst = 1; // spawn target pc
+            thread.next_pc = 1;
+        }
+
+        let spawn = Instruction {
+            opcode: Opcode::Spawn,
+            source: Operand::UNUSED,
+            middle: MiddleOperand::UNUSED,
+            destination: Operand::UNUSED,
+        };
+        dispatch_for_thread(&mut sched, &spawn).expect("spawn should dispatch");
+
+        let child = sched.threads.back().expect("the spawned child");
+        assert_eq!(
+            child.current_loaded_module,
+            Some(0),
+            "the child must keep executing the module its parent was in"
+        );
+        assert_eq!(
+            child.caller_mp_stack, caller_mp_stack,
+            "the child must keep the caller MP stack `spawn` gave it"
+        );
+        assert_eq!(
+            child.mp, module_mp,
+            "the child must run against the module MP its parent was using"
+        );
+        assert_eq!(
+            sched.threads.front().expect("parent").current_loaded_module,
+            Some(0),
+            "dispatch must not lose the parent's module either"
+        );
+    }
+
+    /// The preemptive worker must carry the same context across, so the two
+    /// schedulers cannot disagree about what a spawned thread holds.
+    #[test]
+    fn shared_quanta_preserves_the_spawning_threads_module_context() {
+        let mut frames = entry_frames();
+        let pending = frames.alloc_pending(64).expect("alloc_pending");
+        // The main module would halt at pc 0: only a thread that fetches from
+        // its own loaded module reaches the spawn.
+        let main = module_with_code("shared_ctx", vec![exit_instruction()]);
+        let loaded = module_with_code(
+            "shared_ctx_lib",
+            vec![
+                Instruction {
+                    opcode: Opcode::Spawn,
+                    source: imm_operand(pending as i32),
+                    middle: MiddleOperand::UNUSED,
+                    destination: imm_operand(1),
+                },
+                exit_instruction(),
+            ],
+        );
+        let mut state = shared_state(&main);
+        state.loaded_modules.push(LoadedModule {
+            module: loaded,
+            mp: Vec::new(),
+        });
+
+        let caller_mp_stack = vec![(0usize, vec![1u8, 0, 0, 0])];
+        let mut thread = vm_thread(frames, 0);
+        thread.current_loaded_module = Some(0);
+        thread.caller_mp_stack = caller_mp_stack.clone();
+        let mut spawned = Vec::new();
+
+        run_thread_quanta_shared(&mut state, &mut thread, 1, &mut spawned)
+            .expect("quanta should not error");
+
+        assert_eq!(spawned.len(), 1, "the spawned child must be handed back");
+        assert_eq!(
+            spawned[0].current_loaded_module,
+            Some(0),
+            "the child must keep executing the module its parent was in"
+        );
+        assert_eq!(
+            spawned[0].caller_mp_stack, caller_mp_stack,
+            "the child must keep the caller MP stack `spawn` gave it"
+        );
+    }
+
     /// Regression: a receive from an empty channel must block the thread. The
     /// scheduler used to ignore `blocked_channel`, advancing the PC and leaving
     /// the receive destination holding stale bytes.
@@ -1026,6 +1156,7 @@ mod tests {
             gc_counter: 0,
             trace: false,
             next_thread_id: 1,
+            progress: 0,
         }
     }
 
@@ -1063,11 +1194,12 @@ mod tests {
     }
 
     /// Regression: `blocked_channel` was ignored, so a receive with no data
-    /// advanced the PC and left the destination holding stale bytes. The
-    /// preemptive pool has no protocol for waking a blocked thread, so the
-    /// operation must be reported rather than silently skipped.
+    /// advanced the PC and left the destination holding stale bytes; the fix
+    /// for that then made it a fatal error, which kills any program using a
+    /// channel for flow control (a full single-slot channel is back-pressure,
+    /// not a fault). The thread must park and re-execute the operation.
     #[test]
-    fn shared_quanta_reports_a_blocking_channel_operation() {
+    fn shared_quanta_parks_a_blocking_channel_operation() {
         let module = recv_module("shared_block");
         let mut state = shared_state(&module);
         let chan = state.heap.alloc(
@@ -1083,15 +1215,114 @@ mod tests {
         memory::write_word(&mut thread.frames.data, fp + 8, 0x5eed); // stale value
         let mut spawned = Vec::new();
 
-        assert!(
-            run_thread_quanta_shared(&mut state, &mut thread, 4, &mut spawned).is_err(),
-            "a blocking channel operation must be reported, not skipped"
+        let executed = run_thread_quanta_shared(&mut state, &mut thread, 4, &mut spawned)
+            .expect("a blocking channel operation must not kill the VM");
+
+        assert_eq!(executed, 0, "the blocking instruction did not retire");
+        assert_eq!(
+            thread.state,
+            ThreadState::Blocked(chan),
+            "a receive with no data must park the thread"
         );
+        assert_eq!(thread.pc, 0, "a parked receive must re-execute when woken");
         assert_eq!(
             memory::read_word(&thread.frames.data, fp + 8),
             0x5eed,
             "a blocked receive must not pretend to have delivered a value"
         );
+    }
+
+    /// A single-slot channel that already holds a payload makes `send` block.
+    /// That is ordinary producer/consumer back-pressure: the pool must run the
+    /// consumer and let the producer retry, not abort the program.
+    #[test]
+    fn preemptive_run_survives_channel_back_pressure() {
+        const MESSAGES: usize = 8;
+        // Producer: MESSAGES sends through a one-slot channel, then exit.
+        // Consumer: MESSAGES receives, then exit. Every send but the first
+        // meets back-pressure, and every receive but the first an empty
+        // channel, so both threads park and retry repeatedly.
+        let mut code: Vec<Instruction> = (0..MESSAGES)
+            .map(|_| Instruction {
+                opcode: Opcode::Send,
+                source: fp_operand(4),
+                middle: MiddleOperand::UNUSED,
+                destination: fp_operand(0),
+            })
+            .collect();
+        code.push(exit_instruction());
+        let consumer_pc = code.len();
+        code.extend((0..MESSAGES).map(|_| Instruction {
+            opcode: Opcode::Recv,
+            source: fp_operand(0),
+            middle: MiddleOperand::UNUSED,
+            destination: fp_operand(8),
+        }));
+        code.push(exit_instruction());
+        let module = module_with_code("preempt_pipe", code);
+
+        let mut heap = Heap::new();
+        let chan = heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let thread_with_channel = |pc: usize| {
+            let mut thread = vm_thread(entry_frames(), pc);
+            let fp = thread.frames.current_data_offset();
+            memory::write_word(&mut thread.frames.data, fp, chan as i32);
+            memory::write_word(&mut thread.frames.data, fp + 4, 0x1234);
+            thread
+        };
+
+        let mut sched =
+            PreemptiveScheduler::new(&module, heap, ModuleRegistry::new(), FileTable::new(), 4);
+        sched.add_thread(thread_with_channel(0));
+        sched.add_thread(thread_with_channel(consumer_pc));
+
+        sched
+            .run()
+            .expect("back-pressure must not abort the program");
+
+        let state = sched.shared.lock().unwrap_or_else(|e| e.into_inner());
+        match state.heap.get(chan).map(|obj| &obj.data) {
+            Some(HeapData::Channel { pending, .. }) => assert!(
+                pending.is_none(),
+                "both sends must have been consumed by the receiver"
+            ),
+            other => panic!("expected the channel to survive, got {other:?}"),
+        }
+    }
+
+    /// Parking a blocked thread must not hang the pool: with nothing running
+    /// and only blocked threads left, no channel operation can ever happen.
+    #[test]
+    fn preemptive_run_reports_a_deadlock_when_every_thread_is_blocked() {
+        let module = recv_module("preempt_deadlock");
+        let mut heap = Heap::new();
+        let chan = heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let mut thread = vm_thread(entry_frames(), 0);
+        let fp = thread.frames.current_data_offset();
+        memory::write_word(&mut thread.frames.data, fp, chan as i32);
+
+        let mut sched =
+            PreemptiveScheduler::new(&module, heap, ModuleRegistry::new(), FileTable::new(), 2);
+        sched.add_thread(thread);
+
+        match sched.run() {
+            Err(ExecError::ThreadFault(msg)) => {
+                assert!(msg.contains("deadlock"), "expected a deadlock fault: {msg}");
+            }
+            other => panic!("a blocked-only schedule must deadlock, got {other:?}"),
+        }
     }
 
     /// A send that fills a channel must wake the threads blocked receiving on

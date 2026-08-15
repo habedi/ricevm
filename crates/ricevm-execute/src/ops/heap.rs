@@ -11,10 +11,18 @@ const NEGATIVE_ARRAY_SIZE: &str = "negative array size";
 /// (Inferno: `acheck` -> `error(exHeap)`).
 const OUT_OF_MEMORY: &str = "out of memory: heap";
 
-/// Largest array a single `newa` may allocate. Untrusted bytecode can ask for
-/// `i32::MAX` elements of an arbitrarily large type, which would abort the
-/// process long before the request could be honoured.
-const MAX_ARRAY_BYTES: usize = 1 << 31;
+/// Largest array a single allocation may produce, shared by `newa` here and
+/// by the module data section in `data.rs` so the run-time and load-time
+/// limits cannot drift apart.
+///
+/// This is a per-request cap, not a memory budget: it does not promise the
+/// host can satisfy a request of this size, and a program making many
+/// requests can still exhaust memory. What it does guarantee is that a single
+/// hostile length from untrusted bytecode — `i32::MAX` elements of a large
+/// type — is turned into a Dis `exHeap` exception the program can handle,
+/// rather than an allocation the process has no chance of serving. 64 MiB is
+/// far above any array a real Limbo program builds in one go.
+pub(crate) const MAX_ARRAY_BYTES: usize = 64 * 1024 * 1024;
 
 /// new src, dst:allocate a record of the type given by src (type index)
 pub(crate) fn op_new(vm: &mut VmState<'_>) -> Result<(), ExecError> {
@@ -351,6 +359,38 @@ mod tests {
         memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
 
         let err = op_newa(&mut vm).expect_err("oversized array must be rejected");
+        assert!(
+            err.to_string().contains("out of memory"),
+            "expected out of memory, got: {err}"
+        );
+    }
+
+    #[test]
+    fn array_cap_is_the_agreed_limit() {
+        // One limit, one definition. Module data (`data.rs`) allocates
+        // arrays against this same constant, so neither path can hand out
+        // an array the other would refuse.
+        assert_eq!(MAX_ARRAY_BYTES, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn op_newa_respects_the_same_cap_as_the_data_section() {
+        // Just over the cap: small enough that the old 2 GiB limit let it
+        // through, so `newa` used to hand out an array 32x larger than the
+        // identical request made through the module data section.
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fp = vm.frames.current_data_offset();
+
+        let over_cap: i32 = 64 * 1024 * 1024 / 16 + 1;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = over_cap;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 1; // element type index 1 (size 16)
+        vm.dst = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+
+        let err = op_newa(&mut vm).expect_err("an array over the cap must be rejected");
         assert!(
             err.to_string().contains("out of memory"),
             "expected out of memory, got: {err}"

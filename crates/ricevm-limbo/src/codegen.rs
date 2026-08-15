@@ -487,6 +487,25 @@ impl CodeGen {
             self.gen_func(func)?;
         }
 
+        // `gen_func` emits the deferred module-level initialisers into the
+        // entry function. A module with no `init` has no entry function —
+        // and nothing else is guaranteed to run before its exported
+        // functions — so there is nowhere to put them. Say so instead of
+        // leaving the variables silently zero at run time.
+        if !self.pending_global_inits.is_empty() {
+            let names: Vec<&str> = self
+                .pending_global_inits
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            return Err(format!(
+                "module `{}` has no `init` function, so the module-level initialiser(s) for `{}` \
+                 would never run: add an `init` function, or use a constant initialiser",
+                self.module_name,
+                names.join("`, `")
+            ));
+        }
+
         // Patch any forward-referenced Call/Spawn destinations now that
         // every function's entry PC is known.
         let fixups = std::mem::take(&mut self.pending_call_fixups);
@@ -523,6 +542,18 @@ impl CodeGen {
             .copied()
             .max()
             .unwrap_or(self.frame_size);
+
+        // Nothing may leave `compile` with initialisers still queued: every
+        // one of them is either emitted into the entry function or reported
+        // above. Silently dropping them is the failure mode this guards.
+        debug_assert!(
+            self.pending_global_inits.is_empty(),
+            "module-level initialisers were dropped: {:?}",
+            self.pending_global_inits
+                .iter()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>()
+        );
 
         Ok(Module {
             header: Header {
@@ -3939,6 +3970,51 @@ init(nil: ref Draw->Context, nil: list of string)
         assert!(
             writes_mp,
             "assigning a module-level variable should store into MP"
+        );
+    }
+
+    #[test]
+    fn module_without_init_rejects_non_constant_global_initialiser() {
+        // A library module: exported helpers, no `init`. The initialiser for
+        // `table` cannot be folded, so it needs generated code to run — and
+        // there is no entry function to put that code in. Silently leaving
+        // `table` zero at run time is the one outcome that is not allowed.
+        let src = r#"
+implement Test;
+table := array[4] of int;
+helper(): int
+{
+    return 1;
+}
+"#;
+        let err = compile_src(src)
+            .expect_err("a global initialiser with nowhere to run must be a compile error");
+        assert!(
+            err.contains("table"),
+            "the error must name the dropped initialiser, got: {err}"
+        );
+    }
+
+    #[test]
+    fn module_with_init_still_runs_non_constant_global_initialisers() {
+        // The counterpart to the check above: when there *is* an entry
+        // function, the deferred initialiser is emitted into it.
+        let src = r#"
+implement Test;
+table := array[4] of int;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := 1;
+}
+"#;
+        let module = compile_src(src).expect("module with init should compile");
+        let stores_to_mp = module
+            .code
+            .iter()
+            .any(|i| i.destination.mode == AddressMode::OffsetIndirectMp);
+        assert!(
+            stores_to_mp,
+            "the deferred initialiser for `table` must be emitted into `init`"
         );
     }
 

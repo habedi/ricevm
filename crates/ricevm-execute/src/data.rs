@@ -4,11 +4,11 @@ use ricevm_core::DataItem;
 
 use crate::heap::{Heap, HeapData};
 use crate::memory;
-
-/// Upper bound on the byte size of an array allocated from module data.
-/// Module data comes from an untrusted `.dis` file, so a hostile length
-/// must not be able to exhaust memory at load time.
-const MAX_ARRAY_BYTES: usize = 64 * 1024 * 1024;
+// Arrays built from module data are bounded by the same limit as arrays
+// allocated at run time by `newa`. Sharing the definition is the point: a
+// module must not be able to obtain through its data section an array that
+// `newa` would refuse it.
+use crate::ops::heap::MAX_ARRAY_BYTES;
 
 /// Initialize the module data pointer (MP) memory from DataItem entries.
 ///
@@ -86,11 +86,16 @@ pub(crate) fn init_mp_with_types(
                 let Some(off) = checked_offset(*offset) else {
                     continue;
                 };
+                // Check the destination slot *before* allocating. An object
+                // whose id has nowhere to be stored is referenced by nothing,
+                // yet is born with ref_count 1 and so survives every GC pass
+                // for the VM's lifetime.
+                if !word_slot_fits(&mut mp, heap, &array_stack, off) {
+                    continue;
+                }
                 let id = heap.alloc(0, HeapData::Str(value.clone()));
                 let buf = active_buffer(&mut mp, heap, &array_stack);
-                if off + 4 <= buf.len() {
-                    memory::write_word(buf, off, id as i32);
-                }
+                memory::write_word(buf, off, id as i32);
             }
             DataItem::Array {
                 offset,
@@ -103,6 +108,11 @@ pub(crate) fn init_mp_with_types(
                 let Ok(len) = usize::try_from(*length) else {
                     continue;
                 };
+                // As for String: an array id with nowhere to go would pin the
+                // array on the heap forever, so validate the slot first.
+                if !word_slot_fits(&mut mp, heap, &array_stack, off) {
+                    continue;
+                }
                 let et = *element_type as usize;
                 // Look up element size from type descriptors; default to 4.
                 let elem_size = types.get(et).map(|td| td.size as usize).unwrap_or(4).max(1);
@@ -122,9 +132,7 @@ pub(crate) fn init_mp_with_types(
                     },
                 );
                 let buf = active_buffer(&mut mp, heap, &array_stack);
-                if off + 4 <= buf.len() {
-                    memory::write_word(buf, off, arr_id as i32);
-                }
+                memory::write_word(buf, off, arr_id as i32);
             }
             DataItem::SetArray { offset, index } => {
                 let Some(off) = checked_offset(*offset) else {
@@ -186,6 +194,22 @@ fn checked_offset(offset: ricevm_core::Word) -> Option<usize> {
 /// Byte position of element `index` of `size` bytes at `base`, if it does not overflow.
 fn element_pos(base: usize, index: usize, size: usize) -> Option<usize> {
     index.checked_mul(size).and_then(|d| base.checked_add(d))
+}
+
+/// Whether a 4-byte word written at `off` would land inside the buffer that
+/// is currently active. Callers that allocate a heap object and store its id
+/// must ask this *first*: an object whose id cannot be stored is unreachable
+/// but never freed.
+fn word_slot_fits(
+    mp: &mut Vec<u8>,
+    heap: &mut Heap,
+    array_stack: &[(u32, usize, usize)],
+    off: usize,
+) -> bool {
+    match off.checked_add(4) {
+        Some(end) => end <= active_buffer(mp, heap, array_stack).len(),
+        None => false,
+    }
 }
 
 /// Get the active write buffer: either an array element's data or the MP.
@@ -385,6 +409,72 @@ mod tests {
             mp.iter().all(|&b| b == 0),
             "negative offsets must not write into MP"
         );
+    }
+
+    #[test]
+    fn string_with_unwritable_offset_does_not_allocate() {
+        let mut heap = Heap::new();
+        // Non-negative (so `checked_offset` accepts it) but the 4-byte id
+        // does not fit in the 8-byte MP buffer. Allocating first would leave
+        // a live, unreferenced string pinned on the heap for the VM's life.
+        let items = vec![DataItem::String {
+            offset: 6,
+            value: "unreachable".to_string(),
+        }];
+        let mp = init_mp(8, &items, &mut heap);
+        assert!(
+            mp.iter().all(|&b| b == 0),
+            "an out-of-range offset must not write into MP"
+        );
+        assert_eq!(
+            heap.len(),
+            0,
+            "a string whose id has nowhere to go must not be allocated"
+        );
+    }
+
+    #[test]
+    fn array_with_unwritable_offset_does_not_allocate() {
+        let mut heap = Heap::new();
+        let items = vec![DataItem::Array {
+            offset: 6,
+            element_type: 0,
+            length: 4,
+        }];
+        let mp = init_mp(8, &items, &mut heap);
+        assert!(
+            mp.iter().all(|&b| b == 0),
+            "an out-of-range offset must not write into MP"
+        );
+        assert_eq!(
+            heap.len(),
+            0,
+            "an array whose id has nowhere to go must not be allocated"
+        );
+    }
+
+    #[test]
+    fn array_one_element_over_the_cap_is_refused() {
+        // The counterpart of `op_newa_respects_the_same_cap_as_the_data_section`
+        // in ops/heap.rs: both paths must refuse the same request, so a module
+        // cannot get through its data section what `newa` denies it, or the
+        // other way round.
+        let mut heap = Heap::new();
+        let types = vec![ricevm_core::TypeDescriptor {
+            id: 0,
+            size: 16,
+            pointer_map: ricevm_core::PointerMap { bytes: vec![] },
+            pointer_count: 0,
+        }];
+        let over_cap = MAX_ARRAY_BYTES / 16 + 1;
+        let items = vec![DataItem::Array {
+            offset: 0,
+            element_type: 0,
+            length: i32::try_from(over_cap).expect("length fits in a Word"),
+        }];
+        let mp = init_mp_with_types(8, &items, &mut heap, &types);
+        assert_eq!(memory::read_word(&mp, 0), 0);
+        assert_eq!(heap.len(), 0, "an array over the cap must not be allocated");
     }
 
     #[test]

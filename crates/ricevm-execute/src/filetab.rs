@@ -13,6 +13,15 @@ use std::sync::{Arc, Mutex};
 /// Inferno open mode bit requesting truncation of an existing file.
 const OTRUNC: i32 = 16;
 
+/// Highest descriptor number the table hands out or accepts from a guest.
+/// `dup` takes its target straight from guest memory, so an unchecked value
+/// would overflow the next-fd counter and hand out negative descriptors.
+const MAX_FD: i32 = 1 << 16;
+
+/// How long [`FileTable::read_blocking`] sleeps between polls of a host-fed
+/// handle.
+const HOST_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
 /// A file table entry that supports read, write, and seek.
 pub(crate) struct FileEntry {
     inner: Box<dyn FileOps>,
@@ -31,6 +40,13 @@ pub(crate) trait FileOps: Send {
     /// Returns None for handles that cannot be duplicated.
     fn try_clone(&self) -> Option<Box<dyn FileOps>> {
         None
+    }
+    /// Whether data for this handle arrives from the host rather than from
+    /// another VM thread. Waiting for a host-fed handle can pay off; waiting
+    /// for an in-VM one (a pipe) never can, because the writer needs the OS
+    /// thread the waiter is holding.
+    fn waits_on_host(&self) -> bool {
+        false
     }
 }
 
@@ -167,28 +183,33 @@ impl StdinFile {
     }
 }
 
-/// Take buffered stdin data, waiting for the reader thread to supply it.
+/// Take whatever buffered stdin data the reader thread has supplied.
+///
 /// Returns 0 only at real end of input, so a user typing slowly is never
-/// mistaken for EOF.
+/// mistaken for EOF, and reports `WouldBlock` rather than waiting when no input
+/// has arrived yet: every VM thread shares this OS thread, so a wait here stops
+/// the whole VM. [`FileTable::read_blocking`] does the waiting, and only when
+/// nothing else could run.
 fn read_stdin_buffer(buffer: &Arc<Mutex<StdinBuffer>>, buf: &mut [u8]) -> io::Result<usize> {
     if buf.is_empty() {
         return Ok(0);
     }
-    loop {
-        if let Ok(mut b) = buffer.lock() {
-            if !b.data.is_empty() {
-                let n = buf.len().min(b.data.len());
-                for (i, byte) in b.data.drain(..n).enumerate() {
-                    buf[i] = byte;
-                }
-                return Ok(n);
+    if let Ok(mut b) = buffer.lock() {
+        if !b.data.is_empty() {
+            let n = buf.len().min(b.data.len());
+            for (i, byte) in b.data.drain(..n).enumerate() {
+                buf[i] = byte;
             }
-            if b.eof {
-                return Ok(0);
-            }
+            return Ok(n);
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        if b.eof {
+            return Ok(0);
+        }
     }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "no input has arrived yet",
+    ))
 }
 
 impl FileOps for StdinFile {
@@ -196,6 +217,9 @@ impl FileOps for StdinFile {
         Some(Box::new(StdinFile {
             buffer: Arc::clone(&self.buffer),
         }))
+    }
+    fn waits_on_host(&self) -> bool {
+        true
     }
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         read_stdin_buffer(&self.buffer, buf)
@@ -256,20 +280,32 @@ impl FileOps for RandomFile {
 }
 
 /// In-memory read-only file for virtual device files.
-struct MemoryFile(std::io::Cursor<Vec<u8>>);
+///
+/// The cursor is shared, so `dup` gives two fds one file offset, the way a
+/// duplicated descriptor behaves. Writes are discarded: these stand in for
+/// read-only device files.
+struct MemoryFile(Arc<Mutex<std::io::Cursor<Vec<u8>>>>);
+
+impl MemoryFile {
+    fn new(data: Vec<u8>) -> Self {
+        Self(Arc::new(Mutex::new(std::io::Cursor::new(data))))
+    }
+}
 
 impl FileOps for MemoryFile {
     fn try_clone(&self) -> Option<Box<dyn FileOps>> {
-        Some(Box::new(MemoryFile(self.0.clone())))
+        Some(Box::new(MemoryFile(Arc::clone(&self.0))))
     }
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Read::read(&mut self.0, buf)
+        let mut cursor = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        Read::read(&mut *cursor, buf)
     }
     fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
         Ok(_buf.len()) // silently accept writes
     }
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.0.seek(pos)
+        let mut cursor = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        cursor.seek(pos)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -377,26 +413,28 @@ impl FileOps for AudioFile {
 struct AudioCtlFile {
     state: Arc<Mutex<AudioState>>,
     /// Read position in the status string, so a read-until-EOF loop terminates.
-    pos: usize,
+    /// Shared, so `dup`ing the fd duplicates the handle instead of forking it.
+    pos: Arc<Mutex<usize>>,
 }
 
 impl FileOps for AudioCtlFile {
     fn try_clone(&self) -> Option<Box<dyn FileOps>> {
         Some(Box::new(AudioCtlFile {
             state: Arc::clone(&self.state),
-            pos: self.pos,
+            pos: Arc::clone(&self.pos),
         }))
     }
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let status = state.status();
         let bytes = status.as_bytes();
-        if self.pos >= bytes.len() {
+        let mut pos = self.pos.lock().unwrap_or_else(|e| e.into_inner());
+        if *pos >= bytes.len() {
             return Ok(0);
         }
-        let n = buf.len().min(bytes.len() - self.pos);
-        buf[..n].copy_from_slice(&bytes[self.pos..self.pos + n]);
-        self.pos += n;
+        let n = buf.len().min(bytes.len() - *pos);
+        buf[..n].copy_from_slice(&bytes[*pos..*pos + n]);
+        *pos += n;
         Ok(n)
     }
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -404,7 +442,7 @@ impl FileOps for AudioCtlFile {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.configure(&cmd);
         // The status changed, so let it be read again from the start.
-        self.pos = 0;
+        *self.pos.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         Ok(buf.len())
     }
     fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
@@ -430,12 +468,6 @@ struct PipeState {
 /// Shared buffer for in-memory pipes.
 type PipeBuffer = Arc<Mutex<PipeState>>;
 
-/// Longest a pipe read waits for data before reporting `WouldBlock`.
-/// The cooperative scheduler runs every VM thread on one OS thread, so a pipe
-/// read can never block forever: the writer may be a thread that cannot run
-/// until this call returns.
-const PIPE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
-
 /// Read end of an in-memory pipe.
 struct PipeReader(PipeBuffer);
 
@@ -443,34 +475,32 @@ impl FileOps for PipeReader {
     fn try_clone(&self) -> Option<Box<dyn FileOps>> {
         Some(Box::new(PipeReader(Arc::clone(&self.0))))
     }
+    /// Read queued bytes, or report `WouldBlock` while the pipe is empty and a
+    /// write end is still open.
+    ///
+    /// Waiting here would be worse than useless: the writer is a VM thread that
+    /// shares this OS thread, so it cannot run until this call returns. The
+    /// caller yields to the scheduler and tries again instead.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let deadline = std::time::Instant::now() + PIPE_READ_TIMEOUT;
-        loop {
-            {
-                let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
-                if !state.data.is_empty() {
-                    let n = buf.len().min(state.data.len());
-                    for (i, b) in state.data.drain(..n).enumerate() {
-                        buf[i] = b;
-                    }
-                    return Ok(n);
-                }
-                // EOF only once every write end is closed.
-                if state.writers == 0 {
-                    return Ok(0);
-                }
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.data.is_empty() {
+            let n = buf.len().min(state.data.len());
+            for (i, b) in state.data.drain(..n).enumerate() {
+                buf[i] = b;
             }
-            if std::time::Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "pipe has no data yet",
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            return Ok(n);
         }
+        // EOF only once every write end is closed.
+        if state.writers == 0 {
+            return Ok(0);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "pipe has no data yet",
+        ))
     }
     fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
         Err(io::Error::new(
@@ -1383,6 +1413,103 @@ mod tests {
             );
         }
         assert!(String::from_utf8_lossy(&all).contains("rate 44100"));
+    }
+
+    #[test]
+    fn dup_rejects_an_out_of_range_target_fd() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/sysctl", 0).expect("open /dev/sysctl");
+        assert_eq!(
+            ft.dup(fd, i32::MAX),
+            -1,
+            "a target fd from guest memory must be validated"
+        );
+        let next = ft.open("/dev/sysctl", 0).expect("open /dev/sysctl");
+        assert!(
+            next > 2,
+            "a rejected dup must not corrupt fd allocation, got {next}"
+        );
+    }
+
+    #[test]
+    fn dup_shares_the_read_offset_of_a_virtual_file() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/sysctl", 0).expect("open /dev/sysctl");
+        let mut buf = [0u8; 4];
+        let n = ft.read(fd, &mut buf).expect("read");
+        assert_eq!(&buf[..n], b"Rice");
+
+        let dup_fd = ft.dup(fd, -1);
+        let n = ft.read(dup_fd, &mut buf).expect("read from dup'd fd");
+        assert_eq!(
+            &buf[..n],
+            b"VM",
+            "a dup'd fd must share the original's file offset"
+        );
+    }
+
+    #[test]
+    fn dup_shares_the_read_position_of_audioctl() {
+        let mut ft = FileTable::new();
+        let fd = ft.open("/dev/audioctl", 0).expect("open /dev/audioctl");
+        let mut buf = [0u8; 4];
+        let first = ft.read(fd, &mut buf).expect("audioctl read");
+        assert_eq!(first, 4);
+        let head = buf;
+
+        let dup_fd = ft.dup(fd, -1);
+        let n = ft.read(dup_fd, &mut buf).expect("read from dup'd fd");
+        assert!(
+            n == 0 || buf[..n] != head[..n],
+            "a dup'd fd must continue where the original stopped"
+        );
+    }
+
+    #[test]
+    fn resolve_path_confines_relative_paths_to_the_root() {
+        let ft = FileTable::with_root("/host/inferno".to_string());
+        assert_eq!(
+            ft.resolve_path("../../etc/passwd"),
+            "/host/inferno/etc/passwd",
+            "a relative guest path must stay inside the root"
+        );
+        assert_eq!(ft.resolve_path("sub/file"), "/host/inferno/sub/file");
+        assert_eq!(ft.resolve_path("."), "/host/inferno");
+    }
+
+    #[test]
+    fn pipe_read_reports_would_block_without_waiting() {
+        let mut ft = FileTable::new();
+        let (read_fd, _write_fd) = ft.pipe();
+        let mut buf = [0u8; 8];
+
+        let start = std::time::Instant::now();
+        let err = ft
+            .read(read_fd, &mut buf)
+            .expect_err("an empty pipe with an open writer must not report EOF");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "the writer shares this OS thread, so waiting for it can never help"
+        );
+    }
+
+    #[test]
+    fn stdin_poll_reports_would_block_when_no_input_has_arrived() {
+        let buffer = Arc::new(Mutex::new(StdinBuffer {
+            data: VecDeque::new(),
+            eof: false,
+        }));
+        let mut buf = [0u8; 8];
+
+        let start = std::time::Instant::now();
+        let err = read_stdin_buffer(&buffer, &mut buf, ReadWait::Poll)
+            .expect_err("a poll with no input yet must not report EOF");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "a poll must return at once so other VM threads can run"
+        );
     }
 
     #[test]

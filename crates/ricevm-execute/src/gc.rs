@@ -68,81 +68,64 @@ pub(crate) fn collect(
     heap.sweep(&marked);
 }
 
-/// Scan a byte buffer for potential heap references (word-aligned HeapIds).
+/// Scan a byte buffer for potential heap references (word-aligned HeapIds)
+/// and mark everything reachable from them.
 fn scan_buffer(buf: &[u8], heap: &Heap, marked: &mut HashSet<HeapId>) {
-    // Scan every word-aligned position for potential HeapIds
+    let mut worklist = Vec::new();
+    collect_ids(buf, heap, &mut worklist);
+    mark_all(worklist, heap, marked);
+}
+
+/// Mark every object named by a heap reference table entry.
+fn scan_heap_refs(refs: &[(HeapId, usize)], heap: &Heap, marked: &mut HashSet<HeapId>) {
+    let worklist = refs.iter().map(|&(id, _)| id).collect();
+    mark_all(worklist, heap, marked);
+}
+
+/// Push every word-aligned value in `buf` that names a live heap object.
+fn collect_ids(buf: &[u8], heap: &Heap, out: &mut Vec<HeapId>) {
     let mut offset = 0;
     while offset + 4 <= buf.len() {
         let word = memory::read_word(buf, offset) as u32;
-        if word != NIL && heap.contains(word) && !marked.contains(&word) {
-            mark_object(word, heap, marked);
+        if word != NIL && heap.contains(word) {
+            out.push(word);
         }
         offset += 4;
     }
 }
 
-/// Mark every object named by a heap reference table entry.
-fn scan_heap_refs(refs: &[(HeapId, usize)], heap: &Heap, marked: &mut HashSet<HeapId>) {
-    for &(id, _) in refs {
-        if id != NIL && heap.contains(id) {
-            mark_object(id, heap, marked);
+/// Mark everything reachable from `worklist`.
+///
+/// Iterative, with the worklist on the heap: a guest list is as long as the
+/// guest makes it, and the periodic collection (vm.rs) can fire while one is
+/// live. Recursing per list node or per record field would overflow the native
+/// stack, which aborts the process rather than raising a catchable error.
+fn mark_all(mut worklist: Vec<HeapId>, heap: &Heap, marked: &mut HashSet<HeapId>) {
+    while let Some(id) = worklist.pop() {
+        if id == NIL || !marked.insert(id) {
+            continue;
         }
-    }
-}
-
-/// Recursively mark an object and everything it references.
-fn mark_object(id: HeapId, heap: &Heap, marked: &mut HashSet<HeapId>) {
-    if id == NIL || marked.contains(&id) {
-        return;
-    }
-    marked.insert(id);
-
-    // Scan the object's data for more heap references
-    if let Some(obj) = heap.get(id) {
+        let Some(obj) = heap.get(id) else { continue };
         match &obj.data {
             HeapData::Record(data) | HeapData::Array { data, .. } | HeapData::Adt { data, .. } => {
-                // Scan the data buffer for potential HeapIds
-                let mut offset = 0;
-                while offset + 4 <= data.len() {
-                    let word = memory::read_word(data, offset) as u32;
-                    if word != NIL && heap.contains(word) {
-                        mark_object(word, heap, marked);
-                    }
-                    offset += 4;
-                }
+                collect_ids(data, heap, &mut worklist);
             }
             HeapData::List { head, tail } => {
-                // Scan head buffer
-                let mut offset = 0;
-                while offset + 4 <= head.len() {
-                    let word = memory::read_word(head, offset) as u32;
-                    if word != NIL && heap.contains(word) {
-                        mark_object(word, heap, marked);
-                    }
-                    offset += 4;
-                }
-                // Follow tail
-                mark_object(*tail, heap, marked);
+                collect_ids(head, heap, &mut worklist);
+                worklist.push(*tail);
             }
             HeapData::ArraySlice { parent_id, .. } => {
-                mark_object(*parent_id, heap, marked);
+                worklist.push(*parent_id);
             }
+            // A value in transit through a channel is only referenced by the
+            // channel's payload buffer; scan it so it is not swept.
             HeapData::Channel { pending, .. } => {
-                // A value in transit through a channel is only referenced by
-                // the channel's payload buffer; scan it so it is not swept.
                 if let Some(pending) = pending {
-                    let mut offset = 0;
-                    while offset + 4 <= pending.len() {
-                        let word = memory::read_word(pending, offset) as u32;
-                        if word != NIL && heap.contains(word) {
-                            mark_object(word, heap, marked);
-                        }
-                        offset += 4;
-                    }
+                    collect_ids(pending, heap, &mut worklist);
                 }
             }
-            HeapData::Str(_) => {}
-            HeapData::ModuleRef { .. }
+            HeapData::Str(_)
+            | HeapData::ModuleRef { .. }
             | HeapData::MainModule { .. }
             | HeapData::LoadedModule { .. } => {}
         }
@@ -442,6 +425,58 @@ mod tests {
             heap.get(str_id).is_some(),
             "a value in transit through a channel must survive GC"
         );
+    }
+
+    /// A guest list is as long as the guest cares to make it, and the periodic
+    /// collection (vm.rs, every 10,000 instructions) can fire while one is
+    /// live. Marking must not recurse per node: a native stack overflow aborts
+    /// the process instead of surfacing as a catchable error.
+    ///
+    /// The chain is marked on a thread with a deliberately small stack so the
+    /// test does not depend on the harness's stack size.
+    #[test]
+    fn gc_marks_a_long_list_without_overflowing_the_stack() {
+        const NODES: usize = 100_000;
+
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(|| {
+                let mut heap = Heap::new();
+                let mut tail = NIL;
+                for _ in 0..NODES {
+                    tail = heap.alloc(
+                        0,
+                        HeapData::List {
+                            head: vec![0u8; 4],
+                            tail,
+                        },
+                    );
+                }
+
+                let mut frames = FrameStack::new();
+                frames.push_entry(16, -1);
+                let off = frames.current_data_offset();
+                memory::write_word(&mut frames.data, off, tail as i32);
+
+                collect(
+                    &mut heap,
+                    &frames,
+                    &[],
+                    &[],
+                    &std::collections::VecDeque::new(),
+                    &[],
+                    &[],
+                );
+
+                assert_eq!(
+                    heap.len(),
+                    NODES,
+                    "every node of a rooted list must be marked and survive"
+                );
+            })
+            .expect("spawn marking thread")
+            .join()
+            .expect("marking a long list must not overflow the stack");
     }
 
     #[test]

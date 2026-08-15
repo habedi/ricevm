@@ -396,6 +396,108 @@ pub(crate) fn op_mframe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(pending_data_offset as i32)
 }
 
+/// Run `entry_pc` on a nested interpreter loop over another module's code.
+/// `module_idx` selects a loaded module, `None` the main module.
+///
+/// The loop returns when the callee's frame is popped, when the callee halts,
+/// or with the first error it hits. Every module-context change this makes --
+/// the swapped MP, the caller MP stack entry, the current module, the pc and
+/// the unwind floor -- is undone on ALL exit paths. Restoring only on success
+/// leaves the caller running against the callee's (mem::take'd, hence empty) MP
+/// and the callee's handler table, which corrupts every later call into that
+/// module: exception unwinding then resumes the caller with the callee's
+/// module context still installed.
+fn run_nested_module_call(
+    vm: &mut VmState<'_>,
+    module_idx: Option<usize>,
+    entry_pc: usize,
+    call_frame_base: usize,
+) -> Result<(), ExecError> {
+    let saved_pc = vm.pc;
+    let saved_next_pc = vm.next_pc;
+    let saved_loaded_module = vm.current_loaded_module;
+    // An exception raised in the callee must not unwind into the caller's
+    // frames: their handler table belongs to another module, and this loop --
+    // not the caller -- decides where execution resumes.
+    let saved_unwind_floor = std::mem::replace(&mut vm.unwind_floor, vm.frames.current_base);
+
+    if let Some(idx) = module_idx {
+        // Swap in the loaded module's persistent MP so module refs stored
+        // during execution persist for subsequent calls, and push the caller's
+        // MP so cross-module virtual addresses can still resolve to it.
+        let caller_virt_idx = vm.current_module_virt_idx();
+        let loaded_mp = std::mem::take(&mut vm.loaded_modules[idx].mp);
+        let parent_mp = std::mem::replace(&mut vm.mp, loaded_mp);
+        vm.caller_mp_stack.push((caller_virt_idx, parent_mp));
+        vm.current_loaded_module = Some(idx);
+    }
+    vm.pc = entry_pc;
+    vm.halted = false;
+
+    let nested = nested_interpreter_loop(vm, module_idx, call_frame_base);
+
+    vm.unwind_floor = saved_unwind_floor;
+    if let Some(idx) = module_idx {
+        // Write the loaded module's MP back (preserving any changes), then
+        // restore the caller's MP from the stack.
+        let (_, parent_mp) = vm.caller_mp_stack.pop().unwrap_or_default();
+        vm.loaded_modules[idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
+    }
+    vm.pc = saved_pc;
+    vm.next_pc = saved_next_pc;
+    vm.current_loaded_module = saved_loaded_module;
+    vm.halted = false;
+
+    nested
+}
+
+/// The instruction loop of [`run_nested_module_call`]. Errors propagate to that
+/// function, which restores the caller's context before returning them.
+fn nested_interpreter_loop(
+    vm: &mut VmState<'_>,
+    module_idx: Option<usize>,
+    call_frame_base: usize,
+) -> Result<(), ExecError> {
+    let code_len = match module_idx {
+        Some(idx) => vm.loaded_modules[idx].module.code.len(),
+        None => vm.module.code.len(),
+    };
+    while !vm.halted && vm.pc < code_len {
+        let inst = match module_idx {
+            Some(idx) => vm.loaded_modules[idx].module.code[vm.pc].clone(),
+            None => vm.module.code[vm.pc].clone(),
+        };
+        if vm.trace {
+            vm.trace_instruction(&inst);
+        }
+        vm.resolve_operands(&inst)?;
+        vm.next_pc = vm.pc + 1;
+        crate::ops::dispatch(vm, &inst)?;
+        // A channel operation cannot suspend this thread while the callee runs
+        // on the host stack.
+        vm.fault_on_nested_block()?;
+        vm.pc = vm.next_pc;
+
+        // If Ret popped the call's frame (the current frame's data area is now
+        // below where we started), the function returned.
+        if vm.frames.current_data_offset() < call_frame_base {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Enter a loaded module for a nested call, restoring the caller's module
+/// context on every exit path. Shared by `mcall` and `mspawn`.
+pub(crate) fn call_loaded_module(
+    vm: &mut VmState<'_>,
+    module_idx: usize,
+    entry_pc: usize,
+    call_frame_base: usize,
+) -> Result<(), ExecError> {
+    run_nested_module_call(vm, Some(module_idx), entry_pc, call_frame_base)
+}
+
 /// mcall src, mid, dst:call function in loaded module
 /// src = frame pointer, mid = function index, dst = module ref pointer
 pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
@@ -464,50 +566,8 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 )));
             };
 
-            let saved_pc = vm.pc;
-            let saved_next_pc = vm.next_pc;
-
-            vm.pc = entry_pc;
-            vm.halted = false;
             let mcall_frame_base = vm.frames.current_data_offset();
-            // An exception must not unwind out of this nested loop: the loop,
-            // not the caller, controls where execution resumes.
-            let saved_unwind_floor =
-                std::mem::replace(&mut vm.unwind_floor, vm.frames.current_base);
-
-            let mut nested = Ok(());
-            while !vm.halted && vm.pc < vm.module.code.len() {
-                let inst = vm.module.code[vm.pc].clone();
-                if vm.trace {
-                    vm.trace_instruction(&inst);
-                }
-                if let Err(err) = vm.resolve_operands(&inst) {
-                    nested = Err(err);
-                    break;
-                }
-                vm.next_pc = vm.pc + 1;
-                if let Err(err) = crate::ops::dispatch(vm, &inst) {
-                    nested = Err(err);
-                    break;
-                }
-                // A channel operation cannot suspend this thread while the
-                // callee runs on the host stack.
-                if let Err(err) = vm.fault_on_nested_block() {
-                    nested = Err(err);
-                    break;
-                }
-                vm.pc = vm.next_pc;
-
-                if vm.frames.current_data_offset() < mcall_frame_base {
-                    break;
-                }
-            }
-            vm.unwind_floor = saved_unwind_floor;
-            nested?;
-
-            vm.pc = saved_pc;
-            vm.next_pc = saved_next_pc;
-            vm.halted = false;
+            run_nested_module_call(vm, None, entry_pc, mcall_frame_base)?;
         }
         ModuleKind::Loaded {
             module_idx,
@@ -530,78 +590,11 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 }
             };
 
-            // Save current execution context
-            let saved_pc = vm.pc;
-            let saved_next_pc = vm.next_pc;
-            let saved_loaded_module = vm.current_loaded_module;
-
-            // Swap MP with the loaded module's persistent MP.
-            // This ensures module refs stored during execution persist
-            // in the loaded module's MP for subsequent calls.
-            let caller_virt_idx = vm.current_module_virt_idx();
-            let loaded_mp = std::mem::take(&mut vm.loaded_modules[module_idx].mp);
-            let parent_mp = std::mem::replace(&mut vm.mp, loaded_mp);
-            // Push the caller's MP onto the stack so cross-module virtual
-            // addresses can resolve to it during execution.
-            vm.caller_mp_stack.push((caller_virt_idx, parent_mp));
-
-            let loaded_code_len = vm.loaded_modules[module_idx].module.code.len();
-            vm.current_loaded_module = Some(module_idx);
-            vm.pc = entry_pc;
-            vm.halted = false;
-
             // Track the frame stack state before entering the loaded module.
             // The mcall frame was already activated above. Record the current
             // frame base so we can detect when Ret pops past it.
             let mcall_frame_base = vm.frames.current_data_offset();
-            // An exception raised in the loaded module must not unwind into
-            // the caller's frames: their handler table belongs to another
-            // module, and this loop -- not the caller -- decides where
-            // execution resumes.
-            let saved_unwind_floor =
-                std::mem::replace(&mut vm.unwind_floor, vm.frames.current_base);
-
-            // Execute the loaded module's code
-            let mut nested = Ok(());
-            while !vm.halted && vm.pc < loaded_code_len {
-                let inst = vm.loaded_modules[module_idx].module.code[vm.pc].clone();
-                if vm.trace {
-                    vm.trace_instruction(&inst);
-                }
-                if let Err(err) = vm.resolve_operands(&inst) {
-                    nested = Err(err);
-                    break;
-                }
-                vm.next_pc = vm.pc + 1;
-                if let Err(err) = crate::ops::dispatch(vm, &inst) {
-                    nested = Err(err);
-                    break;
-                }
-                // A channel operation cannot suspend this thread while the
-                // callee runs on the host stack.
-                if let Err(err) = vm.fault_on_nested_block() {
-                    nested = Err(err);
-                    break;
-                }
-                vm.pc = vm.next_pc;
-
-                // If Ret popped our mcall frame (current frame's data area
-                // is now below where we started), the function returned.
-                if vm.frames.current_data_offset() < mcall_frame_base {
-                    break;
-                }
-            }
-            vm.unwind_floor = saved_unwind_floor;
-            nested?;
-
-            // Write back the loaded module's MP (preserving any changes),
-            // then restore the parent's MP from the stack.
-            let (_, parent_mp) = vm.caller_mp_stack.pop().unwrap_or_default();
-            vm.loaded_modules[module_idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
-            vm.pc = saved_pc;
-            vm.next_pc = saved_next_pc;
-            vm.current_loaded_module = saved_loaded_module;
-            vm.halted = false;
+            call_loaded_module(vm, module_idx, entry_pc, mcall_frame_base)?;
         }
     }
 

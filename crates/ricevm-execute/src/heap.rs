@@ -151,24 +151,38 @@ impl Heap {
         )
     }
 
-    /// Collect the heap references owned by an object that is being freed.
+    /// Collect the heap references *owned* by an object that is being freed.
+    ///
+    /// Only slots whose reference was demonstrably acquired on store belong
+    /// here. Releasing anything else is a use-after-free, and the counts here
+    /// are the only thing standing between the guest and a dangling id.
+    ///
+    /// Owned, and therefore cascaded:
+    /// - `List::tail` — every cons op inc_refs the tail (ops/list.rs).
+    /// - `ArraySlice::parent_id` — `slicea` inc_refs the parent (ops/pointer.rs).
+    ///
+    /// *Not* cascaded: the raw byte buffers of `List` heads, records, arrays,
+    /// ADTs and channel payloads. Those are untyped memory, and a word inside
+    /// them that happens to name a live object is not evidence of a reference:
+    /// - `cons_bytes` copies the head block verbatim and inc_refs only the
+    ///   tail, so `l = rec :: l` puts `rec`'s pointer fields in the head with
+    ///   no reference taken on them.
+    /// - `heap_write`/`array_write`/`movm` fill records and arrays with bytes
+    ///   that were never ref counted -- a `sys->read` into an `array of byte`
+    ///   can spell out a live id by pure coincidence.
+    /// - an array of `real` would be scanned as two ids per element.
+    ///
+    /// Distinguishing genuine pointer slots needs the module's type descriptor
+    /// pointer maps, which the heap cannot reach: `HeapObject::type_id` is a
+    /// bare per-module type index (`op_new` records it without any module
+    /// identity) and list nodes carry no descriptor at all. The pointers that
+    /// buffers do own -- those stored by `movp` or by `movmp`'s pointer-map
+    /// walk -- therefore leak here; the mark-and-sweep pass in `gc.rs` is the
+    /// backstop that reclaims them, and a leak the collector can clean up is
+    /// strictly safer than a reference released twice.
     fn child_refs(&self, data: &HeapData, out: &mut Vec<HeapId>) {
-        let scan = |buf: &[u8], out: &mut Vec<HeapId>| {
-            let mut offset = 0;
-            while offset + 4 <= buf.len() {
-                let word = crate::memory::read_word(buf, offset) as HeapId;
-                if word != NIL && self.objects.contains_key(&word) {
-                    out.push(word);
-                }
-                offset += 4;
-            }
-        };
         match data {
-            HeapData::Record(data) | HeapData::Array { data, .. } | HeapData::Adt { data, .. } => {
-                scan(data, out)
-            }
-            HeapData::List { head, tail } => {
-                scan(head, out);
+            HeapData::List { tail, .. } => {
                 if *tail != NIL {
                     out.push(*tail);
                 }
@@ -178,9 +192,10 @@ impl Heap {
                     out.push(*parent_id);
                 }
             }
-            // Channel payloads are copied in by `send` without an inc_ref, so
-            // there is no reference here to release.
-            HeapData::Str(_)
+            HeapData::Record(_)
+            | HeapData::Array { .. }
+            | HeapData::Adt { .. }
+            | HeapData::Str(_)
             | HeapData::Channel { .. }
             | HeapData::ModuleRef { .. }
             | HeapData::MainModule { .. }
@@ -189,8 +204,8 @@ impl Heap {
     }
 
     /// Decrement the reference count. Frees the object if it reaches 0.
-    /// Freeing cascades: the references an object owns (list tails, record and
-    /// array fields, a slice's parent) are released too. No-op for NIL.
+    /// Freeing cascades through the references the object owns -- a list tail,
+    /// a slice's parent -- and only those; see `child_refs`. No-op for NIL.
     pub fn dec_ref(&mut self, id: HeapId) {
         if id == NIL {
             return;
@@ -878,11 +893,15 @@ mod tests {
 
         assert!(!heap.contains(node));
         assert!(!heap.contains(tail), "list tail must be released with node");
-        assert!(!heap.contains(elem), "list element must be released");
+        assert!(
+            heap.contains(elem),
+            "a cons head is copied in without a reference being taken, so \
+             freeing the node must not release what it names"
+        );
     }
 
     #[test]
-    fn dec_ref_releases_record_children() {
+    fn dec_ref_leaves_record_buffer_words_alone() {
         let mut heap = Heap::new();
         let child = heap.alloc(0, HeapData::Str("child".to_string()));
         let mut data = vec![0u8; 8];
@@ -892,7 +911,11 @@ mod tests {
         heap.dec_ref(record);
 
         assert!(!heap.contains(record));
-        assert!(!heap.contains(child), "record field must be released");
+        assert!(
+            heap.contains(child),
+            "a record's buffer is untyped memory: the heap cannot tell an \
+             owned pointer from a coincidence, so it releases neither"
+        );
     }
 
     #[test]
@@ -947,21 +970,101 @@ mod tests {
     }
 
     #[test]
+    fn dec_ref_does_not_release_a_cons_head_reference_it_never_took() {
+        let mut heap = Heap::new();
+        // A record with a `ref` field: the field holds the only reference to
+        // `inner`, taken when the pointer was stored (`move_ptr_to_dst`).
+        let inner = heap.alloc(0, HeapData::Str("still held by the guest".to_string()));
+        let mut rec_data = vec![0u8; 4];
+        crate::memory::write_word(&mut rec_data, 0, inner as i32);
+        let rec = heap.alloc(0, HeapData::Record(rec_data));
+
+        // `l = rec :: l` copies the record block into the list head byte for
+        // byte; `cons_bytes` (ops/list.rs) inc_refs the tail and nothing else.
+        let mut head = vec![0u8; 4];
+        crate::memory::write_word(&mut head, 0, inner as i32);
+        let node = heap.alloc(0, HeapData::List { head, tail: NIL });
+
+        // Overwriting `l` releases the node.
+        heap.dec_ref(node);
+
+        assert!(!heap.contains(node), "the list node itself is released");
+        assert!(
+            heap.contains(inner),
+            "dec_ref must never release a reference that was never acquired"
+        );
+        assert_eq!(
+            heap.get(inner).unwrap().ref_count,
+            1,
+            "the record's field still owns the only reference"
+        );
+        assert!(heap.contains(rec));
+    }
+
+    #[test]
+    fn dec_ref_does_not_release_array_bytes_that_look_like_ids() {
+        let mut heap = Heap::new();
+        let victim = heap.alloc(0, HeapData::Str("live object".to_string()));
+        // An `array of byte` filled by `sys->read`, whose payload happens to
+        // spell out a live heap id. No reference was ever taken on it.
+        let mut data = vec![0u8; 8];
+        crate::memory::write_word(&mut data, 0, victim as i32);
+        let buf = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data,
+                length: 8,
+            },
+        );
+
+        heap.dec_ref(buf);
+
+        assert!(!heap.contains(buf));
+        assert!(
+            heap.contains(victim),
+            "raw array bytes are data, not owned references"
+        );
+        assert_eq!(heap.get(victim).unwrap().ref_count, 1);
+    }
+
+    #[test]
     fn dec_ref_keeps_shared_children_alive() {
         let mut heap = Heap::new();
-        let child = heap.alloc(0, HeapData::Str("shared".to_string()));
-        heap.inc_ref(child); // held by two records
-        let mut data = vec![0u8; 4];
-        crate::memory::write_word(&mut data, 0, child as i32);
-        let record = heap.alloc(0, HeapData::Record(data));
+        let shared_tail = heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![0; 4],
+                tail: NIL,
+            },
+        );
+        // Two nodes cons onto the same tail; each cons takes a reference.
+        heap.inc_ref(shared_tail);
+        let first = heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![0; 4],
+                tail: shared_tail,
+            },
+        );
+        heap.inc_ref(shared_tail);
+        let _second = heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![0; 4],
+                tail: shared_tail,
+            },
+        );
 
-        heap.dec_ref(record);
+        heap.dec_ref(first);
 
+        assert!(!heap.contains(first));
         assert!(
-            heap.contains(child),
+            heap.contains(shared_tail),
             "a child with remaining references must stay alive"
         );
-        assert_eq!(heap.get(child).unwrap().ref_count, 1);
+        assert_eq!(heap.get(shared_tail).unwrap().ref_count, 2);
     }
 
     #[test]

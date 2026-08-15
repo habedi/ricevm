@@ -37,8 +37,63 @@ pub(crate) struct VmThread {
 
     pub heap_refs: Vec<(HeapId, usize)>,
     pub last_error: String,
+    /// Index of the loaded module this thread executes (None = main module).
+    pub current_loaded_module: Option<usize>,
+    /// Caller MP buffers for cross-module address resolution.
+    pub caller_mp_stack: Vec<(usize, Vec<u8>)>,
     pub id: u32,
     pub state: ThreadState,
+}
+
+impl VmThread {
+    /// Adopt a thread that a running thread spawned.
+    ///
+    /// Both schedulers build children here so neither can forget part of the
+    /// context `spawn`/`mspawn` handed over. Dropping `current_loaded_module`
+    /// makes a child spawned inside a loaded module run the MAIN module's code
+    /// at the LOADED module's entry pc, against the wrong MP.
+    fn from_suspended(id: u32, child: crate::vm::SuspendedThread) -> Self {
+        Self {
+            frames: child.frames,
+            mp: child.mp,
+            pc: child.pc,
+            next_pc: 0,
+            halted: false,
+            src: AddrTarget::None,
+            mid: AddrTarget::None,
+            dst: AddrTarget::None,
+            imm_src: 0,
+            imm_mid: 0,
+            imm_dst: 0,
+
+            heap_refs: child.heap_refs,
+            last_error: child.last_error,
+            current_loaded_module: child.current_loaded_module,
+            caller_mp_stack: child.caller_mp_stack,
+            id,
+            state: match child.blocked_on {
+                Some(chan_id) => ThreadState::Blocked(chan_id),
+                None => ThreadState::Ready,
+            },
+        }
+    }
+
+    /// A fresh thread running `pc` in the main module.
+    fn new(id: u32, frames: FrameStack, mp: Vec<u8>, pc: usize) -> Self {
+        Self::from_suspended(
+            id,
+            crate::vm::SuspendedThread {
+                frames,
+                mp,
+                pc,
+                heap_refs: Vec::new(),
+                last_error: String::new(),
+                current_loaded_module: None,
+                caller_mp_stack: Vec::new(),
+                blocked_on: None,
+            },
+        )
+    }
 }
 
 /// Thread scheduling state.
@@ -98,27 +153,33 @@ impl<'m> Scheduler<'m> {
 
     /// Spawn a new thread starting at the given PC with the given frame stack.
     pub fn spawn_thread(&mut self, frames: FrameStack, mp: Vec<u8>, pc: usize) -> u32 {
+        let id = self.next_id();
+        self.threads.push_back(VmThread::new(id, frames, mp, pc));
+        id
+    }
+
+    /// Queue a thread the running thread spawned, keeping its full context.
+    fn adopt_child(&mut self, child: crate::vm::SuspendedThread) -> u32 {
+        let id = self.next_id();
+        self.threads.push_back(VmThread::from_suspended(id, child));
+        id
+    }
+
+    fn next_id(&mut self) -> u32 {
         let id = self.next_thread_id;
         self.next_thread_id += 1;
-        self.threads.push_back(VmThread {
-            frames,
-            mp,
-            pc,
-            next_pc: 0,
-            halted: false,
-            src: AddrTarget::None,
-            mid: AddrTarget::None,
-            dst: AddrTarget::None,
-            imm_src: 0,
-            imm_mid: 0,
-            imm_dst: 0,
-
-            heap_refs: Vec::new(),
-            last_error: String::new(),
-            id,
-            state: ThreadState::Ready,
-        });
         id
+    }
+
+    /// The code of the module a thread executes.
+    fn code_of<'a>(&'a self, thread: &VmThread) -> &'a [Instruction] {
+        match thread.current_loaded_module {
+            Some(idx) => match self.loaded_modules.get(idx) {
+                Some(lm) => &lm.module.code,
+                None => &self.module.code,
+            },
+            None => &self.module.code,
+        }
     }
 
     /// Run all threads until all have halted or an error occurs.
@@ -170,12 +231,14 @@ impl<'m> Scheduler<'m> {
 
     fn run_thread_quanta(&mut self, quanta: usize) -> Result<(), ExecError> {
         for _ in 0..quanta {
-            // Check if front thread exists and is still running
-            let (pc, code_len) = match self.threads.front() {
-                Some(t) if !t.halted => (t.pc, self.module.code.len()),
+            // Check if front thread exists and is still running. A thread that
+            // entered a loaded module executes that module's code, not the
+            // main module's.
+            let (pc, inst) = match self.threads.front() {
+                Some(t) if !t.halted => (t.pc, self.code_of(t).get(t.pc).cloned()),
                 _ => break,
             };
-            if pc >= code_len {
+            let Some(inst) = inst else {
                 // Running off the end of the code ends the thread. Without
                 // halting it here `run()` would retain it, this loop would
                 // break immediately, and the outer loop would spin forever.
@@ -183,9 +246,7 @@ impl<'m> Scheduler<'m> {
                     thread.halted = true;
                 }
                 break;
-            }
-
-            let inst = self.module.code[pc].clone();
+            };
             if self.trace {
                 trace_inst(pc, &inst);
             }
@@ -234,10 +295,44 @@ impl<'m> Scheduler<'m> {
     }
 }
 
+/// The preemptive pool's run queue, plus the bookkeeping needed to tell a real
+/// deadlock ("every thread is blocked and no worker is running, so nothing can
+/// ever complete the channel operation they wait for") apart from a temporary
+/// wait ("a worker is still running and may unblock one").
+struct ThreadPool {
+    queue: VecDeque<VmThread>,
+    /// Threads handed to a worker and not yet returned.
+    running: usize,
+    /// Set once a worker reported a deadlock, so the others stop waiting.
+    shutdown: bool,
+}
+
+impl ThreadPool {
+    fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            running: 0,
+            shutdown: false,
+        }
+    }
+
+    /// Make every blocked thread runnable again. Called after a thread makes
+    /// progress: it may have filled or drained the channel they wait on, and a
+    /// thread whose channel is still not ready simply blocks again when it
+    /// re-executes the operation.
+    fn wake_blocked(&mut self) {
+        for thread in self.queue.iter_mut() {
+            if matches!(thread.state, ThreadState::Blocked(_)) {
+                thread.state = ThreadState::Ready;
+            }
+        }
+    }
+}
+
 /// Preemptive scheduler using OS threads.
 pub(crate) struct PreemptiveScheduler<'m> {
     shared: Arc<Mutex<SharedState<'m>>>,
-    threads: Arc<Mutex<VecDeque<VmThread>>>,
+    threads: Arc<Mutex<ThreadPool>>,
     condvar: Arc<Condvar>,
     pool_size: usize,
 }
@@ -263,7 +358,7 @@ impl<'m> PreemptiveScheduler<'m> {
         };
         Self {
             shared: Arc::new(Mutex::new(shared)),
-            threads: Arc::new(Mutex::new(VecDeque::new())),
+            threads: Arc::new(Mutex::new(ThreadPool::new())),
             condvar: Arc::new(Condvar::new()),
             pool_size,
         }
@@ -273,6 +368,7 @@ impl<'m> PreemptiveScheduler<'m> {
         self.threads
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .queue
             .push_back(thread);
     }
 
@@ -288,24 +384,8 @@ impl<'m> PreemptiveScheduler<'m> {
         self.threads
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push_back(VmThread {
-                frames,
-                mp,
-                pc,
-                next_pc: 0,
-                halted: false,
-                src: AddrTarget::None,
-                mid: AddrTarget::None,
-                dst: AddrTarget::None,
-                imm_src: 0,
-                imm_mid: 0,
-                imm_dst: 0,
-
-                heap_refs: Vec::new(),
-                last_error: String::new(),
-                id,
-                state: ThreadState::Ready,
-            });
+            .queue
+            .push_back(VmThread::new(id, frames, mp, pc));
         self.condvar.notify_one();
         id
     }
@@ -340,30 +420,44 @@ impl<'m> PreemptiveScheduler<'m> {
 
 fn worker_loop(
     shared: Arc<Mutex<SharedState<'_>>>,
-    threads: Arc<Mutex<VecDeque<VmThread>>>,
+    threads: Arc<Mutex<ThreadPool>>,
     condvar: Arc<Condvar>,
 ) -> Result<(), ExecError> {
     loop {
         // Pop a ready thread
         let mut thread = {
-            let mut queue = threads.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pool = threads.lock().unwrap_or_else(|e| e.into_inner());
             loop {
+                if pool.shutdown {
+                    return Ok(());
+                }
                 // Remove halted threads
-                queue.retain(|t| t.state != ThreadState::Exited);
+                pool.queue.retain(|t| t.state != ThreadState::Exited);
                 // Find a ready thread
-                if let Some(idx) = queue.iter().position(|t| t.state == ThreadState::Ready) {
-                    let Some(mut t) = queue.remove(idx) else {
+                if let Some(idx) = pool.queue.iter().position(|t| t.state == ThreadState::Ready) {
+                    let Some(mut t) = pool.queue.remove(idx) else {
                         return Ok(());
                     };
                     t.state = ThreadState::Running;
+                    pool.running += 1;
                     break t;
                 }
-                // No threads left at all? Exit.
-                if queue.is_empty() {
-                    return Ok(());
+                if pool.running == 0 {
+                    // No threads left at all? Exit.
+                    if pool.queue.is_empty() {
+                        return Ok(());
+                    }
+                    // Only blocked threads are left and no worker is running,
+                    // so nothing will ever complete the channel operation they
+                    // wait for. Stop the other workers before reporting it.
+                    pool.shutdown = true;
+                    drop(pool);
+                    condvar.notify_all();
+                    return Err(deadlock_fault());
                 }
-                // All threads are blocked; wait for a signal.
-                queue = condvar.wait(queue).unwrap_or_else(|e| e.into_inner());
+                // Something is still running and may unblock a thread or spawn
+                // one; wait to be signalled.
+                pool = condvar.wait(pool).unwrap_or_else(|e| e.into_inner());
             }
         };
 
@@ -373,17 +467,27 @@ fn worker_loop(
             let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
             run_thread_quanta_shared(&mut state, &mut thread, DEFAULT_QUANTA, &mut spawned)
         };
+        let executed = match &result {
+            Ok(executed) => *executed,
+            Err(_) => 0,
+        };
 
         // Return thread to queue, along with anything it spawned
         {
-            let mut queue = threads.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pool = threads.lock().unwrap_or_else(|e| e.into_inner());
+            pool.running -= 1;
             if thread.halted {
                 thread.state = ThreadState::Exited;
             } else if thread.state == ThreadState::Running {
                 thread.state = ThreadState::Ready;
             }
-            queue.push_back(thread);
-            queue.extend(spawned);
+            if executed > 0 {
+                // This thread ran instructions, so a channel a blocked thread
+                // waits on may have become ready.
+                pool.wake_blocked();
+            }
+            pool.queue.push_back(thread);
+            pool.queue.extend(spawned);
         }
         condvar.notify_all();
 
@@ -391,19 +495,32 @@ fn worker_loop(
     }
 }
 
+/// Run one quanta of `thread`. Returns the number of instructions it retired,
+/// which the worker uses to decide whether blocked threads are worth waking.
 fn run_thread_quanta_shared(
     state: &mut SharedState<'_>,
     thread: &mut VmThread,
     quanta: usize,
     spawned: &mut Vec<VmThread>,
-) -> Result<(), ExecError> {
+) -> Result<usize, ExecError> {
+    let mut executed = 0usize;
     for _ in 0..quanta {
-        if thread.halted || thread.pc >= state.module.code.len() {
-            thread.halted = true;
+        if thread.halted {
             break;
         }
-
-        let inst = state.module.code[thread.pc].clone();
+        // A thread that entered a loaded module executes that module's code.
+        let inst = match thread.current_loaded_module {
+            Some(idx) => state
+                .loaded_modules
+                .get(idx)
+                .and_then(|lm| lm.module.code.get(thread.pc))
+                .cloned(),
+            None => state.module.code.get(thread.pc).cloned(),
+        };
+        let Some(inst) = inst else {
+            thread.halted = true;
+            break;
+        };
         if state.trace {
             trace_inst(thread.pc, &inst);
         }
@@ -445,7 +562,7 @@ fn run_thread_quanta_shared(
             trace: state.trace,
             gc_enabled: state.gc_enabled,
             gc_counter: state.gc_counter,
-            current_loaded_module: None,
+            current_loaded_module: thread.current_loaded_module,
             root_path: String::new(),
             src: thread.src,
             mid: thread.mid,
@@ -454,7 +571,7 @@ fn run_thread_quanta_shared(
             imm_mid: thread.imm_mid,
             imm_dst: thread.imm_dst,
             last_error: std::mem::take(&mut thread.last_error),
-            caller_mp_stack: Vec::new(),
+            caller_mp_stack: std::mem::take(&mut thread.caller_mp_stack),
             blocked_channel: None,
             unwind_floor: 0,
             thread_queue: std::collections::VecDeque::new(),
@@ -482,6 +599,8 @@ fn run_thread_quanta_shared(
         thread.imm_dst = vm.imm_dst;
         thread.heap_refs = vm.heap_refs;
         thread.last_error = vm.last_error;
+        thread.current_loaded_module = vm.current_loaded_module;
+        thread.caller_mp_stack = vm.caller_mp_stack;
         state.heap = vm.heap;
         state.modules = vm.modules;
         state.loaded_modules = vm.loaded_modules;
@@ -491,41 +610,27 @@ fn run_thread_quanta_shared(
         for child in children {
             let id = state.next_thread_id;
             state.next_thread_id += 1;
-            spawned.push(VmThread {
-                frames: child.frames,
-                mp: child.mp,
-                pc: child.pc,
-                next_pc: 0,
-                halted: false,
-                src: AddrTarget::None,
-                mid: AddrTarget::None,
-                dst: AddrTarget::None,
-                imm_src: 0,
-                imm_mid: 0,
-                imm_dst: 0,
-
-                heap_refs: child.heap_refs,
-                last_error: child.last_error,
-                id,
-                state: ThreadState::Ready,
-            });
+            spawned.push(VmThread::from_suspended(id, child));
         }
 
         result?;
 
         if let Some(chan_id) = blocked_channel {
-            // Nothing in the worker pool can wake a blocked thread: there is
-            // no per-channel wakeup protocol, so parking the thread here would
-            // hang the pool. Report the operation instead of advancing past it
-            // and leaving the receive destination unwritten.
-            return Err(ExecError::Other(format!(
-                "preemptive scheduler: blocking channel operation on {chan_id} is not supported"
-            )));
+            // A recv with no data, or a send into a full single-slot channel
+            // (ordinary back-pressure), cannot complete yet. Park the thread
+            // without advancing its pc so it re-executes the operation, and
+            // let the worker pick up another thread; the worker wakes it once
+            // any thread makes progress. Advancing instead would leave a
+            // receive destination unwritten, and failing would abort every
+            // program that uses a channel for flow control.
+            thread.state = ThreadState::Blocked(chan_id);
+            return Ok(executed);
         }
 
         thread.pc = thread.next_pc;
+        executed += 1;
     }
-    Ok(())
+    Ok(executed)
 }
 
 /// Dispatch an instruction for the current front thread (cooperative mode).
@@ -575,7 +680,7 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
         trace: sched.trace,
         gc_enabled: false,
         gc_counter: 0,
-        current_loaded_module: None,
+        current_loaded_module: thread.current_loaded_module,
         root_path: String::new(),
         src: thread.src,
         mid: thread.mid,
@@ -584,7 +689,7 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
         imm_mid: thread.imm_mid,
         imm_dst: thread.imm_dst,
         last_error: std::mem::take(&mut thread.last_error),
-        caller_mp_stack: Vec::new(),
+        caller_mp_stack: std::mem::take(&mut thread.caller_mp_stack),
         blocked_channel: None,
         unwind_floor: 0,
         thread_queue,
@@ -618,6 +723,8 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
     thread.imm_dst = vm.imm_dst;
     thread.heap_refs = vm.heap_refs;
     thread.last_error = vm.last_error;
+    thread.current_loaded_module = vm.current_loaded_module;
+    thread.caller_mp_stack = vm.caller_mp_stack;
     if let Some(chan_id) = blocked_channel {
         // recv/alt found no data: the run loop keeps this thread's PC and
         // leaves it blocked until another thread makes the operation possible.
@@ -638,9 +745,10 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
     }
 
     // Keep the threads this instruction spawned; they used to be dropped with
-    // the temporary VmState.
+    // the temporary VmState. `adopt_child` carries the whole context `spawn`
+    // gave them (module, caller MPs, heap refs), not just frames/mp/pc.
     for child in spawned {
-        sched.spawn_thread(child.frames, child.mp, child.pc);
+        sched.adopt_child(child);
     }
 
     result
@@ -922,23 +1030,7 @@ mod tests {
     }
 
     fn vm_thread(frames: FrameStack, pc: usize) -> VmThread {
-        VmThread {
-            frames,
-            mp: Vec::new(),
-            pc,
-            next_pc: 0,
-            halted: false,
-            src: AddrTarget::None,
-            mid: AddrTarget::None,
-            dst: AddrTarget::None,
-            imm_src: 0,
-            imm_mid: 0,
-            imm_dst: 0,
-            heap_refs: Vec::new(),
-            last_error: String::new(),
-            id: 1,
-            state: ThreadState::Ready,
-        }
+        VmThread::new(1, frames, Vec::new(), pc)
     }
 
     /// Regression: the preemptive worker built a throwaway VmState per

@@ -649,8 +649,8 @@ mod tests {
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm init");
         let fp = vm.frames.current_data_offset();
-        crate::memory::write_real(&mut vm.frames.data, fp, 3.14);
-        crate::memory::write_real(&mut vm.frames.data, fp + 8, 3.14);
+        crate::memory::write_real(&mut vm.frames.data, fp, 3.75);
+        crate::memory::write_real(&mut vm.frames.data, fp + 8, 3.75);
         vm.src = AddrTarget::Frame(fp);
         vm.mid = AddrTarget::Frame(fp + 8);
         vm.dst = AddrTarget::Immediate;

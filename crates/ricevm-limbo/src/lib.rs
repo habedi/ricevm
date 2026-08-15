@@ -62,13 +62,15 @@ pub fn compile_with_options(
     }
     includes::process_includes(&ast, &mut symtab);
 
-    codegen::CodeGen::new().compile(&ast)
+    // The symbol table carries constants declared in included .m interfaces;
+    // codegen resolves unqualified and `Mod->NAME` constant uses through it.
+    codegen::CodeGen::new().with_symtab(symtab).compile(&ast)
 }
 
 /// Compile Limbo source code to Dis binary format.
 pub fn compile_to_bytes(src: &str, filename: &str) -> Result<Vec<u8>, String> {
     let module = compile(src, filename)?;
-    Ok(writer::write_dis(&module))
+    writer::write_dis(&module).map_err(|e| format!("{e}"))
 }
 
 /// Compile Limbo source code to Dis binary format with options.
@@ -78,5 +80,5 @@ pub fn compile_to_bytes_with_options(
     opts: &CompileOptions,
 ) -> Result<Vec<u8>, String> {
     let module = compile_with_options(src, filename, opts)?;
-    Ok(writer::write_dis(&module))
+    writer::write_dis(&module).map_err(|e| format!("{e}"))
 }

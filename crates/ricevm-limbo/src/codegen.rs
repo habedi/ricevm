@@ -8,6 +8,8 @@ use ricevm_core::{
 };
 
 use crate::ast::*;
+use crate::symtab::{ConstValue, Symbol, SymbolTable};
+use crate::token::Span;
 
 /// Value type tracking for selecting correct Dis opcodes.
 #[derive(Clone, Copy, PartialEq)]
@@ -15,6 +17,49 @@ enum ValType {
     Word,
     Ptr,   // string, list, ref, module, channel
     Array, // array types (use Lena instead of Lenc)
+}
+
+/// Where a named variable lives. Function-locals are frame-relative; module
+/// level variables live in the module's MP data area so every function in the
+/// module (and every thread) sees the same storage.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Local(i32),
+    Global(i32),
+}
+
+impl Slot {
+    /// The Dis operand that addresses this slot.
+    fn operand(self) -> Operand {
+        match self {
+            Slot::Local(off) => op_fp(off),
+            Slot::Global(off) => op_mp(off),
+        }
+    }
+}
+
+/// A folded compile-time constant value.
+#[derive(Clone, Debug, PartialEq)]
+enum ConstVal {
+    Int(i64),
+    Real(f64),
+    Str(String),
+}
+
+/// A breakable (and usually continuable) construct being generated. `break`
+/// and `continue` emit an unpatched `Jmp` and record its index here; the
+/// construct patches every recorded site once its exit and continue PCs are
+/// known — the same patch-after-the-fact pattern used for `if`/`while`.
+struct LoopFrame {
+    /// Label attached to the construct, for `break label` / `continue label`.
+    label: Option<String>,
+    /// Code indices of jumps that must land on the construct's exit.
+    breaks: Vec<usize>,
+    /// Code indices of jumps that must land on the construct's continue point.
+    continues: Vec<usize>,
+    /// `case` statements are breakable but not continuable: a `continue`
+    /// inside a case arm belongs to the enclosing loop.
+    continuable: bool,
 }
 
 /// Numeric kind: selects 4-byte word, 8-byte big, or 8-byte real slots and
@@ -145,6 +190,121 @@ fn sys_return_kind(name: &str) -> NumKind {
     }
 }
 
+/// Pick the Mov opcode that moves a whole value of the given shape: 8-byte
+/// big/real payloads use Movl/Movf, pointers use the ref-counting Movp, and
+/// everything else is a plain 4-byte Movw.
+fn mov_opcode(ty: ValType, kind: NumKind) -> Opcode {
+    match (ty, kind) {
+        (_, NumKind::Big) => Opcode::Movl,
+        (_, NumKind::Real) => Opcode::Movf,
+        (ValType::Word, NumKind::Word) => Opcode::Movw,
+        _ => Opcode::Movp,
+    }
+}
+
+impl From<&ConstValue> for ConstVal {
+    fn from(value: &ConstValue) -> Self {
+        match value {
+            ConstValue::Int(v) => ConstVal::Int(*v),
+            ConstValue::Real(v) => ConstVal::Real(*v),
+            ConstValue::String(s) => ConstVal::Str(s.clone()),
+        }
+    }
+}
+
+impl ConstVal {
+    /// The ValType a use of this constant produces.
+    fn val_type(&self) -> ValType {
+        match self {
+            ConstVal::Str(_) => ValType::Ptr,
+            _ => ValType::Word,
+        }
+    }
+
+    /// The NumKind (slot width) a use of this constant produces.
+    fn num_kind(&self) -> NumKind {
+        match self {
+            ConstVal::Real(_) => NumKind::Real,
+            ConstVal::Int(v) if *v > i32::MAX as i64 || *v < i32::MIN as i64 => NumKind::Big,
+            _ => NumKind::Word,
+        }
+    }
+}
+
+/// Supplies the value of `iota` while folding a sequence of `con`
+/// declarations: it counts up within one declaration (whose names all carry
+/// the same span) and restarts at the next declaration.
+#[derive(Default)]
+struct IotaCounter {
+    group: Option<Span>,
+    value: i64,
+}
+
+impl IotaCounter {
+    fn next(&mut self, span: Span) -> i64 {
+        if self.group != Some(span) {
+            self.group = Some(span);
+            self.value = 0;
+        }
+        let v = self.value;
+        self.value += 1;
+        v
+    }
+}
+
+/// Fold a binary operation over two constant values.
+fn fold_const_binary(lhs: &ConstVal, op: BinOp, rhs: &ConstVal) -> Result<ConstVal, String> {
+    match (lhs, rhs) {
+        (ConstVal::Str(a), ConstVal::Str(b)) if op == BinOp::Add => {
+            Ok(ConstVal::Str(format!("{a}{b}")))
+        }
+        (ConstVal::Int(a), ConstVal::Int(b)) => {
+            let (a, b) = (*a, *b);
+            let v = match op {
+                BinOp::Add => a.wrapping_add(b),
+                BinOp::Sub => a.wrapping_sub(b),
+                BinOp::Mul => a.wrapping_mul(b),
+                BinOp::Div if b == 0 => return Err("constant division by zero".to_string()),
+                BinOp::Div => a.wrapping_div(b),
+                BinOp::Mod if b == 0 => return Err("constant division by zero".to_string()),
+                BinOp::Mod => a.wrapping_rem(b),
+                BinOp::Lshift => a.wrapping_shl(b as u32),
+                BinOp::Rshift => a.wrapping_shr(b as u32),
+                BinOp::And => a & b,
+                BinOp::Or => a | b,
+                BinOp::Xor => a ^ b,
+                BinOp::Eq => (a == b) as i64,
+                BinOp::Neq => (a != b) as i64,
+                BinOp::Lt => (a < b) as i64,
+                BinOp::Gt => (a > b) as i64,
+                BinOp::Leq => (a <= b) as i64,
+                BinOp::Geq => (a >= b) as i64,
+                _ => return Err(format!("unsupported constant operator {op:?}")),
+            };
+            Ok(ConstVal::Int(v))
+        }
+        (ConstVal::Real(a), ConstVal::Real(b)) => {
+            let (a, b) = (*a, *b);
+            let v = match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div => a / b,
+                _ => return Err(format!("unsupported constant operator {op:?} on real")),
+            };
+            Ok(ConstVal::Real(v))
+        }
+        // Mixed int/real: promote the int operand.
+        (ConstVal::Int(a), ConstVal::Real(_)) => {
+            fold_const_binary(&ConstVal::Real(*a as f64), op, rhs)
+        }
+        (ConstVal::Real(_), ConstVal::Int(b)) => {
+            fold_const_binary(lhs, op, &ConstVal::Real(*b as f64))
+        }
+        _ => Err(format!("unsupported constant operator {op:?}")),
+    }
+}
+
 /// Code generation context.
 pub struct CodeGen {
     code: Vec<Instruction>,
@@ -199,6 +359,28 @@ pub struct CodeGen {
     func_frames: Vec<i32>,
     /// Exception handlers for the module.
     handlers: Vec<ricevm_core::Handler>,
+    /// Module-level variables: name -> (MP offset, ValType, NumKind). These
+    /// are shared by every function in the module, unlike frame locals.
+    globals: Vec<(String, i32, ValType, NumKind)>,
+    /// Folded module-level constants: name -> value, or the reason the value
+    /// could not be folded. Unfoldable constants are only an error if some
+    /// expression actually uses them.
+    module_consts: std::collections::HashMap<String, Result<ConstVal, String>>,
+    /// Constants declared inside a `Mod: module { ... }` block, keyed
+    /// `Mod->NAME`, so `Mod->NAME` use sites resolve.
+    qualified_consts: std::collections::HashMap<String, Result<ConstVal, String>>,
+    /// Symbols gathered from included `.m` files, when the driver supplies
+    /// them. Consulted for constants that this file does not declare itself.
+    symtab: Option<SymbolTable>,
+    /// Module-level initialisers that are not compile-time constants. They
+    /// are emitted at the top of the entry function, which runs before any
+    /// other code in the module.
+    pending_global_inits: Vec<(String, Expr)>,
+    /// Enclosing breakable constructs, innermost last.
+    loop_stack: Vec<LoopFrame>,
+    /// Label of the statement currently being generated, consumed by the next
+    /// loop/case construct so `break label` can find it.
+    pending_label: Option<String>,
 }
 
 impl Default for CodeGen {
@@ -233,7 +415,21 @@ impl CodeGen {
             local_adt_type: std::collections::HashMap::new(),
             func_tuple_ret: std::collections::HashMap::new(),
             handlers: Vec::new(),
+            globals: Vec::new(),
+            module_consts: std::collections::HashMap::new(),
+            qualified_consts: std::collections::HashMap::new(),
+            symtab: None,
+            pending_global_inits: Vec::new(),
+            loop_stack: Vec::new(),
+            pending_label: None,
         }
+    }
+
+    /// Attach the symbol table built from the file's `include` directives so
+    /// constants declared in `.m` interfaces resolve at their use sites.
+    pub fn with_symtab(mut self, symtab: SymbolTable) -> Self {
+        self.symtab = Some(symtab);
+        self
     }
 
     pub fn compile(mut self, file: &SourceFile) -> Result<Module, String> {
@@ -247,6 +443,11 @@ impl CodeGen {
         self.sys_mp_ref = self.alloc_mp(4);
         self.collect_strings(file);
         self.collect_adts(file);
+        // Module-level `con` values are folded once, up front, so use sites
+        // can resolve them to literals; module-level variables get real MP
+        // storage so every function sees the same slot.
+        self.collect_consts(file);
+        self.collect_globals(file)?;
         self.imports.push(ImportModule { functions: vec![] });
 
         // Pre-scan to count functions and allocate type indices
@@ -303,15 +504,32 @@ impl CodeGen {
         }
 
         self.build_types();
-        let entry_type = (self.types.len() as i32 - 1).max(0);
+        // The entry frame must be described by the *entry function's* type
+        // descriptor. Using the last generated function's descriptor only
+        // happened to work while every frame was sized to the cumulative
+        // maximum; with per-function frame sizes it would under- or
+        // over-allocate the entry frame.
         let entry_pc = self.exports.first().map(|e| e.pc).unwrap_or(0);
+        let entry_type = match self.exports.first() {
+            Some(e) => e.frame_type,
+            // No `init`: entry_pc falls back to 0, which is the first
+            // generated function, so use that function's descriptor.
+            None if !self.func_frames.is_empty() => 2,
+            None => 0,
+        };
+        let max_frame = self
+            .func_frames
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(self.frame_size);
 
         Ok(Module {
             header: Header {
                 magic: XMAGIC,
                 signature: vec![],
                 runtime_flags: RuntimeFlags(if self.handlers.is_empty() { 0x40 } else { 0x60 }),
-                stack_extent: (self.frame_size + 256).max(480),
+                stack_extent: (max_frame + 256).max(480),
                 code_size: self.code.len() as i32,
                 data_size: self.mp_size,
                 type_size: self.types.len() as i32,
@@ -443,6 +661,261 @@ impl CodeGen {
                 _ => {}
             }
         }
+    }
+
+    /// Fold every module-level `con` declaration into a literal value.
+    ///
+    /// Constants declared in the interface block of the module this file
+    /// implements are in scope unqualified; constants from any module block
+    /// are also recorded under `Mod->NAME` for qualified use sites.
+    ///
+    /// `iota` takes the value 0 for the first name of a `con` declaration, 1
+    /// for the second, and so on, restarting at every declaration. The parser
+    /// expands `Red, Green, Blue: con iota;` into one declaration per name,
+    /// all sharing the declaration's span, so the span identifies the group.
+    fn collect_consts(&mut self, file: &SourceFile) {
+        for decl in &file.decls {
+            let Decl::Module(m) = decl else { continue };
+            let implemented = file.implement.first() == Some(&m.name);
+            let mut iota = IotaCounter::default();
+            for member in &m.members {
+                let ModuleMember::Const(c) = member else {
+                    continue;
+                };
+                let value = self.fold_const(&c.value, iota.next(c.span));
+                self.qualified_consts
+                    .insert(format!("{}->{}", m.name, c.name), value.clone());
+                if implemented {
+                    self.module_consts.insert(c.name.clone(), value);
+                }
+            }
+        }
+
+        let mut iota = IotaCounter::default();
+        for decl in &file.decls {
+            if let Decl::Const(c) = decl {
+                let value = self.fold_const(&c.value, iota.next(c.span));
+                self.module_consts.insert(c.name.clone(), value);
+            }
+        }
+    }
+
+    /// Evaluate a constant expression. `iota` supplies the value of the
+    /// `iota` keyword for the declaration being folded.
+    fn fold_const(&self, expr: &Expr, iota: i64) -> Result<ConstVal, String> {
+        match expr {
+            Expr::IntLit(v, _) => Ok(ConstVal::Int(*v)),
+            Expr::CharLit(v, _) => Ok(ConstVal::Int(*v as i64)),
+            Expr::RealLit(v, _) => Ok(ConstVal::Real(*v)),
+            Expr::StringLit(s, _) => Ok(ConstVal::Str(s.clone())),
+            Expr::Ident(name, _) if name == "iota" => Ok(ConstVal::Int(iota)),
+            Expr::Ident(name, _) => self
+                .const_value(name)
+                .unwrap_or_else(|| Err(format!("`{name}` is not a constant"))),
+            Expr::ModQual(module, member, _) => {
+                let Expr::Ident(mod_name, _) = module.as_ref() else {
+                    return Err("unsupported qualified constant".to_string());
+                };
+                self.qualified_const_value(mod_name, member)
+                    .unwrap_or_else(|| Err(format!("`{mod_name}->{member}` is not a constant")))
+            }
+            Expr::Unary(op, inner, _) => {
+                let v = self.fold_const(inner, iota)?;
+                match (op, v) {
+                    (UnaryOp::Neg, ConstVal::Int(n)) => Ok(ConstVal::Int(-n)),
+                    (UnaryOp::Neg, ConstVal::Real(n)) => Ok(ConstVal::Real(-n)),
+                    (UnaryOp::BitNot, ConstVal::Int(n)) => Ok(ConstVal::Int(!n)),
+                    (UnaryOp::Not, ConstVal::Int(n)) => {
+                        Ok(ConstVal::Int(if n == 0 { 1 } else { 0 }))
+                    }
+                    (op, _) => Err(format!("unsupported constant operator {op:?}")),
+                }
+            }
+            Expr::Cast(ty, inner, _) => {
+                let v = self.fold_const(inner, iota)?;
+                match (ty.as_ref(), v) {
+                    (Type::Basic(BasicType::Real), ConstVal::Int(n)) => {
+                        Ok(ConstVal::Real(n as f64))
+                    }
+                    (
+                        Type::Basic(BasicType::Int | BasicType::Big | BasicType::Byte),
+                        ConstVal::Real(n),
+                    ) => Ok(ConstVal::Int(n as i64)),
+                    (Type::Basic(BasicType::String), ConstVal::Int(n)) => {
+                        Ok(ConstVal::Str(n.to_string()))
+                    }
+                    (_, v) => Ok(v),
+                }
+            }
+            Expr::Binary(lhs, op, rhs, _) => {
+                let l = self.fold_const(lhs, iota)?;
+                let r = self.fold_const(rhs, iota)?;
+                fold_const_binary(&l, *op, &r)
+            }
+            _ => Err("not a constant expression".to_string()),
+        }
+    }
+
+    /// Look up a folded constant by unqualified name, falling back to the
+    /// include-derived symbol table.
+    fn const_value(&self, name: &str) -> Option<Result<ConstVal, String>> {
+        if let Some(v) = self.module_consts.get(name) {
+            return Some(v.clone());
+        }
+        match self.symtab.as_ref()?.lookup(name) {
+            Some(Symbol::Const { value, .. }) => Some(Ok(ConstVal::from(value))),
+            _ => None,
+        }
+    }
+
+    /// Look up a folded constant by `Module->NAME`.
+    fn qualified_const_value(
+        &self,
+        module: &str,
+        member: &str,
+    ) -> Option<Result<ConstVal, String>> {
+        if let Some(v) = self.qualified_consts.get(&format!("{module}->{member}")) {
+            return Some(v.clone());
+        }
+        match self.symtab.as_ref()?.lookup_qualified(module, member) {
+            Some(Symbol::Const { value, .. }) => Some(Ok(ConstVal::from(value))),
+            _ => None,
+        }
+    }
+
+    /// Give every module-level variable MP-resident storage. Declarations in
+    /// the interface block of the implemented module count too — they are the
+    /// module's own globals.
+    fn collect_globals(&mut self, file: &SourceFile) -> Result<(), String> {
+        for decl in &file.decls {
+            match decl {
+                Decl::Var(v) => self.declare_global(v)?,
+                Decl::Module(m) if file.implement.first() == Some(&m.name) => {
+                    for member in &m.members {
+                        if let ModuleMember::Var(v) = member {
+                            self.declare_global(v)?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn declare_global(&mut self, v: &VarDecl) -> Result<(), String> {
+        let ty = self.infer_decl_type(v);
+        let kind = self.decl_num_kind(v);
+        let elem_type = decl_array_elem_type(v);
+        let chan_elem_basic = decl_chan_elem_basic(v);
+        let adt_name = v.ty.as_ref().and_then(Self::adt_name_for_type);
+        // A constant initialiser goes straight into the data section;
+        // anything else is deferred to the top of the entry function.
+        let init = match &v.init {
+            Some(e) => self.fold_const(e, 0).ok(),
+            None => None,
+        };
+        for name in &v.names {
+            if name == "nil" || self.globals.iter().any(|(n, _, _, _)| n == name) {
+                continue;
+            }
+            let off = self.alloc_mp(kind.byte_size());
+            self.globals.push((name.clone(), off, ty, kind));
+            if let Some(t) = &elem_type {
+                self.local_array_elem.insert(name.clone(), t.clone());
+            }
+            if let Some(b) = chan_elem_basic {
+                self.local_chan_elem.insert(name.clone(), b);
+            }
+            if let Some(a) = &adt_name {
+                self.local_adt_type.insert(name.clone(), a.clone());
+            }
+            if init.is_none()
+                && let Some(expr) = &v.init
+            {
+                self.pending_global_inits.push((name.clone(), expr.clone()));
+            }
+            if let Some(value) = &init {
+                let item = match (value, kind) {
+                    (ConstVal::Int(n), NumKind::Big) => DataItem::Bigs {
+                        offset: off,
+                        values: vec![*n],
+                    },
+                    (ConstVal::Int(n), _) => DataItem::Words {
+                        offset: off,
+                        values: vec![*n as i32],
+                    },
+                    (ConstVal::Real(n), _) => DataItem::Reals {
+                        offset: off,
+                        values: vec![*n],
+                    },
+                    (ConstVal::Str(s), _) => DataItem::String {
+                        offset: off,
+                        value: s.clone(),
+                    },
+                };
+                self.data.push(item);
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a name to its storage slot, preferring function locals over
+    /// module-level variables (locals shadow globals).
+    fn lookup_var(&self, name: &str) -> Option<(Slot, ValType, NumKind)> {
+        if let Some((_, off, ty, kind)) = self.locals.iter().find(|(n, _, _, _)| n == name) {
+            return Some((Slot::Local(*off), *ty, *kind));
+        }
+        self.globals
+            .iter()
+            .find(|(n, _, _, _)| n == name)
+            .map(|(_, off, ty, kind)| (Slot::Global(*off), *ty, *kind))
+    }
+
+    /// Load a 32-bit constant into `dst`. Dis operands are encoded in at most
+    /// 30 signed bits, so a wider value has to travel through the data
+    /// section rather than as an immediate.
+    fn gen_word_const_to(&mut self, v: i32, dst: i32) {
+        const OPERAND_MIN: i32 = -(1 << 29);
+        const OPERAND_MAX: i32 = (1 << 29) - 1;
+        if (OPERAND_MIN..=OPERAND_MAX).contains(&v) {
+            self.emit(Opcode::Movw, op_imm(v), mid_unused(), op_fp(dst));
+        } else {
+            let mp_off = self.alloc_mp(4);
+            self.data.push(DataItem::Words {
+                offset: mp_off,
+                values: vec![v],
+            });
+            self.emit(Opcode::Movw, op_mp(mp_off), mid_unused(), op_fp(dst));
+        }
+    }
+
+    /// Materialize a folded constant into `dst`.
+    fn gen_const_to(&mut self, value: &ConstVal, dst: i32) -> Result<(), String> {
+        match value {
+            ConstVal::Int(v) if *v > i32::MAX as i64 || *v < i32::MIN as i64 => {
+                let mp_off = self.alloc_mp(8);
+                self.data.push(DataItem::Bigs {
+                    offset: mp_off,
+                    values: vec![*v],
+                });
+                self.emit(Opcode::Movl, op_mp(mp_off), mid_unused(), op_fp(dst));
+            }
+            ConstVal::Int(v) => self.gen_word_const_to(*v as i32, dst),
+            ConstVal::Real(v) => {
+                let mp_off = self.alloc_mp(8);
+                self.data.push(DataItem::Reals {
+                    offset: mp_off,
+                    values: vec![*v],
+                });
+                self.emit(Opcode::Movf, op_mp(mp_off), mid_unused(), op_fp(dst));
+            }
+            ConstVal::Str(s) => {
+                let mp = self.intern_string(s);
+                self.emit(Opcode::Movp, op_mp(mp), mid_unused(), op_fp(dst));
+            }
+        }
+        Ok(())
     }
 
     /// Look up `(field_offset, field_type)` for `adt_name.field_name`.
@@ -615,6 +1088,9 @@ impl CodeGen {
         let entry_pc = self.code.len();
         self.locals.clear();
         self.next_local = 40;
+        // Each function gets its own frame layout; without this reset every
+        // function's descriptor would carry the running maximum frame size.
+        self.frame_size = 80;
 
         // Register parameter names at fixed offsets
         let mut param_off = 32;
@@ -651,6 +1127,15 @@ impl CodeGen {
             }
         }
         self.next_local = param_off.max(40);
+
+        // Module-level initialisers that aren't compile-time constants run
+        // first, inside the entry function: it is the module's first code.
+        if func.name.name == "init" && !self.pending_global_inits.is_empty() {
+            let inits = std::mem::take(&mut self.pending_global_inits);
+            for (name, expr) in &inits {
+                self.gen_assign_to_ident(name, expr, None)?;
+            }
+        }
 
         for stmt in &func.body.stmts {
             self.gen_stmt(stmt)?;
@@ -848,7 +1333,17 @@ impl CodeGen {
             }
             Stmt::Case(s) => self.gen_case(s),
             Stmt::Do(s) => self.gen_do(s),
-            Stmt::Label(_, inner) => self.gen_stmt(inner),
+            Stmt::Label(name, inner) => {
+                // The label belongs to the construct it prefixes; the next
+                // loop/case takes it. Clear it afterwards so it can't leak
+                // onto an unrelated later construct.
+                self.pending_label = Some(name.clone());
+                let result = self.gen_stmt(inner);
+                self.pending_label = None;
+                result
+            }
+            Stmt::Break(label, _) => self.gen_break(label.as_deref()),
+            Stmt::Continue(label, _) => self.gen_continue(label.as_deref()),
             Stmt::Spawn(e, _) => {
                 // spawn func(args) → Frame + Spawn
                 if let Expr::Call(callee, args, _) = e
@@ -913,7 +1408,74 @@ impl CodeGen {
                 self.gen_expr_discard(e)?;
                 Ok(())
             }
-            _ => Ok(()),
+            Stmt::Empty => Ok(()),
+            // Unsupported constructs are hard errors: emitting nothing at all
+            // would silently drop the statement's behavior.
+            Stmt::Alt(_) => Err("`alt` statements are not supported yet".to_string()),
+            Stmt::Pick(_) => Err("`pick` statements are not supported yet".to_string()),
+            Stmt::Raise(None, _) => Err("bare `raise` (re-raise) is not supported yet".to_string()),
+        }
+    }
+
+    /// Enter a breakable construct, taking any label that prefixed it.
+    fn push_loop(&mut self, continuable: bool) {
+        let label = self.pending_label.take();
+        self.loop_stack.push(LoopFrame {
+            label,
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            continuable,
+        });
+    }
+
+    /// Find the innermost enclosing construct a `break`/`continue` refers to.
+    fn find_loop(&self, label: Option<&str>, need_continue: bool) -> Option<usize> {
+        self.loop_stack.iter().rposition(|frame| {
+            (!need_continue || frame.continuable)
+                && match label {
+                    Some(l) => frame.label.as_deref() == Some(l),
+                    None => true,
+                }
+        })
+    }
+
+    fn gen_break(&mut self, label: Option<&str>) -> Result<(), String> {
+        let Some(idx) = self.find_loop(label, false) else {
+            return Err(match label {
+                Some(l) => format!("`break {l}`: no enclosing statement labelled `{l}`"),
+                None => "`break` outside of a loop or case statement".to_string(),
+            });
+        };
+        let jump = self.code.len();
+        self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(0));
+        self.loop_stack[idx].breaks.push(jump);
+        Ok(())
+    }
+
+    fn gen_continue(&mut self, label: Option<&str>) -> Result<(), String> {
+        let Some(idx) = self.find_loop(label, true) else {
+            return Err(match label {
+                Some(l) => format!("`continue {l}`: no enclosing loop labelled `{l}`"),
+                None => "`continue` outside of a loop".to_string(),
+            });
+        };
+        let jump = self.code.len();
+        self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(0));
+        self.loop_stack[idx].continues.push(jump);
+        Ok(())
+    }
+
+    /// Leave a breakable construct, patching its recorded `break` jumps to
+    /// `exit_pc` and its `continue` jumps to `continue_pc`.
+    fn pop_loop(&mut self, exit_pc: i32, continue_pc: i32) {
+        let Some(frame) = self.loop_stack.pop() else {
+            return;
+        };
+        for idx in frame.breaks {
+            self.code[idx].destination = op_imm(exit_pc);
+        }
+        for idx in frame.continues {
+            self.code[idx].destination = op_imm(continue_pc);
         }
     }
 
@@ -960,7 +1522,19 @@ impl CodeGen {
             }
             Expr::RealLit(_, _) => NumKind::Real,
             Expr::CharLit(_, _) => NumKind::Word,
-            Expr::Ident(name, _) => self.local_num_kind(name),
+            Expr::Ident(name, _) => match self.lookup_var(name) {
+                Some((_, _, kind)) => kind,
+                None => match self.const_value(name) {
+                    Some(Ok(v)) => v.num_kind(),
+                    _ => NumKind::Word,
+                },
+            },
+            // An assignment used as an expression has the kind of the value
+            // it stores; without this the surrounding slot is sized as Word.
+            Expr::Assign(_, rhs, _)
+            | Expr::DeclAssign(_, rhs, _)
+            | Expr::CompoundAssign(_, _, rhs, _) => self.infer_num_kind(rhs),
+            Expr::PostInc(inner, _) | Expr::PostDec(inner, _) => self.infer_num_kind(inner),
             Expr::Cast(ty, _, _) => type_num_kind(ty),
             // Unary ops preserve the inner kind (negation of big stays big).
             Expr::Unary(_, inner, _) => self.infer_num_kind(inner),
@@ -1054,10 +1628,17 @@ impl CodeGen {
         match expr {
             Expr::IntLit(_, _) | Expr::CharLit(_, _) | Expr::RealLit(_, _) => ValType::Word,
             Expr::StringLit(_, _) | Expr::Nil(_) => ValType::Ptr,
-            Expr::Ident(name, _) => self
-                .get_local(name)
-                .map(|(_, t)| t)
-                .unwrap_or(ValType::Word),
+            Expr::Ident(name, _) => match self.lookup_var(name) {
+                Some((_, ty, _)) => ty,
+                None => match self.const_value(name) {
+                    Some(Ok(v)) => v.val_type(),
+                    _ => ValType::Word,
+                },
+            },
+            Expr::Assign(_, rhs, _)
+            | Expr::DeclAssign(_, rhs, _)
+            | Expr::CompoundAssign(_, _, rhs, _) => self.infer_expr_type(rhs),
+            Expr::PostInc(inner, _) | Expr::PostDec(inner, _) => self.infer_expr_type(inner),
             Expr::Binary(lhs, op, _, _) => match op {
                 BinOp::Eq
                 | BinOp::Neq
@@ -1157,6 +1738,7 @@ impl CodeGen {
     }
 
     fn gen_while(&mut self, s: &WhileStmt) -> Result<(), String> {
+        self.push_loop(true);
         let loop_start = self.code.len() as i32;
         let cond_tmp = self.alloc_temp();
         self.gen_cond_to(&s.cond, cond_tmp)?;
@@ -1164,11 +1746,15 @@ impl CodeGen {
         self.emit(Opcode::Beqw, op_fp(cond_tmp), mid_imm(0), op_imm(0));
         self.gen_stmt(&s.body)?;
         self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(loop_start));
-        self.code[jump_idx].destination = op_imm(self.code.len() as i32);
+        let exit_pc = self.code.len() as i32;
+        self.code[jump_idx].destination = op_imm(exit_pc);
+        // `continue` re-tests the condition.
+        self.pop_loop(exit_pc, loop_start);
         Ok(())
     }
 
     fn gen_for(&mut self, s: &ForStmt) -> Result<(), String> {
+        self.push_loop(true);
         if let Some(init) = &s.init {
             self.gen_stmt(init)?;
         }
@@ -1183,19 +1769,26 @@ impl CodeGen {
             None
         };
         self.gen_stmt(&s.body)?;
+        // `continue` runs the post statement, then re-tests the condition.
+        let continue_pc = self.code.len() as i32;
         if let Some(post) = &s.post {
             self.gen_stmt(post)?;
         }
         self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(loop_start));
+        let exit_pc = self.code.len() as i32;
         if let Some(idx) = jump_idx {
-            self.code[idx].destination = op_imm(self.code.len() as i32);
+            self.code[idx].destination = op_imm(exit_pc);
         }
+        self.pop_loop(exit_pc, continue_pc);
         Ok(())
     }
 
     fn gen_do(&mut self, s: &DoStmt) -> Result<(), String> {
+        self.push_loop(true);
         let loop_start = self.code.len() as i32;
         self.gen_stmt(&s.body)?;
+        // `continue` skips the rest of the body but still tests the condition.
+        let continue_pc = self.code.len() as i32;
         let cond_tmp = self.alloc_temp();
         self.gen_cond_to(&s.cond, cond_tmp)?;
         // Branch back to start if condition is true (nonzero)
@@ -1205,10 +1798,15 @@ impl CodeGen {
             mid_imm(0),
             op_imm(loop_start),
         );
+        let exit_pc = self.code.len() as i32;
+        self.pop_loop(exit_pc, continue_pc);
         Ok(())
     }
 
     fn gen_case(&mut self, s: &CaseStmt) -> Result<(), String> {
+        // A case is breakable (a `break` in an arm leaves the case) but not
+        // continuable — `continue` belongs to the enclosing loop.
+        self.push_loop(false);
         let val_tmp = self.alloc_temp();
         self.gen_expr_to(&s.expr, val_tmp)?;
         let val_ty = self.infer_expr_type(&s.expr);
@@ -1234,20 +1832,20 @@ impl CodeGen {
                         arm_jumps.push(idx);
                     }
                     CasePattern::Range(lo, hi) => {
-                        // val >= lo && val <= hi
+                        // Matches when `lo <= val && val <= hi`.
                         let lo_tmp = self.alloc_temp();
                         let hi_tmp = self.alloc_temp();
                         self.gen_expr_to(lo, lo_tmp)?;
                         self.gen_expr_to(hi, hi_tmp)?;
-                        let idx = self.code.len();
-                        // Use Bgew val, lo and Blew val, hi
-                        self.emit(Opcode::Bltw, op_fp(val_tmp), mid_fp(lo_tmp), op_imm(0)); // skip if val < lo
-                        let skip1 = self.code.len() - 1;
-                        let idx2 = self.code.len();
-                        self.emit(Opcode::Blew, op_fp(val_tmp), mid_fp(hi_tmp), op_imm(0)); // match if val <= hi
-                        arm_jumps.push(idx2);
-                        // Patch skip1 to skip this arm
-                        let _ = (idx, skip1); // skip1 will be patched after arm body
+                        // val < lo: this pattern cannot match, so skip past
+                        // the upper-bound test to the next pattern check.
+                        let below_idx = self.code.len();
+                        self.emit(Opcode::Bltw, op_fp(val_tmp), mid_fp(lo_tmp), op_imm(0));
+                        // val <= hi: matched, jump to the arm body.
+                        let match_idx = self.code.len();
+                        self.emit(Opcode::Blew, op_fp(val_tmp), mid_fp(hi_tmp), op_imm(0));
+                        arm_jumps.push(match_idx);
+                        self.code[below_idx].destination = op_imm(self.code.len() as i32);
                     }
                     CasePattern::Wildcard => {
                         // Always matches — jump to body
@@ -1287,6 +1885,9 @@ impl CodeGen {
         for idx in end_jumps {
             self.code[idx].destination = op_imm(end_pc);
         }
+        // `break` in an arm lands here too; `continue` never targets a case,
+        // so its continue PC is unused.
+        self.pop_loop(end_pc, end_pc);
 
         Ok(())
     }
@@ -1328,12 +1929,7 @@ impl CodeGen {
         match expr {
             Expr::Assign(lhs, rhs, _) => {
                 if let Expr::Ident(name, _) = lhs.as_ref() {
-                    let ty = self.infer_expr_type(rhs);
-                    let off = self
-                        .get_local(name)
-                        .map(|(o, _)| o)
-                        .unwrap_or_else(|| self.alloc_local(name, ty, NumKind::Word));
-                    self.gen_expr_to(rhs, off)
+                    self.gen_assign_to_ident(name, rhs, None)
                 } else if let Expr::Index(arr_expr, idx_expr, _) = lhs.as_ref() {
                     // Distinguish array-element write from string-character
                     // insert by the lvalue's ValType. Strings are Ptr; arrays
@@ -1443,21 +2039,24 @@ impl CodeGen {
             }
             Expr::CompoundAssign(lhs, op, rhs, _) => {
                 if let Expr::Ident(name, _) = lhs.as_ref() {
-                    let off = self
-                        .get_local(name)
-                        .map(|(o, _)| o)
-                        .unwrap_or_else(|| self.alloc_local(name, ValType::Word, NumKind::Word));
-                    let (_, vt) = self.get_local(name).unwrap_or((off, ValType::Word));
+                    // The lvalue may be a frame local or a module-level
+                    // (MP-resident) variable; both are legal Dis destinations.
+                    let (slot, vt, kind) = match self.lookup_var(name) {
+                        Some(v) => v,
+                        None => {
+                            let off = self.alloc_local(name, ValType::Word, NumKind::Word);
+                            (Slot::Local(off), ValType::Word, NumKind::Word)
+                        }
+                    };
                     // String +=: use Addc with the same operand layout.
                     if vt == ValType::Ptr && *op == BinOp::Add {
                         let rhs_tmp = self.alloc_temp();
                         self.gen_expr_to(rhs, rhs_tmp)?;
-                        self.emit(Opcode::Addc, op_fp(rhs_tmp), mid_unused(), op_fp(off));
+                        self.emit(Opcode::Addc, op_fp(rhs_tmp), mid_unused(), slot.operand());
                         return Ok(());
                     }
                     // Numeric compound assign: dispatch by the lvalue's kind
                     // so big/real `x op= y` uses the wide opcode family.
-                    let kind = self.local_num_kind(name);
                     let rhs_tmp = self.alloc_temp_for(kind);
                     self.gen_expr_to_kind(rhs, rhs_tmp, kind)?;
                     let opcode = match (op, kind) {
@@ -1475,7 +2074,7 @@ impl CodeGen {
                         (BinOp::Div, NumKind::Real) => Opcode::Divf,
                         _ => Opcode::Addw,
                     };
-                    self.emit(opcode, op_fp(rhs_tmp), mid_unused(), op_fp(off));
+                    self.emit(opcode, op_fp(rhs_tmp), mid_unused(), slot.operand());
                     Ok(())
                 } else if let Expr::Index(arr_expr, idx_expr, _) = lhs.as_ref() {
                     // Array element compound assign: arr[i] op= val.
@@ -1612,22 +2211,8 @@ impl CodeGen {
                 }
                 Ok(())
             }
-            Expr::PostInc(inner, _) => {
-                if let Expr::Ident(name, _) = inner.as_ref()
-                    && let Some((off, _)) = self.get_local(name)
-                {
-                    self.emit_inc_dec(off, self.local_num_kind(name), true);
-                }
-                Ok(())
-            }
-            Expr::PostDec(inner, _) => {
-                if let Expr::Ident(name, _) = inner.as_ref()
-                    && let Some((off, _)) = self.get_local(name)
-                {
-                    self.emit_inc_dec(off, self.local_num_kind(name), false);
-                }
-                Ok(())
-            }
+            Expr::PostInc(inner, _) => self.gen_inc_dec(inner, true, None),
+            Expr::PostDec(inner, _) => self.gen_inc_dec(inner, false, None),
             Expr::Call(_, _, _) => self.gen_call_expr(expr),
             Expr::Send(chan_expr, val_expr, _) => {
                 // Size the value temp by the channel's element kind so the
@@ -1670,7 +2255,7 @@ impl CodeGen {
                     });
                     self.emit(Opcode::Movl, op_mp(mp_off), mid_unused(), op_fp(dst));
                 } else {
-                    self.emit(Opcode::Movw, op_imm(*v as i32), mid_unused(), op_fp(dst));
+                    self.gen_word_const_to(*v as i32, dst);
                 }
                 Ok(())
             }
@@ -1699,26 +2284,29 @@ impl CodeGen {
                 Ok(())
             }
             Expr::Ident(name, _) => {
-                if let Some((off, ty)) = self.get_local(name) {
-                    if off != dst {
-                        let kind = self.local_num_kind(name);
-                        let op = match (ty, kind) {
-                            // Big/real locals carry an 8-byte payload: use the
-                            // matching wide move regardless of the surrounding
-                            // ValType (which is Word for both).
-                            (_, NumKind::Big) => Opcode::Movl,
-                            (_, NumKind::Real) => Opcode::Movf,
-                            (ValType::Word, NumKind::Word) => Opcode::Movw,
-                            // Strings, lists, refs, channels, modules: 4-byte
-                            // pointer move with ref-counting in the VM.
-                            _ => Opcode::Movp,
-                        };
-                        self.emit(op, op_fp(off), mid_unused(), op_fp(dst));
+                // Frame local or module-level variable. Big/real values carry
+                // an 8-byte payload and use the matching wide move regardless
+                // of the surrounding ValType (Word for both); strings, lists,
+                // refs, channels and modules use the ref-counting Movp.
+                if let Some((slot, ty, kind)) = self.lookup_var(name) {
+                    if slot != Slot::Local(dst) {
+                        self.emit(
+                            mov_opcode(ty, kind),
+                            slot.operand(),
+                            mid_unused(),
+                            op_fp(dst),
+                        );
                     }
-                } else {
-                    self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
+                    return Ok(());
                 }
-                Ok(())
+                // Module-level constant: materialize its folded value.
+                if let Some(value) = self.const_value(name) {
+                    let value = value
+                        .map_err(|why| format!("constant `{name}` cannot be folded: {why}"))?;
+                    return self.gen_const_to(&value, dst);
+                }
+                // Anything else used to compile to `Movw $0` — a silent zero.
+                Err(format!("undefined identifier `{name}`"))
             }
             Expr::Binary(lhs, op, rhs, _) => {
                 // String concatenation: string + string → Addc with 3 operands
@@ -1891,25 +2479,34 @@ impl CodeGen {
                     self.emit(Opcode::Movp, op_mp(mp), mid_unused(), op_fp(dst));
                     return Ok(());
                 }
+                // Constants declared in a module interface resolve to their
+                // folded value.
+                if let Expr::Ident(mod_name, _) = module.as_ref()
+                    && let Some(Ok(value)) = self.qualified_const_value(mod_name, member)
+                {
+                    return self.gen_const_to(&value, dst);
+                }
                 self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
                 Ok(())
             }
             Expr::Call(callee, args, _) => self.gen_call_with_result(callee, args, dst),
-            Expr::DeclAssign(names, rhs, _) => {
-                let ty = self.infer_expr_type(rhs);
+            Expr::DeclAssign(names, _, _) => {
+                // Reuse the statement lowering so the local is sized by the
+                // value's kind (an 8-byte real must not land in a 4-byte
+                // slot) and the array/chan/ADT sidecars are recorded, then
+                // copy the value out to `dst`.
+                self.gen_expr_discard(expr)?;
                 let name = names.first().map(|s| s.as_str()).unwrap_or("_");
-                let off = self.alloc_local(name, ty, NumKind::Word);
-                self.gen_expr_to(rhs, off)?;
-                if off != dst {
-                    let op = if ty != ValType::Word {
-                        Opcode::Movp
-                    } else {
-                        Opcode::Movw
-                    };
-                    self.emit(op, op_fp(off), mid_unused(), op_fp(dst));
+                if let Some((off, ty)) = self.get_local(name) {
+                    let kind = self.local_num_kind(name);
+                    if off != dst {
+                        self.emit(mov_opcode(ty, kind), op_fp(off), mid_unused(), op_fp(dst));
+                    }
                 }
                 Ok(())
             }
+            Expr::PostInc(inner, _) => self.gen_inc_dec(inner, true, Some(dst)),
+            Expr::PostDec(inner, _) => self.gen_inc_dec(inner, false, Some(dst)),
             Expr::Cast(ty, inner, _) => {
                 // Type cast: for 'array of byte string_expr' → Cvtca
                 if let Type::Array(elem) = ty.as_ref()
@@ -2115,29 +2712,159 @@ impl CodeGen {
                 Ok(())
             }
             Expr::Assign(lhs, rhs, _) => {
-                self.gen_expr_to(rhs, dst)?;
                 if let Expr::Ident(name, _) = lhs.as_ref() {
-                    let ty = self.infer_expr_type(rhs);
-                    let off = self
-                        .get_local(name)
-                        .map(|(o, _)| o)
-                        .unwrap_or_else(|| self.alloc_local(name, ty, NumKind::Word));
-                    if off != dst {
-                        let op = if ty != ValType::Word {
-                            Opcode::Movp
-                        } else {
-                            Opcode::Movw
-                        };
-                        self.emit(op, op_fp(dst), mid_unused(), op_fp(off));
-                    }
+                    return self.gen_assign_to_ident(name, rhs, Some(dst));
                 }
-                Ok(())
+                self.gen_expr_to(rhs, dst)
             }
             _ => {
                 self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
                 Ok(())
             }
         }
+    }
+
+    /// Store `rhs` into the variable `name`, which may be a frame local, a
+    /// module-level variable, or (for the historical `x = expr;`-without-a-
+    /// declaration form) a local created on the spot. The new local is sized
+    /// by the value's kind so an 8-byte value never lands in a 4-byte slot.
+    /// When `dst` is `Some`, the assigned value is also left there so the
+    /// assignment can be used as an expression.
+    fn gen_assign_to_ident(
+        &mut self,
+        name: &str,
+        rhs: &Expr,
+        dst: Option<i32>,
+    ) -> Result<(), String> {
+        let (slot, ty, kind) = match self.lookup_var(name) {
+            Some(v) => v,
+            None => {
+                let ty = self.infer_expr_type(rhs);
+                let kind = self.infer_num_kind(rhs);
+                let off = self.alloc_local(name, ty, kind);
+                (Slot::Local(off), ty, kind)
+            }
+        };
+        let mov = mov_opcode(ty, kind);
+        match slot {
+            Slot::Local(off) => {
+                self.gen_expr_to_kind(rhs, off, kind)?;
+                if let Some(d) = dst
+                    && d != off
+                {
+                    self.emit(mov, op_fp(off), mid_unused(), op_fp(d));
+                }
+            }
+            Slot::Global(mp_off) => {
+                // MP destinations can't be written by every expression form,
+                // so stage the value in a frame temp and move it across.
+                let tmp = self.alloc_temp_for(kind);
+                self.gen_expr_to_kind(rhs, tmp, kind)?;
+                self.emit(mov, op_fp(tmp), mid_unused(), op_mp(mp_off));
+                if let Some(d) = dst {
+                    self.emit(mov, op_fp(tmp), mid_unused(), op_fp(d));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Generate `x++` / `x--`. When `dst` is `Some`, the *old* value is copied
+    /// there first, which is the value `y := x++` must produce.
+    ///
+    /// NOTE: the parser lowers prefix `++x` to the same `PostInc` node, so a
+    /// prefix form in value context yields the pre-increment value too;
+    /// distinguishing the two needs an AST change in the parser.
+    fn gen_inc_dec(&mut self, inner: &Expr, inc: bool, dst: Option<i32>) -> Result<(), String> {
+        // Resolve the lvalue to (target operand, read opcode, kind).
+        let (target, mov, kind) = match inner {
+            Expr::Ident(name, _) => {
+                let Some((slot, ty, kind)) = self.lookup_var(name) else {
+                    return Err(format!("undefined variable `{name}` in `++`/`--`"));
+                };
+                if let Some(d) = dst
+                    && slot == Slot::Local(d)
+                {
+                    // Value and storage share a slot; only the update is left.
+                    self.emit_inc_dec(slot.operand(), kind, inc);
+                    return Ok(());
+                }
+                (slot.operand(), mov_opcode(ty, kind), kind)
+            }
+            Expr::Index(arr, idx, _) => {
+                if self.infer_expr_type(arr) != ValType::Array {
+                    // String character: read with Indc, bump, write back with
+                    // Insc. The write-back targets the string variable itself
+                    // when there is one, so a fresh string id is not lost.
+                    let arr_slot = match arr.as_ref() {
+                        Expr::Ident(name, _) => self.lookup_var(name).map(|(slot, _, _)| slot),
+                        _ => None,
+                    };
+                    let arr_tmp = self.alloc_temp();
+                    let idx_tmp = self.alloc_temp();
+                    self.gen_expr_to(arr, arr_tmp)?;
+                    self.gen_expr_to(idx, idx_tmp)?;
+                    let val_tmp = self.alloc_temp();
+                    self.emit(
+                        Opcode::Indc,
+                        op_fp(arr_tmp),
+                        mid_fp(idx_tmp),
+                        op_fp(val_tmp),
+                    );
+                    if let Some(d) = dst {
+                        self.emit(Opcode::Movw, op_fp(val_tmp), mid_unused(), op_fp(d));
+                    }
+                    let opc = if inc { Opcode::Addw } else { Opcode::Subw };
+                    self.emit(opc, op_imm(1), mid_unused(), op_fp(val_tmp));
+                    let target = arr_slot.map(|s| s.operand()).unwrap_or(op_fp(arr_tmp));
+                    self.emit(Opcode::Insc, op_fp(val_tmp), mid_fp(idx_tmp), target);
+                    return Ok(());
+                }
+                // Install a heap ref for the element, then update in place.
+                let elem = self.array_elem_basic_for_expr(arr);
+                let kind = elem
+                    .map(|b| type_num_kind(&Type::Basic(b)))
+                    .unwrap_or(NumKind::Word);
+                let (ind_op, mov_op) = Self::array_elem_opcodes(elem);
+                let arr_tmp = self.alloc_temp();
+                let idx_tmp = self.alloc_temp();
+                self.gen_expr_to(arr, arr_tmp)?;
+                self.gen_expr_to(idx, idx_tmp)?;
+                let ref_tmp = self.alloc_temp();
+                self.emit(ind_op, op_fp(arr_tmp), mid_fp(ref_tmp), op_fp(idx_tmp));
+                (op_fp_ind(ref_tmp, 0), mov_op, kind)
+            }
+            Expr::Dot(obj, field, _) => {
+                let ref_tmp = self.alloc_temp();
+                self.gen_expr_to(obj, ref_tmp)?;
+                match self
+                    .adt_name_for_expr(obj)
+                    .and_then(|a| self.adt_field_info(&a, field))
+                {
+                    Some((off, ty)) => {
+                        let kind = type_num_kind(&ty);
+                        let mov = match &ty {
+                            Type::Basic(BasicType::Big) => Opcode::Movl,
+                            Type::Basic(BasicType::Real) => Opcode::Movf,
+                            _ => Opcode::Movw,
+                        };
+                        (op_fp_ind(ref_tmp, off), mov, kind)
+                    }
+                    None => (
+                        op_fp_ind(ref_tmp, self.estimate_field_offset(obj, field)),
+                        Opcode::Movw,
+                        NumKind::Word,
+                    ),
+                }
+            }
+            _ => return Err("`++`/`--` needs a variable, element or field".to_string()),
+        };
+        // Post-increment yields the value *before* the update.
+        if let Some(d) = dst {
+            self.emit(mov, target, mid_unused(), op_fp(d));
+        }
+        self.emit_inc_dec(target, kind, inc);
+        Ok(())
     }
 
     fn gen_binary(&mut self, lhs: &Expr, op: BinOp, rhs: &Expr, dst: i32) -> Result<(), String> {
@@ -2403,6 +3130,12 @@ impl CodeGen {
                         };
                         self.emit(op, op_fp(arg_tmp), mid_unused(), op_fp_ind(dst, field_off));
                     }
+                } else if let Expr::Ident(name, _) = inner
+                    && self.adt_layouts.contains_key(name)
+                {
+                    // `ref Adt` with no initialiser list: allocate the record
+                    // and leave its fields zeroed.
+                    self.emit(Opcode::New, op_imm(1), mid_unused(), op_fp(dst));
                 } else {
                     self.gen_expr_to(inner, dst)?;
                 }
@@ -2648,16 +3381,16 @@ impl CodeGen {
         });
     }
 
-    /// Emit an in-place increment or decrement of a local at `off`. Picks
-    /// the opcode family by `kind`: Word uses Addw/Subw with an immediate;
-    /// Big and Real materialize a kind-sized `1` in a wide temp via Cvt and
-    /// use Addl/Subl or Addf/Subf so the carry/precision of the high bytes
-    /// is preserved.
-    fn emit_inc_dec(&mut self, off: i32, kind: NumKind, inc: bool) {
+    /// Emit an in-place increment or decrement of the variable addressed by
+    /// `target` (a frame slot or an MP slot). Picks the opcode family by
+    /// `kind`: Word uses Addw/Subw with an immediate; Big and Real
+    /// materialize a kind-sized `1` in a wide temp via Cvt and use Addl/Subl
+    /// or Addf/Subf so the carry/precision of the high bytes is preserved.
+    fn emit_inc_dec(&mut self, target: Operand, kind: NumKind, inc: bool) {
         match kind {
             NumKind::Word => {
                 let opc = if inc { Opcode::Addw } else { Opcode::Subw };
-                self.emit(opc, op_imm(1), mid_unused(), op_fp(off));
+                self.emit(opc, op_imm(1), mid_unused(), target);
             }
             NumKind::Big => {
                 let z = self.alloc_temp_for(NumKind::Word);
@@ -2665,8 +3398,8 @@ impl CodeGen {
                 self.emit(Opcode::Movw, op_imm(1), mid_unused(), op_fp(z));
                 self.emit(Opcode::Cvtwl, op_fp(z), mid_unused(), op_fp(one));
                 let opc = if inc { Opcode::Addl } else { Opcode::Subl };
-                // 2-op form: dst = dst OP src, so off += one (or off -= one).
-                self.emit(opc, op_fp(one), mid_unused(), op_fp(off));
+                // 2-op form: dst = dst OP src, so target += one (or -= one).
+                self.emit(opc, op_fp(one), mid_unused(), target);
             }
             NumKind::Real => {
                 let z = self.alloc_temp_for(NumKind::Word);
@@ -2674,7 +3407,7 @@ impl CodeGen {
                 self.emit(Opcode::Movw, op_imm(1), mid_unused(), op_fp(z));
                 self.emit(Opcode::Cvtwf, op_fp(z), mid_unused(), op_fp(one));
                 let opc = if inc { Opcode::Addf } else { Opcode::Subf };
-                self.emit(opc, op_fp(one), mid_unused(), op_fp(off));
+                self.emit(opc, op_fp(one), mid_unused(), target);
             }
         }
     }
@@ -2988,6 +3721,257 @@ init(nil: ref Draw->Context, nil: list of string)
                 && i.source.register1 == 42
         });
         assert!(has_movw_42, "should have Movw $42");
+    }
+
+    // ── Unsupported constructs are diagnosed, not silently dropped ──
+
+    #[test]
+    fn alt_statement_is_a_compile_error() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    c := chan of int;
+    alt {
+    v := <-c =>
+        v = 0;
+    }
+}
+"#;
+        let err = compile_src(src).expect_err("alt must not compile to nothing");
+        assert!(err.contains("alt"), "diagnostic should mention alt: {err}");
+    }
+
+    #[test]
+    fn pick_statement_is_a_compile_error() {
+        let src = r#"
+implement Test;
+Shape: adt {
+    pick {
+    Circle => r: int;
+    Square => s: int;
+    }
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    sh: ref Shape;
+    pick x := sh {
+    Circle =>
+        x.r = 1;
+    }
+}
+"#;
+        let err = compile_src(src).expect_err("pick must not compile to nothing");
+        assert!(
+            err.contains("pick"),
+            "diagnostic should mention pick: {err}"
+        );
+    }
+
+    #[test]
+    fn break_outside_a_loop_is_a_compile_error() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    break;
+}
+"#;
+        let err = compile_src(src).expect_err("stray break must not compile to nothing");
+        assert!(
+            err.contains("break"),
+            "diagnostic should mention break: {err}"
+        );
+    }
+
+    #[test]
+    fn break_to_an_unknown_label_is_a_compile_error() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    for(;;)
+        break nowhere;
+}
+"#;
+        let err = compile_src(src).expect_err("unknown label must not compile to nothing");
+        assert!(
+            err.contains("nowhere"),
+            "diagnostic should name the label: {err}"
+        );
+    }
+
+    #[test]
+    fn undefined_identifier_is_a_compile_error() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := undefined_thing;
+}
+"#;
+        let err = compile_src(src).expect_err("unknown name must not compile to Movw $0");
+        assert!(
+            err.contains("undefined_thing"),
+            "diagnostic should name the identifier: {err}"
+        );
+    }
+
+    // ── Loops and cases patch every jump they emit ──────────────
+
+    #[test]
+    fn break_emits_a_forward_jump_past_the_loop() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    i := 0;
+    for(;;) {
+        i++;
+        break;
+    }
+    i = 1;
+}
+"#;
+        let module = compile_src(src).expect("break should compile");
+        // The `break` jump must leave the loop: it targets a PC after the
+        // loop's own backwards jump, and it is never left pointing at 0.
+        let forward_jumps: Vec<usize> = module
+            .code
+            .iter()
+            .enumerate()
+            .filter(|(idx, i)| {
+                i.opcode == Opcode::Jmp
+                    && i.destination.mode == AddressMode::Immediate
+                    && i.destination.register1 as usize > *idx
+            })
+            .map(|(idx, _)| idx)
+            .collect();
+        assert!(
+            !forward_jumps.is_empty(),
+            "break should emit a forward Jmp out of the loop"
+        );
+        assert!(
+            module.code.iter().all(|i| i.opcode != Opcode::Jmp
+                || i.destination.mode != AddressMode::Immediate
+                || i.destination.register1 != 0),
+            "no jump should be left pointing at PC 0"
+        );
+    }
+
+    #[test]
+    fn case_range_lower_bound_branch_is_patched() {
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := 0;
+    r := 0;
+    case x {
+    1 to 10 =>
+        r = 1;
+    * =>
+        r = 2;
+    }
+}
+"#;
+        let module = compile_src(src).expect("case range should compile");
+        let range_branches: Vec<_> = module
+            .code
+            .iter()
+            .enumerate()
+            .filter(|(_, i)| i.opcode == Opcode::Bltw)
+            .collect();
+        assert!(
+            !range_branches.is_empty(),
+            "a `lo to hi` pattern should emit a lower-bound branch"
+        );
+        for (idx, inst) in range_branches {
+            assert_eq!(
+                inst.destination.mode,
+                AddressMode::Immediate,
+                "range branch should have an immediate target"
+            );
+            assert!(
+                inst.destination.register1 as usize > idx,
+                "range lower-bound branch must be patched to the next pattern \
+                 check, not left pointing at PC {}",
+                inst.destination.register1
+            );
+        }
+    }
+
+    // ── Module-level constants ──────────────────────────────────
+
+    #[test]
+    fn module_constant_loads_its_value_not_zero() {
+        let src = r#"
+implement Test;
+MAX: con 100;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := MAX;
+}
+"#;
+        let module = compile_src(src).expect("module constant should compile");
+        let has_100 = module.code.iter().any(|i| {
+            i.opcode == Opcode::Movw
+                && i.source.mode == AddressMode::Immediate
+                && i.source.register1 == 100
+        });
+        assert!(has_100, "`x := MAX` should load 100, not 0");
+    }
+
+    #[test]
+    fn module_variable_gets_mp_storage() {
+        let src = r#"
+implement Test;
+counter: int;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    counter = 7;
+}
+"#;
+        let module = compile_src(src).expect("module variable should compile");
+        let writes_mp = module.code.iter().any(|i| {
+            i.opcode == Opcode::Movw && i.destination.mode == AddressMode::OffsetIndirectMp
+        });
+        assert!(
+            writes_mp,
+            "assigning a module-level variable should store into MP"
+        );
+    }
+
+    // ── Entry frame descriptor ──────────────────────────────────
+
+    #[test]
+    fn entry_type_describes_the_entry_function() {
+        // `init` is generated first, so the last function's descriptor (the
+        // old entry_type) is a different — and differently sized — type.
+        let src = r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := 1;
+}
+helper(): int
+{
+    a := 1; b := a + 1; c := b + 1; d := c + 1; e := d + 1;
+    f := e + 1; g := f + 1; h := g + 1; i := h + 1; j := i + 1;
+    return j;
+}
+"#;
+        let module = compile_src(src).expect("two functions should compile");
+        assert_eq!(module.exports.len(), 1);
+        assert_eq!(
+            module.header.entry_type, module.exports[0].frame_type,
+            "entry_type must describe the entry function's frame"
+        );
+        let entry_size = module.types[module.header.entry_type as usize].size;
+        assert!(
+            entry_size >= 40,
+            "entry frame must still hold the standard frame header and locals"
+        );
     }
 
     #[test]

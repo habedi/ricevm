@@ -37,6 +37,13 @@ fn apply_scale(val: i64, scale: i32) -> i64 {
     }
 }
 
+/// Divide without trapping: native `i64::MIN / -1` overflows and aborts even in
+/// release builds, and both operands come from untrusted bytecode. Callers
+/// already reject a zero divisor; the guard here is belt and braces.
+fn safe_div(a: i64, b: i64) -> i64 {
+    if b == 0 { 0 } else { a.wrapping_div(b) }
+}
+
 fn rounding_mask(scale: i32) -> i64 {
     if scale >= 0 || (-scale as u32) >= 63 {
         0
@@ -65,7 +72,7 @@ pub(crate) fn op_mulx0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let residual = read_stmp(vm) as i64;
     let mut z = apply_scale(x.wrapping_mul(y), scale);
     if residual != 0 {
-        z /= residual;
+        z = safe_div(z, residual);
     }
     vm.set_dst_word(z as Word)
 }
@@ -105,7 +112,7 @@ pub(crate) fn op_mulx1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     r = apply_scale(r, scale);
     r = r.wrapping_add(v);
     if a != 0 {
-        r /= a;
+        r = safe_div(r, a);
     }
     vm.set_dst_word(r as Word)
 }
@@ -121,7 +128,7 @@ pub(crate) fn op_divx(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let x = vm.mid_word()? as i64;
     let scale = read_dtmp(vm);
     let scaled_x = apply_scale(x, scale);
-    vm.set_dst_word((scaled_x / y) as Word)
+    vm.set_dst_word(safe_div(scaled_x, y) as Word)
 }
 
 /// divx0 src, mid, dst:fixed-point divide with residual
@@ -144,7 +151,7 @@ pub(crate) fn op_divx0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         x
     };
     let scaled = apply_scale(tmp, scale);
-    vm.set_dst_word((scaled / y) as Word)
+    vm.set_dst_word(safe_div(scaled, y) as Word)
 }
 
 /// divx1:fixed-point divide with rounding flags encoded in DTemp.
@@ -182,8 +189,8 @@ pub(crate) fn op_divx1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
     let mut s = b.wrapping_mul(x).wrapping_add(w);
     s = apply_scale(s, scale);
-    s /= y;
-    vm.set_dst_word((s + v) as Word)
+    s = safe_div(s, y);
+    vm.set_dst_word(s.wrapping_add(v) as Word)
 }
 
 /// cvtxx src, dst:fixed-point scaling: dst = src scaled by the middle operand.
@@ -203,7 +210,7 @@ pub(crate) fn op_cvtxx0(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let scale = vm.mid_word()?;
     let scaled = apply_scale(x, scale);
     let z = if residual != 0 {
-        scaled / residual
+        safe_div(scaled, residual)
     } else {
         scaled
     };
@@ -241,7 +248,7 @@ pub(crate) fn op_cvtxx1(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     r = apply_scale(r, scale);
     r = r.wrapping_add(v);
     if a != 0 {
-        r /= a;
+        r = safe_div(r, a);
     }
     vm.set_dst_word(r as Word)
 }
@@ -397,6 +404,124 @@ mod tests {
             memory::read_word(&vm.frames.data, vm.frames.current_data_offset()),
             -4
         );
+    }
+
+    // --- i64::MIN / -1 must not trap (it panics even in release builds) ---
+    //
+    // Every one of these drives an operand to i64::MIN through `apply_scale`
+    // (mid/src = i32::MIN or a scale of 32) and then divides by -1.
+
+    fn read_dst(vm: &VmState<'_>) -> i32 {
+        memory::read_word(&vm.frames.data, vm.frames.current_data_offset())
+    }
+
+    #[test]
+    fn mulx0_min_over_minus_one_does_not_trap() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        write_stmp(&mut vm, -1); // residual
+        write_dtmp(&mut vm, 32); // scale
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 1;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = i32::MIN;
+        vm.dst = AddrTarget::Frame(vm.frames.current_data_offset());
+
+        op_mulx0(&mut vm).expect("mulx0 should succeed");
+        assert_eq!(read_dst(&vm), 0);
+    }
+
+    #[test]
+    fn mulx1_min_over_minus_one_does_not_trap() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        write_stmp(&mut vm, -1); // a
+        write_dtmp(&mut vm, 32 << 2); // scale = 32, no rounding flags
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 1;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = i32::MIN;
+        vm.dst = AddrTarget::Frame(vm.frames.current_data_offset());
+
+        op_mulx1(&mut vm).expect("mulx1 should succeed");
+        assert_eq!(read_dst(&vm), 0);
+    }
+
+    #[test]
+    fn divx_min_over_minus_one_does_not_trap() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        write_dtmp(&mut vm, 32); // scale
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = -1;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = i32::MIN;
+        vm.dst = AddrTarget::Frame(vm.frames.current_data_offset());
+
+        op_divx(&mut vm).expect("divx should succeed");
+        assert_eq!(read_dst(&vm), 0);
+    }
+
+    #[test]
+    fn divx0_min_over_minus_one_does_not_trap() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        write_stmp(&mut vm, 0); // no residual
+        write_dtmp(&mut vm, 32); // scale
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = -1;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = i32::MIN;
+        vm.dst = AddrTarget::Frame(vm.frames.current_data_offset());
+
+        op_divx0(&mut vm).expect("divx0 should succeed");
+        assert_eq!(read_dst(&vm), 0);
+    }
+
+    #[test]
+    fn divx1_min_over_minus_one_does_not_trap() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        write_stmp(&mut vm, 1); // b
+        write_dtmp(&mut vm, 32 << 2); // scale = 32, no rounding flags
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = -1;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = i32::MIN;
+        vm.dst = AddrTarget::Frame(vm.frames.current_data_offset());
+
+        op_divx1(&mut vm).expect("divx1 should succeed");
+        assert_eq!(read_dst(&vm), 0);
+    }
+
+    #[test]
+    fn cvtxx0_min_over_minus_one_does_not_trap() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        write_stmp(&mut vm, -1); // residual
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = i32::MIN;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 32; // scale
+        vm.dst = AddrTarget::Frame(vm.frames.current_data_offset());
+
+        op_cvtxx0(&mut vm).expect("cvtxx0 should succeed");
+        assert_eq!(read_dst(&vm), 0);
+    }
+
+    #[test]
+    fn cvtxx1_min_over_minus_one_does_not_trap() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        write_stmp(&mut vm, -1); // a
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = i32::MIN;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 32 << 2; // scale = 32, no rounding flags
+        vm.dst = AddrTarget::Frame(vm.frames.current_data_offset());
+
+        op_cvtxx1(&mut vm).expect("cvtxx1 should succeed");
+        assert_eq!(read_dst(&vm), 0);
     }
 
     #[test]

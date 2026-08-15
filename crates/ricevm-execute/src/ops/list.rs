@@ -4,44 +4,69 @@ use crate::heap::{self, HeapData, HeapId};
 use crate::memory;
 use crate::vm::VmState;
 
+/// Upper bound on a single list element, used to reject absurd `consm` sizes
+/// before anything is allocated. Dis list elements are single Limbo values or
+/// records; a megabyte is already far past anything a compiler emits.
+const MAX_CONS_BYTES: usize = 1 << 20;
+
 // --- cons operations: push a value onto the front of a list ---
 // consX src, dst: dst = src :: dst
 // src = value to prepend, dst = existing list pointer (modified in place)
 
-fn cons_bytes(vm: &mut VmState<'_>, size: usize) -> Result<(), ExecError> {
-    let tail_id = vm.dst_ptr()?;
-    // Read `size` bytes from the source location
-    let mut head = vec![0u8; size];
+/// Read the `size` bytes of the cons head from the source location.
+///
+/// Every block read is bounds-checked: the size can come straight from an
+/// untrusted `consm` middle word, and the source offset from any operand.
+fn read_cons_head(vm: &VmState<'_>, size: usize) -> Result<Vec<u8>, ExecError> {
+    let out_of_bounds = || {
+        ExecError::ThreadFault(format!(
+            "cons source out of bounds: {size} bytes at {:?}",
+            vm.src
+        ))
+    };
+    let block = |buf: &[u8], off: usize| -> Result<Vec<u8>, ExecError> {
+        let end = off.checked_add(size).ok_or_else(out_of_bounds)?;
+        if end > buf.len() {
+            return Err(out_of_bounds());
+        }
+        Ok(buf[off..end].to_vec())
+    };
+
     match vm.src {
-        crate::address::AddrTarget::Frame(off) => {
-            head.copy_from_slice(&vm.frames.data[off..off + size]);
-        }
-        crate::address::AddrTarget::Mp(off) => {
-            head.copy_from_slice(&vm.mp[off..off + size]);
-        }
+        crate::address::AddrTarget::Frame(off) => block(&vm.frames.data, off),
+        crate::address::AddrTarget::Mp(off) => block(&vm.mp, off),
         crate::address::AddrTarget::ModuleMp { module_idx, offset } => {
-            if let Some(mp) = vm.module_mp(module_idx)
-                && offset + size <= mp.len()
-            {
-                head.copy_from_slice(&mp[offset..offset + size]);
+            match vm.module_mp(module_idx) {
+                Some(mp) => block(mp, offset),
+                None => Ok(vec![0u8; size]),
             }
         }
         crate::address::AddrTarget::Immediate => {
             // For immediate, store the word value
+            let mut head = vec![0u8; size];
             let val = vm.imm_src;
             if size >= 4 {
                 memory::write_word(&mut head, 0, val);
-            } else {
+            } else if size >= 1 {
                 head[0] = val as u8;
             }
+            Ok(head)
         }
-        crate::address::AddrTarget::None => {}
+        crate::address::AddrTarget::None => Ok(vec![0u8; size]),
         crate::address::AddrTarget::HeapArray { id, offset } => {
+            let mut head = vec![0u8; size];
             if let Some(bytes) = vm.heap_slice(id, offset, size) {
-                head[..size].copy_from_slice(&bytes[..size]);
+                let n = size.min(bytes.len());
+                head[..n].copy_from_slice(&bytes[..n]);
             }
+            Ok(head)
         }
     }
+}
+
+fn cons_bytes(vm: &mut VmState<'_>, size: usize) -> Result<(), ExecError> {
+    let tail_id = vm.dst_ptr()?;
+    let head = read_cons_head(vm, size)?;
 
     if tail_id != heap::NIL {
         vm.heap.inc_ref(tail_id);
@@ -111,7 +136,20 @@ pub(crate) fn op_consp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 /// consm: cons a memory block (record). Size comes from mid operand.
 pub(crate) fn op_consm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let size = vm.mid_word()? as usize;
+    // The block size is untrusted: a negative word would become a ~1.8e19 byte
+    // allocation, and even a large positive one is never a real record.
+    let size = vm.mid_word()?;
+    if size < 0 {
+        return Err(ExecError::ThreadFault(format!(
+            "consm: negative block size: {size}"
+        )));
+    }
+    let size = size as usize;
+    if size > MAX_CONS_BYTES {
+        return Err(ExecError::ThreadFault(format!(
+            "consm: block size too large: {size}"
+        )));
+    }
     cons_bytes(vm, size)
 }
 
@@ -339,6 +377,91 @@ mod tests {
             HeapData::List { head, tail } => {
                 assert_eq!(memory::read_word(head, 0), 20);
                 assert_ne!(*tail, heap::NIL);
+            }
+            _ => panic!("expected List"),
+        }
+    }
+
+    #[test]
+    fn consw_out_of_range_frame_source_is_rejected() {
+        // The source read must be bounds-checked like every other block read.
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Frame(vm.frames.data.len() - 2); // only 2 bytes left
+        vm.dst = AddrTarget::Frame(fp);
+
+        let err = op_consw(&mut vm).expect_err("out-of-range cons source must be rejected");
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "expected out of bounds, got: {err}"
+        );
+    }
+
+    #[test]
+    fn consm_negative_size_is_rejected() {
+        // A negative mid word must not become a ~1.8e19 byte allocation.
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = -1;
+        vm.dst = AddrTarget::Frame(fp);
+
+        let err = op_consm(&mut vm).expect_err("negative cons size must be rejected");
+        assert!(
+            err.to_string().contains("negative"),
+            "expected negative size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn consm_oversized_size_is_rejected() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = i32::MAX;
+        vm.dst = AddrTarget::Frame(fp);
+
+        let err = op_consm(&mut vm).expect_err("oversized cons size must be rejected");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected size error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn consm_copies_block_from_frame() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        memory::write_word(&mut vm.frames.data, fp, 7);
+        memory::write_word(&mut vm.frames.data, fp + 4, 8);
+        memory::write_word(&mut vm.frames.data, fp + 8, heap::NIL as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 8;
+        vm.dst = AddrTarget::Frame(fp + 8);
+
+        op_consm(&mut vm).expect("consm should succeed");
+
+        let list_id = memory::read_word(&vm.frames.data, fp + 8) as HeapId;
+        let obj = vm.heap.get(list_id).expect("list should exist");
+        match &obj.data {
+            HeapData::List { head, .. } => {
+                assert_eq!(head.len(), 8);
+                assert_eq!(memory::read_word(head, 0), 7);
+                assert_eq!(memory::read_word(head, 4), 8);
             }
             _ => panic!("expected List"),
         }

@@ -230,7 +230,8 @@ fn math_log1p(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     unary_real(vm, f64::ln_1p)
 }
 fn math_rint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    unary_real(vm, f64::round)
+    // rint follows the current rounding mode, i.e. round-half-to-even.
+    unary_real(vm, f64::round_ties_even)
 }
 fn math_sin(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     unary_real(vm, f64::sin)
@@ -313,19 +314,79 @@ fn math_pow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// IEEE-754 remainder: `x - n*y` where `n` is `x/y` rounded half-to-even.
+/// This is not `fmod` (which truncates the quotient).
+fn ieee_remainder(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() || y == 0.0 || x.is_infinite() {
+        return f64::NAN;
+    }
+    if y.is_infinite() {
+        return x;
+    }
+    let ay = y.abs();
+    // fmod gives x - trunc(x/y)*y, so |r| < |y| with the sign of x.
+    let mut r = x % ay;
+    let half = ay * 0.5;
+    if r.abs() > half {
+        r -= ay.copysign(r);
+    } else if r.abs() == half {
+        // Exact tie: keep the remainder that leaves an even quotient.
+        let q = (x - r) / ay;
+        if q % 2.0 != 0.0 {
+            r -= ay.copysign(r);
+        }
+    }
+    if r == 0.0 { 0.0_f64.copysign(x) } else { r }
+}
+
 fn math_remainder(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    write_real_return(vm, base, x % y);
+    write_real_return(vm, base, ieee_remainder(x, y));
     Ok(())
+}
+
+/// 2^1023, the largest power of two that is still a normal f64.
+const TWO_POW_1023: f64 = f64::from_bits(0x7fe0_0000_0000_0000);
+/// 2^-969 (= 2^-1022 * 2^53): scaling down by this keeps the final
+/// multiply out of the subnormal range, avoiding double rounding.
+const TWO_POW_M969: f64 = f64::from_bits(0x0360_0000_0000_0000);
+
+/// `x * 2^n`, scaled in steps so the power of two never overflows or
+/// underflows independently of the product (as `x * 2f64.powi(n)` does).
+fn scalbn(x: f64, n: i32) -> f64 {
+    let mut y = x;
+    let mut n = n;
+    if n > 1023 {
+        y *= TWO_POW_1023;
+        n -= 1023;
+        if n > 1023 {
+            y *= TWO_POW_1023;
+            n -= 1023;
+            if n > 1023 {
+                n = 1023;
+            }
+        }
+    } else if n < -1022 {
+        y *= TWO_POW_M969;
+        n += 1022 - 53;
+        if n < -1022 {
+            y *= TWO_POW_M969;
+            n += 1022 - 53;
+            if n < -1022 {
+                n = -1022;
+            }
+        }
+    }
+    y * f64::from_bits(((0x3ff + n) as u64) << 52)
 }
 
 fn math_scalbn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let n = memory::read_word(&vm.frames.data, base + ARG2_OFF);
-    write_real_return(vm, base, x * (2.0_f64).powi(n));
+    write_real_return(vm, base, scalbn(x, n));
     Ok(())
 }
 
@@ -647,13 +708,19 @@ fn math_nextafter(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let x = memory::read_real(&vm.frames.data, base + ARG1_OFF);
     let y = memory::read_real(&vm.frames.data, base + ARG2_OFF);
-    let result = if x == y {
-        y
-    } else if x.is_nan() || y.is_nan() {
+    let result = if x.is_nan() || y.is_nan() {
         f64::NAN
+    } else if x == y {
+        y
+    } else if x == 0.0 {
+        // Both zeros compare equal to 0.0, so the sign of x tells us nothing:
+        // step to the smallest subnormal in the direction of y.
+        f64::from_bits(1).copysign(y)
     } else {
+        // Away from zero the bit patterns are monotonic in magnitude, so a
+        // step "towards y" is +1 when y and x point the same way from zero.
         let bits = x.to_bits();
-        let next = if (y > x) == (x >= 0.0) {
+        let next = if (y > x) == (x > 0.0) {
             bits + 1
         } else {
             bits - 1
@@ -756,24 +823,73 @@ fn math_gemm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let base = vm.frames.current_data_offset();
     let transa = memory::read_word(&vm.frames.data, base + ARG1_OFF) as u8 as char;
     let transb = memory::read_word(&vm.frames.data, base + ARG1_OFF + 4) as u8 as char;
-    let m = memory::read_word(&vm.frames.data, base + ARG1_OFF + 8) as usize;
-    let n = memory::read_word(&vm.frames.data, base + ARG1_OFF + 12) as usize;
-    let k = memory::read_word(&vm.frames.data, base + ARG1_OFF + 16) as usize;
+    let raw_m = memory::read_word(&vm.frames.data, base + ARG1_OFF + 8);
+    let raw_n = memory::read_word(&vm.frames.data, base + ARG1_OFF + 12);
+    let raw_k = memory::read_word(&vm.frames.data, base + ARG1_OFF + 16);
     // alpha at offset 56 (8-byte aligned after 5 ints + 4 bytes padding)
     let alpha = memory::read_real(&vm.frames.data, base + 56);
     let a_id = memory::read_word(&vm.frames.data, base + 64) as u32;
-    let lda = memory::read_word(&vm.frames.data, base + 68) as usize;
+    let raw_lda = memory::read_word(&vm.frames.data, base + 68);
     let b_id = memory::read_word(&vm.frames.data, base + 72) as u32;
-    let ldb = memory::read_word(&vm.frames.data, base + 76) as usize;
+    let raw_ldb = memory::read_word(&vm.frames.data, base + 76);
     let beta = memory::read_real(&vm.frames.data, base + 80);
     let c_id = memory::read_word(&vm.frames.data, base + 88) as u32;
-    let ldc = memory::read_word(&vm.frames.data, base + 92) as usize;
+    let raw_ldc = memory::read_word(&vm.frames.data, base + 92);
 
     let nota = transa == 'N';
     let notb = transb == 'N';
 
+    // Every dimension is untrusted: negatives would become huge `usize`
+    // values and drive both the buffer allocation and the loop bounds.
+    if raw_m < 0 || raw_n < 0 || raw_k < 0 || raw_lda < 0 || raw_ldb < 0 || raw_ldc < 0 {
+        return Err(ExecError::ThreadFault(format!(
+            "gemm: negative dimension (m={raw_m}, n={raw_n}, k={raw_k}, \
+             lda={raw_lda}, ldb={raw_ldb}, ldc={raw_ldc})"
+        )));
+    }
+    let (m, n, k) = (raw_m as usize, raw_n as usize, raw_k as usize);
+    let (lda, ldb, ldc) = (raw_lda as usize, raw_ldb as usize, raw_ldc as usize);
+
     if m == 0 || n == 0 || ((alpha == 0.0 || k == 0) && beta == 1.0) {
         return Ok(());
+    }
+
+    // BLAS requires the leading dimensions to span each matrix; checking the
+    // spans against the real array lengths bounds every loop and the C buffer.
+    let elems = |id: u32| vm.heap.array_byte_len(id).unwrap_or(0) / 8;
+    let a_rows = if nota { m } else { k };
+    let b_rows = if notb { k } else { n };
+    let a_cols = if nota { k } else { m };
+    let b_cols = if notb { n } else { k };
+    let span = |ld: usize, rows: usize, cols: usize| {
+        if ld < rows.max(1) {
+            None
+        } else {
+            ld.checked_mul(cols.saturating_sub(1))
+                .and_then(|v| v.checked_add(rows))
+        }
+    };
+    let c_size = match span(ldc, m, n) {
+        Some(size) if size <= elems(c_id) => size,
+        _ => {
+            return Err(ExecError::ThreadFault(format!(
+                "gemm: C does not hold {m}x{n} with ldc={ldc}"
+            )));
+        }
+    };
+    // A may legitimately be nil (C := alpha*op(B) + beta*C); that path and the
+    // alpha == 0 path only walk m and n, which the C check already bounds.
+    if alpha != 0.0 && a_id != 0 {
+        if span(lda, a_rows, a_cols).is_none_or(|size| size > elems(a_id)) {
+            return Err(ExecError::ThreadFault(format!(
+                "gemm: A does not hold {a_rows}x{a_cols} with lda={lda}"
+            )));
+        }
+        if span(ldb, b_rows, b_cols).is_none_or(|size| size > elems(b_id)) {
+            return Err(ExecError::ThreadFault(format!(
+                "gemm: B does not hold {b_rows}x{b_cols} with ldb={ldb}"
+            )));
+        }
     }
 
     // Helper: read a real from a heap array at the given element index
@@ -786,7 +902,6 @@ fn math_gemm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     };
 
     // Read C into a working buffer
-    let c_size = ldc * (n.max(1) - 1) + m;
     let mut c_buf: Vec<f64> = (0..c_size).map(|i| read_arr(vm, c_id, i)).collect();
 
     if alpha == 0.0 {
@@ -1246,9 +1361,17 @@ mod tests {
     }
 
     #[test]
-    fn rint_rounds_half() {
+    fn rint_rounds_half_to_even() {
+        // rint uses the current rounding mode: round-half-to-even, not
+        // round-half-away-from-zero.
         let r = call_unary_real(math_rint, 2.5);
-        assert!((r - 3.0).abs() < 1e-15, "rint(2.5) = 3, got {r}");
+        assert!((r - 2.0).abs() < 1e-15, "rint(2.5) = 2, got {r}");
+        let r = call_unary_real(math_rint, 3.5);
+        assert!((r - 4.0).abs() < 1e-15, "rint(3.5) = 4, got {r}");
+        let r = call_unary_real(math_rint, -2.5);
+        assert!((r - (-2.0)).abs() < 1e-15, "rint(-2.5) = -2, got {r}");
+        let r = call_unary_real(math_rint, 2.7);
+        assert!((r - 3.0).abs() < 1e-15, "rint(2.7) = 3, got {r}");
     }
 
     // ---- fabs, cbrt ----
@@ -1448,20 +1571,100 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scalbn_basic() {
-        // scalbn(1.5, 3) = 1.5 * 2^3 = 12.0
+    fn call_scalbn(x: f64, n: i32) -> f64 {
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm should initialize");
         let base = vm.frames.current_data_offset();
-        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, 1.5);
-        memory::write_word(&mut vm.frames.data, base + ARG2_OFF, 3);
+        memory::write_real(&mut vm.frames.data, base + ARG1_OFF, x);
+        memory::write_word(&mut vm.frames.data, base + ARG2_OFF, n);
         math_scalbn(&mut vm).expect("scalbn should succeed");
-        let result = memory::read_real(&vm.frames.data, base + RET_OFF);
+        memory::read_real(&vm.frames.data, base + RET_OFF)
+    }
+
+    #[test]
+    fn scalbn_basic() {
+        // scalbn(1.5, 3) = 1.5 * 2^3 = 12.0
+        let result = call_scalbn(1.5, 3);
         assert!(
             (result - 12.0).abs() < 1e-12,
             "scalbn(1.5,3) = 12.0, got {result}"
         );
+        assert_eq!(call_scalbn(1.5, 0), 1.5);
+        assert_eq!(call_scalbn(1.5, -1), 0.75);
+        assert_eq!(call_scalbn(0.0, 100), 0.0);
+    }
+
+    #[test]
+    fn scalbn_scales_in_steps() {
+        // The intermediate 2^n must not overflow/underflow independently of
+        // the product: both of these results are finite and non-zero.
+        let expected = 1e-300 * 2.0_f64.powi(1000) * 2.0_f64.powi(1000);
+        let result = call_scalbn(1e-300, 2000);
+        assert!(result.is_finite(), "scalbn(1e-300, 2000) should be finite");
+        assert!(
+            ((result - expected) / expected).abs() < 1e-12,
+            "scalbn(1e-300,2000) = {expected}, got {result}"
+        );
+
+        let expected = 1e300 * 2.0_f64.powi(-1000) * 2.0_f64.powi(-1000);
+        let result = call_scalbn(1e300, -2000);
+        assert!(result > 0.0, "scalbn(1e300, -2000) should not underflow");
+        assert!(
+            ((result - expected) / expected).abs() < 1e-12,
+            "scalbn(1e300,-2000) = {expected}, got {result}"
+        );
+    }
+
+    #[test]
+    fn scalbn_saturates_at_the_extremes() {
+        assert!(call_scalbn(1.0, 100_000).is_infinite());
+        assert_eq!(call_scalbn(1.0, -100_000), 0.0);
+    }
+
+    // ---- remainder ----
+
+    #[test]
+    fn remainder_is_ieee_not_fmod() {
+        // remainder rounds the quotient half-to-even; fmod truncates it.
+        let r = call_binary_real(math_remainder, 7.0, 2.0);
+        assert!((r - (-1.0)).abs() < 1e-15, "remainder(7,2) = -1, got {r}");
+        let r = call_binary_real(math_remainder, 5.0, 2.0);
+        assert!((r - 1.0).abs() < 1e-15, "remainder(5,2) = 1, got {r}");
+        let r = call_binary_real(math_remainder, -7.0, 2.0);
+        assert!((r - 1.0).abs() < 1e-15, "remainder(-7,2) = 1, got {r}");
+        let r = call_binary_real(math_remainder, 8.0, 3.0);
+        assert!((r - (-1.0)).abs() < 1e-15, "remainder(8,3) = -1, got {r}");
+        let r = call_binary_real(math_remainder, 7.0, 3.0);
+        assert!((r - 1.0).abs() < 1e-15, "remainder(7,3) = 1, got {r}");
+        assert!(
+            call_binary_real(math_remainder, 1.0, 0.0).is_nan(),
+            "remainder(x,0) is NaN"
+        );
+    }
+
+    // ---- nextafter ----
+
+    #[test]
+    fn nextafter_around_zero() {
+        let tiny = f64::from_bits(1); // 5e-324
+        let r = call_binary_real(math_nextafter, 0.0, -1.0);
+        assert_eq!(r, -tiny, "nextafter(+0,-1) = -5e-324, got {r}");
+        let r = call_binary_real(math_nextafter, -0.0, 1.0);
+        assert_eq!(r, tiny, "nextafter(-0,1) = 5e-324, got {r}");
+        let r = call_binary_real(math_nextafter, 0.0, 1.0);
+        assert_eq!(r, tiny, "nextafter(+0,1) = 5e-324, got {r}");
+    }
+
+    #[test]
+    fn nextafter_normal_values() {
+        let up = f64::from_bits(1.0_f64.to_bits() + 1);
+        let down = f64::from_bits(1.0_f64.to_bits() - 1);
+        assert_eq!(call_binary_real(math_nextafter, 1.0, 2.0), up);
+        assert_eq!(call_binary_real(math_nextafter, 1.0, 0.0), down);
+        let neg_up = f64::from_bits((-1.0_f64).to_bits() + 1);
+        assert_eq!(call_binary_real(math_nextafter, -1.0, -2.0), neg_up);
+        assert_eq!(call_binary_real(math_nextafter, 3.0, 3.0), 3.0);
+        assert!(call_binary_real(math_nextafter, f64::NAN, 1.0).is_nan());
     }
 
     // ---- modf ----
@@ -1569,6 +1772,109 @@ mod tests {
         let base = vm.frames.current_data_offset();
         let result = memory::read_word(&vm.frames.data, base + RET_OFF);
         assert_eq!(result, 0, "getFPstatus should return 0");
+    }
+
+    // ---- gemm ----
+
+    /// A module whose entry frame is big enough for gemm's 96-byte layout.
+    fn gemm_module() -> Module {
+        let mut module = test_module();
+        module.types[0].size = 128;
+        module
+    }
+
+    fn alloc_real_array(vm: &mut VmState<'_>, vals: &[f64]) -> u32 {
+        let mut data = vec![0u8; vals.len() * 8];
+        for (i, &v) in vals.iter().enumerate() {
+            memory::write_real(&mut data, i * 8, v);
+        }
+        vm.heap.alloc(
+            0,
+            crate::heap::HeapData::Array {
+                elem_type: 0,
+                elem_size: 8,
+                data,
+                length: vals.len(),
+            },
+        )
+    }
+
+    /// Fill the gemm frame. Dimensions are words so they can be made negative.
+    #[allow(clippy::too_many_arguments)]
+    fn setup_gemm(
+        vm: &mut VmState<'_>,
+        m: i32,
+        n: i32,
+        k: i32,
+        a_id: u32,
+        lda: i32,
+        b_id: u32,
+        ldb: i32,
+        c_id: u32,
+        ldc: i32,
+    ) {
+        let base = vm.frames.current_data_offset();
+        memory::write_word(&mut vm.frames.data, base + ARG1_OFF, b'N' as i32);
+        memory::write_word(&mut vm.frames.data, base + ARG1_OFF + 4, b'N' as i32);
+        memory::write_word(&mut vm.frames.data, base + ARG1_OFF + 8, m);
+        memory::write_word(&mut vm.frames.data, base + ARG1_OFF + 12, n);
+        memory::write_word(&mut vm.frames.data, base + ARG1_OFF + 16, k);
+        memory::write_real(&mut vm.frames.data, base + 56, 1.0); // alpha
+        memory::write_word(&mut vm.frames.data, base + 64, a_id as i32);
+        memory::write_word(&mut vm.frames.data, base + 68, lda);
+        memory::write_word(&mut vm.frames.data, base + 72, b_id as i32);
+        memory::write_word(&mut vm.frames.data, base + 76, ldb);
+        memory::write_real(&mut vm.frames.data, base + 80, 1.0); // beta
+        memory::write_word(&mut vm.frames.data, base + 88, c_id as i32);
+        memory::write_word(&mut vm.frames.data, base + 92, ldc);
+    }
+
+    #[test]
+    fn gemm_multiplies_one_by_one() {
+        let module = gemm_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let a = alloc_real_array(&mut vm, &[2.0]);
+        let b = alloc_real_array(&mut vm, &[3.0]);
+        let c = alloc_real_array(&mut vm, &[1.0]);
+        setup_gemm(&mut vm, 1, 1, 1, a, 1, b, 1, c, 1);
+
+        math_gemm(&mut vm).expect("gemm should succeed");
+
+        let out = vm.heap.array_read(c, 0, 8).expect("c should be readable");
+        assert_eq!(memory::read_real(&out, 0), 7.0, "1*2*3 + 1*1 = 7");
+    }
+
+    #[test]
+    fn gemm_rejects_negative_dimensions() {
+        let module = gemm_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let a = alloc_real_array(&mut vm, &[2.0]);
+        let b = alloc_real_array(&mut vm, &[3.0]);
+        let c = alloc_real_array(&mut vm, &[1.0]);
+        setup_gemm(&mut vm, -1, 1, 1, a, 1, b, 1, c, 1);
+
+        let err = math_gemm(&mut vm).expect_err("negative m must be rejected");
+        assert!(
+            err.to_string().contains("gemm"),
+            "expected a gemm parameter error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn gemm_rejects_dimensions_larger_than_the_arrays() {
+        let module = gemm_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let a = alloc_real_array(&mut vm, &[2.0]);
+        let b = alloc_real_array(&mut vm, &[3.0]);
+        let c = alloc_real_array(&mut vm, &[1.0]);
+        // ldc * (n-1) + m would need a 2-billion element C buffer.
+        setup_gemm(&mut vm, 1, i32::MAX, 1, a, 1, b, 1, c, 1);
+
+        let err = math_gemm(&mut vm).expect_err("oversized C must be rejected");
+        assert!(
+            err.to_string().contains("gemm"),
+            "expected a gemm parameter error, got: {err}"
+        );
     }
 
     // ---- create_math_module ----

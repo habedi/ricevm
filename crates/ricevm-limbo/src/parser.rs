@@ -127,7 +127,7 @@ impl Parser {
                 includes.push(Include { path, span });
             } else {
                 match self.parse_top_decl() {
-                    Ok(d) => decls.push(d),
+                    Ok(d) => decls.extend(d),
                     Err(e) => {
                         // Try to recover by skipping to next semicolon
                         if self.at(&TokenKind::Eof) {
@@ -147,7 +147,9 @@ impl Parser {
     }
 
     /// Parse a top-level declaration: variable, constant, type, module, adt, function, or import.
-    fn parse_top_decl(&mut self) -> Result<Decl, ParseError> {
+    ///
+    /// A single `name, name2: ...` declaration yields one `Decl` per name.
+    fn parse_top_decl(&mut self) -> Result<Vec<Decl>, ParseError> {
         let span = self.span();
 
         // Function definition: name(args) or Qualifier.name(args)
@@ -156,10 +158,10 @@ impl Parser {
             // Look ahead: could be name(, name., name:, name,
             let la = self.look_ahead_after_ident();
             match la {
-                LookAhead::FuncDef => return self.parse_func_def(),
+                LookAhead::FuncDef => return Ok(vec![self.parse_func_def()?]),
                 LookAhead::ColonDecl => return self.parse_colon_decl(span),
-                LookAhead::Assign => return self.parse_top_assign(span),
-                LookAhead::DeclAssign => return self.parse_top_decl_assign(span),
+                LookAhead::Assign => return Ok(vec![self.parse_top_assign(span)?]),
+                LookAhead::DeclAssign => return Ok(vec![self.parse_top_decl_assign(span)?]),
             }
         }
 
@@ -202,7 +204,7 @@ impl Parser {
     // ── Declarations ───────────────────────────────────────────
 
     /// Parse `names : <type|con|module|adt|import|exception> ...;`
-    fn parse_colon_decl(&mut self, span: Span) -> Result<Decl, ParseError> {
+    fn parse_colon_decl(&mut self, span: Span) -> Result<Vec<Decl>, ParseError> {
         // Parse one or more names
         let mut names = vec![self.expect_ident()?];
         while self.at(&TokenKind::Comma) {
@@ -216,22 +218,32 @@ impl Parser {
                 self.advance();
                 let value = self.parse_expr()?;
                 self.expect_semi()?;
-                Ok(Decl::Const(ConstDecl {
-                    name: names.into_iter().next().unwrap_or_default(),
-                    ty: None,
-                    value,
-                    span,
-                }))
+                Ok(names
+                    .into_iter()
+                    .map(|name| {
+                        Decl::Const(ConstDecl {
+                            name,
+                            ty: None,
+                            value: value.clone(),
+                            span,
+                        })
+                    })
+                    .collect())
             }
             TokenKind::Type => {
                 self.advance();
                 let ty = self.parse_type()?;
                 self.expect_semi()?;
-                Ok(Decl::TypeAlias(TypeAliasDecl {
-                    name: names.into_iter().next().unwrap_or_default(),
-                    ty,
-                    span,
-                }))
+                Ok(names
+                    .into_iter()
+                    .map(|name| {
+                        Decl::TypeAlias(TypeAliasDecl {
+                            name,
+                            ty: ty.clone(),
+                            span,
+                        })
+                    })
+                    .collect())
             }
             TokenKind::Module => {
                 self.advance();
@@ -239,11 +251,16 @@ impl Parser {
                 let members = self.parse_module_members()?;
                 self.expect(&TokenKind::RBrace)?;
                 self.expect_semi()?;
-                Ok(Decl::Module(ModuleDecl {
-                    name: names.into_iter().next().unwrap_or_default(),
-                    members,
-                    span,
-                }))
+                Ok(names
+                    .into_iter()
+                    .map(|name| {
+                        Decl::Module(ModuleDecl {
+                            name,
+                            members: members.clone(),
+                            span,
+                        })
+                    })
+                    .collect())
             }
             TokenKind::Adt => {
                 self.advance();
@@ -272,22 +289,27 @@ impl Parser {
                 let (members, pick) = self.parse_adt_members()?;
                 self.expect(&TokenKind::RBrace)?;
                 self.expect_semi()?;
-                Ok(Decl::Adt(AdtDecl {
-                    name: names.into_iter().next().unwrap_or_default(),
-                    members,
-                    pick,
-                    span,
-                }))
+                Ok(names
+                    .into_iter()
+                    .map(|name| {
+                        Decl::Adt(AdtDecl {
+                            name,
+                            members: members.clone(),
+                            pick: pick.clone(),
+                            span,
+                        })
+                    })
+                    .collect())
             }
             TokenKind::Import => {
                 self.advance();
                 let module = self.expect_ident()?;
                 self.expect_semi()?;
-                Ok(Decl::Import(ImportDecl {
+                Ok(vec![Decl::Import(ImportDecl {
                     names,
                     module,
                     span,
-                }))
+                })])
             }
             TokenKind::Exception => {
                 self.advance();
@@ -300,11 +322,16 @@ impl Parser {
                     None
                 };
                 self.expect_semi()?;
-                Ok(Decl::Exception(ExceptionDecl {
-                    name: names.into_iter().next().unwrap_or_default(),
-                    ty,
-                    span,
-                }))
+                Ok(names
+                    .into_iter()
+                    .map(|name| {
+                        Decl::Exception(ExceptionDecl {
+                            name,
+                            ty: ty.clone(),
+                            span,
+                        })
+                    })
+                    .collect())
             }
             _ => {
                 // Variable declaration: names : type [= expr];
@@ -316,12 +343,12 @@ impl Parser {
                     None
                 };
                 self.expect_semi()?;
-                Ok(Decl::Var(VarDecl {
+                Ok(vec![Decl::Var(VarDecl {
                     names,
                     ty: Some(ty),
                     init,
                     span,
-                }))
+                })])
             }
         }
     }
@@ -373,27 +400,36 @@ impl Parser {
                     self.advance();
                     let value = self.parse_expr()?;
                     self.expect_semi()?;
-                    members.push(ModuleMember::Const(ConstDecl {
-                        name: names.into_iter().next().unwrap_or_default(),
-                        ty: None,
-                        value,
-                        span,
+                    members.extend(names.into_iter().map(|name| {
+                        ModuleMember::Const(ConstDecl {
+                            name,
+                            ty: None,
+                            value: value.clone(),
+                            span,
+                        })
                     }));
                 }
                 TokenKind::Type => {
                     self.advance();
                     let ty = self.parse_type()?;
                     self.expect_semi()?;
-                    members.push(ModuleMember::TypeAlias(TypeAliasDecl {
-                        name: names.into_iter().next().unwrap_or_default(),
-                        ty,
-                        span,
+                    members.extend(names.into_iter().map(|name| {
+                        ModuleMember::TypeAlias(TypeAliasDecl {
+                            name,
+                            ty: ty.clone(),
+                            span,
+                        })
                     }));
                 }
                 TokenKind::Fn => {
-                    let sig = self.parse_func_sig(names.into_iter().next().unwrap_or_default())?;
+                    let sig = self.parse_func_sig(first_name(&names))?;
                     self.expect_semi()?;
-                    members.push(ModuleMember::Func(sig));
+                    members.extend(names.into_iter().map(|name| {
+                        ModuleMember::Func(FuncSig {
+                            name,
+                            ..sig.clone()
+                        })
+                    }));
                 }
                 TokenKind::Adt => {
                     self.advance();
@@ -401,11 +437,13 @@ impl Parser {
                     let (adt_members, pick) = self.parse_adt_members()?;
                     self.expect(&TokenKind::RBrace)?;
                     self.expect_semi()?;
-                    members.push(ModuleMember::Adt(AdtDecl {
-                        name: names.into_iter().next().unwrap_or_default(),
-                        members: adt_members,
-                        pick,
-                        span,
+                    members.extend(names.into_iter().map(|name| {
+                        ModuleMember::Adt(AdtDecl {
+                            name,
+                            members: adt_members.clone(),
+                            pick: pick.clone(),
+                            span,
+                        })
                     }));
                 }
                 _ => {
@@ -452,17 +490,24 @@ impl Parser {
                     self.advance();
                     let value = self.parse_expr()?;
                     self.expect_semi()?;
-                    members.push(AdtMember::Const(ConstDecl {
-                        name: names.into_iter().next().unwrap_or_default(),
-                        ty: None,
-                        value,
-                        span,
+                    members.extend(names.into_iter().map(|name| {
+                        AdtMember::Const(ConstDecl {
+                            name,
+                            ty: None,
+                            value: value.clone(),
+                            span,
+                        })
                     }));
                 }
                 TokenKind::Fn => {
-                    let sig = self.parse_func_sig(names.into_iter().next().unwrap_or_default())?;
+                    let sig = self.parse_func_sig(first_name(&names))?;
                     self.expect_semi()?;
-                    members.push(AdtMember::Func(sig));
+                    members.extend(names.into_iter().map(|name| {
+                        AdtMember::Func(FuncSig {
+                            name,
+                            ..sig.clone()
+                        })
+                    }));
                 }
                 _ => {
                     let mut is_cyclic = false;
@@ -1674,13 +1719,14 @@ impl Parser {
                 continue;
             }
 
-            // Cons operator (right-associative)
+            // Cons operator: binds tighter than `&&`, looser than `|`,
+            // and is right-associative.
             if self.at(&TokenKind::ColonColon) {
-                if 5 < min_bp {
+                if CONS_BP < min_bp {
                     break;
                 }
                 self.advance();
-                let rhs = self.parse_expr_bp(5)?;
+                let rhs = self.parse_expr_bp(CONS_BP)?;
                 lhs = Expr::Cons(Box::new(lhs), Box::new(rhs), span);
                 continue;
             }
@@ -1987,27 +2033,31 @@ impl Parser {
     }
 
     /// Return (left_bp, right_bp, op) for infix binary operators.
+    ///
+    /// Limbo precedence, loosest first: `||`, `&&`, `::`, `|`, `^`, `&`,
+    /// equality, relational, shifts, additive, multiplicative, `**`.
     fn infix_binding_power(&self) -> Option<(u8, u8, BinOp)> {
         match self.peek() {
             TokenKind::OrOr => Some((3, 4, BinOp::LogOr)),
             TokenKind::AndAnd => Some((5, 6, BinOp::LogAnd)),
-            TokenKind::Pipe => Some((7, 8, BinOp::Or)),
-            TokenKind::Caret => Some((9, 10, BinOp::Xor)),
-            TokenKind::Amp => Some((11, 12, BinOp::And)),
-            TokenKind::Eq => Some((13, 14, BinOp::Eq)),
-            TokenKind::Neq => Some((13, 14, BinOp::Neq)),
-            TokenKind::Lt => Some((15, 16, BinOp::Lt)),
-            TokenKind::Gt => Some((15, 16, BinOp::Gt)),
-            TokenKind::Leq => Some((15, 16, BinOp::Leq)),
-            TokenKind::Geq => Some((15, 16, BinOp::Geq)),
-            TokenKind::Lshift => Some((17, 18, BinOp::Lshift)),
-            TokenKind::Rshift => Some((17, 18, BinOp::Rshift)),
-            TokenKind::Plus => Some((19, 20, BinOp::Add)),
-            TokenKind::Minus => Some((19, 20, BinOp::Sub)),
-            TokenKind::Star => Some((21, 22, BinOp::Mul)),
-            TokenKind::Slash => Some((21, 22, BinOp::Div)),
-            TokenKind::Percent => Some((21, 22, BinOp::Mod)),
-            TokenKind::Power => Some((24, 23, BinOp::Power)), // right-assoc
+            // 7 is CONS_BP
+            TokenKind::Pipe => Some((9, 10, BinOp::Or)),
+            TokenKind::Caret => Some((11, 12, BinOp::Xor)),
+            TokenKind::Amp => Some((13, 14, BinOp::And)),
+            TokenKind::Eq => Some((15, 16, BinOp::Eq)),
+            TokenKind::Neq => Some((15, 16, BinOp::Neq)),
+            TokenKind::Lt => Some((17, 18, BinOp::Lt)),
+            TokenKind::Gt => Some((17, 18, BinOp::Gt)),
+            TokenKind::Leq => Some((17, 18, BinOp::Leq)),
+            TokenKind::Geq => Some((17, 18, BinOp::Geq)),
+            TokenKind::Lshift => Some((19, 20, BinOp::Lshift)),
+            TokenKind::Rshift => Some((19, 20, BinOp::Rshift)),
+            TokenKind::Plus => Some((21, 22, BinOp::Add)),
+            TokenKind::Minus => Some((21, 22, BinOp::Sub)),
+            TokenKind::Star => Some((23, 24, BinOp::Mul)),
+            TokenKind::Slash => Some((23, 24, BinOp::Div)),
+            TokenKind::Percent => Some((23, 24, BinOp::Mod)),
+            TokenKind::Power => Some((26, 25, BinOp::Power)), // right-assoc
             _ => None,
         }
     }
@@ -2030,6 +2080,15 @@ impl Parser {
             _ => None,
         }
     }
+}
+
+/// Binding power of `::`: below `|` (9) and above `&&` (5). Used as both the
+/// left and the right binding power, which makes the operator right-associative.
+const CONS_BP: u8 = 7;
+
+/// First name of a `a, b, c: ...` declaration group.
+fn first_name(names: &[String]) -> String {
+    names.first().cloned().unwrap_or_default()
 }
 
 enum LookAhead {
@@ -2570,6 +2629,145 @@ test()
             panic!("expected func");
         };
         assert_eq!(f.body.stmts.len(), 3);
+    }
+
+    #[test]
+    fn parse_multi_name_const_and_type_decls() {
+        let file = parse(
+            r#"implement T;
+A, B: con 7;
+X, Y: type int;
+"#,
+        );
+        let names: Vec<&str> = file
+            .decls
+            .iter()
+            .map(|d| match d {
+                Decl::Const(c) => c.name.as_str(),
+                Decl::TypeAlias(t) => t.name.as_str(),
+                other => panic!("unexpected decl: {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["A", "B", "X", "Y"]);
+    }
+
+    #[test]
+    fn parse_multi_name_module_members() {
+        let file = parse(
+            r#"implement T;
+T: module {
+    A, B: con 1;
+    X, Y: type int;
+};
+"#,
+        );
+        let Decl::Module(m) = &file.decls[0] else {
+            panic!("expected module");
+        };
+        let names: Vec<&str> = m
+            .members
+            .iter()
+            .map(|mem| match mem {
+                ModuleMember::Const(c) => c.name.as_str(),
+                ModuleMember::TypeAlias(t) => t.name.as_str(),
+                other => panic!("unexpected member: {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["A", "B", "X", "Y"]);
+    }
+
+    #[test]
+    fn parse_multi_name_adt_members() {
+        let file = parse(
+            r#"implement T;
+T: adt {
+    A, B: con 1;
+};
+"#,
+        );
+        let Decl::Adt(a) = &file.decls[0] else {
+            panic!("expected adt");
+        };
+        let names: Vec<&str> = a
+            .members
+            .iter()
+            .map(|mem| match mem {
+                AdtMember::Const(c) => c.name.as_str(),
+                other => panic!("unexpected member: {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn cons_binds_tighter_than_logical_and() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    x = a && b :: c;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        let Stmt::Expr(Expr::Assign(_, rhs, _)) = &f.body.stmts[0] else {
+            panic!("expected assignment");
+        };
+        // Must parse as `a && (b :: c)`, not `(a && b) :: c`.
+        let Expr::Binary(lhs, BinOp::LogAnd, and_rhs, _) = rhs.as_ref() else {
+            panic!("expected && at the root, got {rhs:?}");
+        };
+        assert!(matches!(lhs.as_ref(), Expr::Ident(n, _) if n == "a"));
+        assert!(matches!(and_rhs.as_ref(), Expr::Cons(_, _, _)));
+    }
+
+    #[test]
+    fn cons_binds_looser_than_bitwise_or() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    x = a | b :: c;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        let Stmt::Expr(Expr::Assign(_, rhs, _)) = &f.body.stmts[0] else {
+            panic!("expected assignment");
+        };
+        // Must parse as `(a | b) :: c`.
+        let Expr::Cons(head, tail, _) = rhs.as_ref() else {
+            panic!("expected :: at the root, got {rhs:?}");
+        };
+        assert!(matches!(head.as_ref(), Expr::Binary(_, BinOp::Or, _, _)));
+        assert!(matches!(tail.as_ref(), Expr::Ident(n, _) if n == "c"));
+    }
+
+    #[test]
+    fn cons_is_right_associative() {
+        let file = parse(
+            r#"implement T;
+test()
+{
+    x = a :: b :: c;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        let Stmt::Expr(Expr::Assign(_, rhs, _)) = &f.body.stmts[0] else {
+            panic!("expected assignment");
+        };
+        let Expr::Cons(head, tail, _) = rhs.as_ref() else {
+            panic!("expected :: at the root, got {rhs:?}");
+        };
+        assert!(matches!(head.as_ref(), Expr::Ident(n, _) if n == "a"));
+        assert!(matches!(tail.as_ref(), Expr::Cons(_, _, _)));
     }
 
     #[test]

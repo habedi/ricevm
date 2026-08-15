@@ -780,6 +780,7 @@ name = "ricevm-limbo"
 version = "0.1.0-alpha.3"
 dependencies = [
  "ricevm-core",
+ "ricevm-execute",
  "ricevm-loader",
  "thiserror 2.0.18",
 ]

@@ -470,21 +470,34 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             vm.pc = entry_pc;
             vm.halted = false;
             let mcall_frame_base = vm.frames.current_data_offset();
+            // An exception must not unwind out of this nested loop: the loop,
+            // not the caller, controls where execution resumes.
+            let saved_unwind_floor =
+                std::mem::replace(&mut vm.unwind_floor, vm.frames.current_base);
 
+            let mut nested = Ok(());
             while !vm.halted && vm.pc < vm.module.code.len() {
                 let inst = vm.module.code[vm.pc].clone();
                 if vm.trace {
                     vm.trace_instruction(&inst);
                 }
-                vm.resolve_operands(&inst)?;
+                if let Err(err) = vm.resolve_operands(&inst) {
+                    nested = Err(err);
+                    break;
+                }
                 vm.next_pc = vm.pc + 1;
-                crate::ops::dispatch(vm, &inst)?;
+                if let Err(err) = crate::ops::dispatch(vm, &inst) {
+                    nested = Err(err);
+                    break;
+                }
                 vm.pc = vm.next_pc;
 
                 if vm.frames.current_data_offset() < mcall_frame_base {
                     break;
                 }
             }
+            vm.unwind_floor = saved_unwind_floor;
+            nested?;
 
             vm.pc = saved_pc;
             vm.next_pc = saved_next_pc;
@@ -535,16 +548,29 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             // The mcall frame was already activated above. Record the current
             // frame base so we can detect when Ret pops past it.
             let mcall_frame_base = vm.frames.current_data_offset();
+            // An exception raised in the loaded module must not unwind into
+            // the caller's frames: their handler table belongs to another
+            // module, and this loop -- not the caller -- decides where
+            // execution resumes.
+            let saved_unwind_floor =
+                std::mem::replace(&mut vm.unwind_floor, vm.frames.current_base);
 
             // Execute the loaded module's code
+            let mut nested = Ok(());
             while !vm.halted && vm.pc < loaded_code_len {
                 let inst = vm.loaded_modules[module_idx].module.code[vm.pc].clone();
                 if vm.trace {
                     vm.trace_instruction(&inst);
                 }
-                vm.resolve_operands(&inst)?;
+                if let Err(err) = vm.resolve_operands(&inst) {
+                    nested = Err(err);
+                    break;
+                }
                 vm.next_pc = vm.pc + 1;
-                crate::ops::dispatch(vm, &inst)?;
+                if let Err(err) = crate::ops::dispatch(vm, &inst) {
+                    nested = Err(err);
+                    break;
+                }
                 vm.pc = vm.next_pc;
 
                 // If Ret popped our mcall frame (current frame's data area
@@ -553,6 +579,8 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                     break;
                 }
             }
+            vm.unwind_floor = saved_unwind_floor;
+            nested?;
 
             // Write back the loaded module's MP (preserving any changes),
             // then restore the parent's MP from the stack.
@@ -777,8 +805,9 @@ pub(crate) fn op_casel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 /// raise src:raise an exception.
-/// Searches the handler table for a matching handler at the current PC.
-/// If found, jumps to the handler. If not, returns a ThreadFault.
+/// Dispatches through the same handler search as every VM-raised exception:
+/// the executing module's handler table, walking out through the frame chain
+/// to the caller's `try` blocks. If nothing handles it, returns a ThreadFault.
 pub(crate) fn op_raise(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let str_id = vm.src_ptr()?;
     let msg = vm
@@ -787,44 +816,9 @@ pub(crate) fn op_raise(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         .unwrap_or("unknown exception")
         .to_string();
 
-    let current_pc = vm.pc as i32;
-
-    // Search the handler table for a matching handler
-    for handler in &vm.module.handlers {
-        if current_pc < handler.begin_pc || current_pc >= handler.end_pc {
-            continue;
-        }
-        // Found a handler covering this PC. Search cases.
-        for case in &handler.cases {
-            match &case.name {
-                Some(name) if *name == msg => {
-                    vm.next_pc = case.pc as usize;
-                    let frame_base = vm.frames.current_data_offset();
-                    let off = frame_base + handler.exception_offset as usize;
-                    if off + 4 <= vm.frames.data.len() {
-                        crate::memory::write_word(&mut vm.frames.data, off, str_id as i32);
-                    }
-                    return Ok(());
-                }
-                None => {
-                    // Wildcard handler
-                    vm.next_pc = case.pc as usize;
-                    let frame_base = vm.frames.current_data_offset();
-                    let off = frame_base + handler.exception_offset as usize;
-                    if off + 4 <= vm.frames.data.len() {
-                        crate::memory::write_word(&mut vm.frames.data, off, str_id as i32);
-                    }
-                    return Ok(());
-                }
-                _ => continue,
-            }
-        }
-    }
-
-    // No handler found
-    Err(ExecError::ThreadFault(format!(
-        "unhandled exception: {msg}"
-    )))
+    // Pass the guest's own exception value through rather than a copy, so the
+    // handler sees the object it raised.
+    vm.raise_exception_with_value(&msg, str_id)
 }
 
 /// runt src:runtime check (module type validation). Stub: no-op.
@@ -1642,6 +1636,84 @@ mod tests {
             }
             other => panic!("expected ThreadFault, got {other:?}"),
         }
+    }
+
+    /// Regression: `raise` inside a loaded .dis module must search that
+    /// module's handler table. Searching the main module's table instead makes
+    /// the loaded module's own handlers unreachable, and can jump to a
+    /// main-module PC while the loaded module's code is executing.
+    #[test]
+    fn raise_uses_the_executing_loaded_modules_handler_table() {
+        use crate::vm::LoadedModule;
+
+        let main = module_with_handler(0, 10, 0, vec![ExceptionCase { name: None, pc: 42 }]);
+        let loaded = module_with_handler(
+            0,
+            10,
+            0,
+            vec![ExceptionCase {
+                name: None,
+                pc: 777,
+            }],
+        );
+
+        let mut vm = VmState::new(&main).expect("vm init");
+        vm.loaded_modules.push(LoadedModule {
+            module: loaded,
+            mp: Vec::new(),
+        });
+        vm.current_loaded_module = Some(0);
+
+        let msg_id = vm.heap.alloc(0, HeapData::Str("boom".to_string()));
+        vm.pc = 5;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = msg_id as i32;
+
+        op_raise(&mut vm).expect("the loaded module's handler should catch");
+        assert_eq!(
+            vm.next_pc, 777,
+            "raise must dispatch through the executing module's handler table"
+        );
+    }
+
+    /// Regression: an exception raised in a callee must unwind to a handler
+    /// covering the caller's call site instead of being reported as unhandled.
+    #[test]
+    fn raise_unwinds_to_a_caller_handler() {
+        let module = module_with_handler(
+            0,
+            5,
+            0,
+            vec![ExceptionCase {
+                name: Some("fail:oops".to_string()),
+                pc: 21,
+            }],
+        );
+        let mut vm = VmState::new(&module).expect("vm init");
+        let caller_base = vm.frames.current_base;
+
+        // Simulate `call`: the callee frame saves return pc 3, so the call
+        // instruction at pc 2 lies inside the handler's range.
+        let callee = vm.frames.alloc_pending(64).expect("alloc_pending");
+        vm.frames.activate_pending(callee, 3).expect("activate");
+        vm.pc = 20; // inside the callee, outside the handler's range
+
+        let msg_id = vm.heap.alloc(0, HeapData::Str("fail:oops".to_string()));
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = msg_id as i32;
+
+        op_raise(&mut vm).expect("the caller's handler should catch");
+
+        assert_eq!(vm.next_pc, 21, "should resume in the caller's handler");
+        assert_eq!(
+            vm.frames.current_base, caller_base,
+            "frames must unwind to the handler's frame"
+        );
+        assert_eq!(
+            memory::read_word(&vm.frames.data, vm.frames.current_data_offset()),
+            msg_id as i32,
+            "raise must pass the guest's own exception value to the handler"
+        );
     }
 
     /// op_raise must skip handlers whose PC range does not cover the current PC.

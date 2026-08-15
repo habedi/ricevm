@@ -22,6 +22,14 @@ use crate::vm::VmState;
 //   Offset 32+:    arguments
 const ARG_START: usize = 32;
 
+/// Upper bound on a printf-style field width or precision.
+/// Format strings come from guest bytecode, so an unbounded width would let a
+/// guest allocate an arbitrarily large padding string.
+const MAX_FORMAT_WIDTH: usize = 4096;
+
+/// Upper bound on the copy buffer `stream` allocates for a guest-supplied size.
+const MAX_STREAM_BUF: usize = 1024 * 1024;
+
 fn read_ptr(data: &[u8], offset: usize) -> HeapId {
     memory::read_word(data, offset) as HeapId
 }
@@ -52,6 +60,14 @@ fn write_ret_word(vm: &mut VmState<'_>, frame_base: usize, field_offset: usize, 
     if field_offset == 0 {
         memory::write_word(&mut vm.frames.data, frame_base, val);
     }
+}
+
+/// Append a decimal digit to a width or precision, clamped to MAX_FORMAT_WIDTH.
+fn accumulate_digit(value: usize, digit: char) -> usize {
+    value
+        .saturating_mul(10)
+        .saturating_add(digit as usize - '0' as usize)
+        .min(MAX_FORMAT_WIDTH)
 }
 
 /// Format a printf-style string with arguments from the frame.
@@ -104,13 +120,14 @@ fn format_string(
             }
         }
 
-        // Parse optional width
+        // Parse optional width, bounded so a hostile format string can neither
+        // overflow the counter nor request a huge padding string.
         let mut width: Option<usize> = None;
         while let Some(&wc) = chars.peek() {
             if wc.is_ascii_digit() {
                 chars.next();
                 let w = width.unwrap_or(0);
-                width = Some(w * 10 + (wc as usize - '0' as usize));
+                width = Some(accumulate_digit(w, wc));
             } else {
                 break;
             }
@@ -123,15 +140,15 @@ fn format_string(
             if chars.peek() == Some(&'*') {
                 chars.next();
                 // Precision comes from the next argument (word)
-                let p = memory::read_word(&vm.frames.data, arg_offset) as usize;
+                let p = memory::read_word(&vm.frames.data, arg_offset).max(0) as usize;
                 arg_offset += 4;
-                precision = Some(p);
+                precision = Some(p.min(MAX_FORMAT_WIDTH));
             } else {
                 let mut p: usize = 0;
                 while let Some(&pc) = chars.peek() {
                     if pc.is_ascii_digit() {
                         chars.next();
-                        p = p * 10 + (pc as usize - '0' as usize);
+                        p = accumulate_digit(p, pc);
                     } else {
                         break;
                     }
@@ -169,14 +186,11 @@ fn format_string(
                 } else {
                     "<nil>".to_string()
                 };
-                let s = if let Some(prec) = precision {
-                    if prec < s.len() {
-                        s[..prec].to_string()
-                    } else {
-                        s
-                    }
-                } else {
-                    s
+                // Precision counts characters, not bytes, so a multi-byte
+                // character is never split.
+                let s = match precision {
+                    Some(prec) => s.chars().take(prec).collect(),
+                    None => s,
                 };
                 output.push_str(&apply_width(s));
                 arg_offset += 4;
@@ -383,7 +397,7 @@ pub(crate) fn create_sys_module() -> BuiltinModule {
             bf("print", 0xac849033, 256, sys_print),
             bf("pwrite", 0x09d8aac6, 56, sys_pwrite),
             bf("read", 0x7cfef557, 48, sys_read),
-            bf("readn", 0x7cfef557, 48, sys_read),
+            bf("readn", 0x7cfef557, 48, sys_readn),
             bf("remove", 0xc6935858, 40, sys_remove),
             bf("seek", 0xaeccaddb, 56, sys_seek),
             bf("sleep", 0xe67bf126, 40, sys_sleep),
@@ -438,11 +452,20 @@ fn sys_fprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let fd_num = get_fd_num(vm, fd_id);
-    let fd_num = if fd_num < 0 { 1 } else { fd_num }; // default to stdout
+    if fd_num < 0 {
+        vm.last_error = "invalid file descriptor".to_string();
+        memory::write_word(&mut vm.frames.data, frame_base, -1);
+        return Ok(());
+    }
     let output = format_string(vm, frame_base, ARG_START + 4, ARG_START + 8);
-    let len = output.len() as i32;
-    let _ = vm.files.write(fd_num, output.as_bytes());
-    memory::write_word(&mut vm.frames.data, frame_base, len);
+    let n = match vm.files.write(fd_num, output.as_bytes()) {
+        Ok(n) => n as i32,
+        Err(e) => {
+            vm.last_error = format!("{e}");
+            -1
+        }
+    };
+    memory::write_word(&mut vm.frames.data, frame_base, n);
     Ok(())
 }
 
@@ -475,17 +498,35 @@ fn sys_aprint(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 // --- File I/O (portable, no libc) ---
 
+/// Close descriptors whose owning FD record has been reclaimed.
+/// Inferno closes the host descriptor when the `ref FD` value is freed;
+/// doing it here keeps a guest that opens files in a loop from leaking them.
+fn reap_reclaimed_fds(vm: &mut VmState<'_>) {
+    let dead: Vec<i32> = vm
+        .files
+        .owned_fds()
+        .into_iter()
+        .filter(|&(_, owner)| vm.heap.get(owner).is_none())
+        .map(|(fd, _)| fd)
+        .collect();
+    for fd in dead {
+        vm.files.close(fd);
+    }
+}
+
 fn sys_open(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let mode = memory::read_word(&vm.frames.data, frame_base + ARG_START + 4);
 
+    reap_reclaimed_fds(vm);
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
     match vm.files.open(&path, mode) {
         Ok(fd) => {
             let mut fd_data = vec![0u8; 4];
             memory::write_word(&mut fd_data, 0, fd);
             let fd_id = vm.heap.alloc(0, HeapData::Record(fd_data));
+            vm.files.set_owner(fd, fd_id);
             write_ptr(&mut vm.frames.data, frame_base, fd_id);
         }
         Err(e) => {
@@ -499,13 +540,17 @@ fn sys_open(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn sys_create(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let mode = memory::read_word(&vm.frames.data, frame_base + ARG_START + 4);
+    let perm = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8);
 
+    reap_reclaimed_fds(vm);
     let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
-    match vm.files.create(&path) {
+    match vm.files.create(&path, mode, perm) {
         Ok(fd) => {
             let mut fd_data = vec![0u8; 4];
             memory::write_word(&mut fd_data, 0, fd);
             let fd_id = vm.heap.alloc(0, HeapData::Record(fd_data));
+            vm.files.set_owner(fd, fd_id);
             write_ptr(&mut vm.frames.data, frame_base, fd_id);
         }
         Err(e) => {
@@ -516,11 +561,25 @@ fn sys_create(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// Clamp a guest-supplied byte count to the buffer it applies to.
+/// Returns None when the buffer is nil or the count is negative, which
+/// Inferno reports as a transfer of zero bytes.
+fn clamp_count(vm: &VmState<'_>, buf_id: HeapId, count: i32) -> Option<usize> {
+    let len = vm.heap.array_byte_len(buf_id)?;
+    let count = usize::try_from(count).ok()?;
+    Some(count.min(len))
+}
+
 fn sys_read(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
-    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
+    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8);
+
+    let Some(count) = clamp_count(vm, buf_id, count) else {
+        memory::write_word(&mut vm.frames.data, frame_base, 0);
+        return Ok(());
+    };
 
     let fd_num = get_fd_num(vm, fd_id);
     let mut tmp = vec![0u8; count];
@@ -540,11 +599,55 @@ fn sys_read(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     Ok(())
 }
 
+/// readn: read repeatedly until `n` bytes have been read or the source ends.
+fn sys_readn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
+    let frame_base = vm.frames.current_data_offset();
+    let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
+    let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
+    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8);
+
+    let Some(count) = clamp_count(vm, buf_id, count) else {
+        memory::write_word(&mut vm.frames.data, frame_base, 0);
+        return Ok(());
+    };
+
+    let fd_num = get_fd_num(vm, fd_id);
+    let mut tmp = vec![0u8; count];
+    let mut total = 0usize;
+    let mut result = 0i32;
+    while total < count {
+        match vm.files.read(fd_num, &mut tmp[total..]) {
+            Ok(0) => break, // EOF
+            Ok(n) => total += n,
+            Err(e) => {
+                vm.last_error = format!("{e}");
+                if total == 0 {
+                    result = -1;
+                }
+                break;
+            }
+        }
+    }
+
+    if total > 0 {
+        vm.heap.array_write(buf_id, 0, &tmp[..total]);
+        result = total as i32;
+    }
+
+    memory::write_word(&mut vm.frames.data, frame_base, result);
+    Ok(())
+}
+
 fn sys_write(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
-    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
+    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8);
+
+    let Some(count) = clamp_count(vm, buf_id, count) else {
+        memory::write_word(&mut vm.frames.data, frame_base, 0);
+        return Ok(());
+    };
 
     let fd_num = get_fd_num(vm, fd_id);
     let bytes: Vec<u8> = vm.heap.array_read(buf_id, 0, count).unwrap_or_default();
@@ -553,7 +656,7 @@ fn sys_write(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         Ok(n) => n as i32,
         Err(e) => {
             vm.last_error = format!("{e}");
-            0
+            -1
         }
     };
     memory::write_word(&mut vm.frames.data, frame_base, n);
@@ -564,11 +667,16 @@ fn sys_pread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
-    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
+    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8);
     // big (8 bytes) is aligned to 8-byte boundary: fd(4)+buf(4)+n(4)=offset 44,
     // aligned up to 48 = ARG_START + 16
     let offset = memory::read_big(&vm.frames.data, frame_base + ARG_START + 16);
     let fd_num = get_fd_num(vm, fd_id);
+
+    let Some(count) = clamp_count(vm, buf_id, count) else {
+        memory::write_word(&mut vm.frames.data, frame_base, 0);
+        return Ok(());
+    };
 
     let original_pos = match vm.files.seek(fd_num, 0, 1) {
         Ok(pos) => pos as i64,
@@ -599,11 +707,16 @@ fn sys_pwrite(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let buf_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
-    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
+    let count = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8);
     // big (8 bytes) is aligned to 8-byte boundary: fd(4)+buf(4)+n(4)=offset 44,
     // aligned up to 48 = ARG_START + 16
     let offset = memory::read_big(&vm.frames.data, frame_base + ARG_START + 16);
     let fd_num = get_fd_num(vm, fd_id);
+
+    let Some(count) = clamp_count(vm, buf_id, count) else {
+        memory::write_word(&mut vm.frames.data, frame_base, 0);
+        return Ok(());
+    };
 
     let original_pos = match vm.files.seek(fd_num, 0, 1) {
         Ok(pos) => pos as i64,
@@ -840,7 +953,8 @@ fn sys_chdir(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn sys_remove(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
-    let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    let raw_path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    let path = vm.files.resolve_path(&raw_path);
     let result = match std::fs::remove_file(&path) {
         Ok(()) => 0,
         Err(e) => {
@@ -1018,7 +1132,8 @@ fn sys_fstat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 fn sys_stat(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let path_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
-    let path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    let raw_path = vm.heap.get_string(path_id).unwrap_or("").to_string();
+    let path = vm.files.resolve_path(&raw_path);
 
     match std::fs::metadata(&path) {
         Ok(meta) => {
@@ -1045,10 +1160,16 @@ fn sys_dirread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let fd_num = get_fd_num(vm, fd_id);
     let path = vm.files.get_path(fd_num).unwrap_or("").to_string();
 
+    // Directory reads are positional: each call continues after the entries
+    // already returned, and returns 0 once the directory is exhausted.
+    let start = vm.files.dir_offset(fd_num);
+
     match std::fs::read_dir(&path) {
         Ok(entries) => {
+            let mut names: Vec<std::fs::DirEntry> = entries.flatten().collect();
+            names.sort_by_key(|e| e.file_name());
             let mut dir_ids: Vec<HeapId> = Vec::new();
-            for entry in entries.flatten() {
+            for entry in names.into_iter().skip(start) {
                 if let Ok(meta) = entry.metadata() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     let dir_id = build_dir_record(vm, &meta, &name);
@@ -1056,6 +1177,7 @@ fn sys_dirread(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 }
             }
             let count = dir_ids.len();
+            vm.files.set_dir_offset(fd_num, start + count);
             // Build array of Dir pointers
             let mut arr_data = vec![0u8; count * 4];
             for (i, &id) in dir_ids.iter().enumerate() {
@@ -1346,11 +1468,15 @@ fn sys_stream(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
     let src_fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START);
     let dst_fd_id = read_ptr(&vm.frames.data, frame_base + ARG_START + 4);
-    let bufsiz = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8) as usize;
+    let bufsiz = memory::read_word(&vm.frames.data, frame_base + ARG_START + 8);
 
     let src_fd = get_fd_num(vm, src_fd_id);
     let dst_fd = get_fd_num(vm, dst_fd_id);
-    let bufsiz = if bufsiz == 0 { 8192 } else { bufsiz };
+    // A guest-supplied buffer size must be positive and bounded.
+    let bufsiz = match usize::try_from(bufsiz) {
+        Ok(0) | Err(_) => 8192,
+        Ok(n) => n.min(MAX_STREAM_BUF),
+    };
 
     let mut total: i64 = 0;
     let mut buf = vec![0u8; bufsiz];
@@ -1560,9 +1686,9 @@ mod tests {
     #[test]
     fn format_string_precision_f() {
         let result = run_format("%.2f", |vm, off| {
-            memory::write_real(&mut vm.frames.data, off, 3.14159);
+            memory::write_real(&mut vm.frames.data, off, 3.755);
         });
-        assert_eq!(result, "3.14");
+        assert_eq!(result, "3.75");
     }
 
     #[test]
@@ -1714,9 +1840,9 @@ mod tests {
     #[test]
     fn format_string_g_float() {
         let result = run_format("%g", |vm, off| {
-            memory::write_real(&mut vm.frames.data, off, 3.14);
+            memory::write_real(&mut vm.frames.data, off, 3.75);
         });
-        assert_eq!(result, "3.14");
+        assert_eq!(result, "3.75");
     }
 
     #[test]
@@ -1855,6 +1981,356 @@ mod tests {
 
         let result = format_string(&vm, frame_base, ARG_START, ARG_START + 4);
         assert_eq!(result, "err: file not found");
+    }
+
+    /// Set up a VM with a temp file opened read-write, plus an FD record and a
+    /// byte array of `buf_len` bytes. Returns (vm, frame_base, fd, buf_id).
+    fn vm_with_open_file<'m>(
+        module: &'m Module,
+        path: &std::path::Path,
+        buf: &[u8],
+    ) -> (VmState<'m>, usize, i32, HeapId) {
+        let mut vm = VmState::new(module).expect("vm should initialize");
+        let fd = vm
+            .files
+            .open(path.to_str().expect("temp path should be utf-8"), 2)
+            .expect("open should succeed");
+        let fd_id = alloc_fd_record(&mut vm, fd);
+        let length = buf.len();
+        let buf_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: buf.to_vec(),
+                length,
+            },
+        );
+        let frame_base = vm.frames.current_data_offset();
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, buf_id);
+        (vm, frame_base, fd, buf_id)
+    }
+
+    fn array_bytes(vm: &VmState<'_>, id: HeapId) -> Vec<u8> {
+        match &vm.heap.get(id).expect("array should exist").data {
+            HeapData::Array { data, .. } => data.clone(),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_with_negative_count_returns_zero() {
+        let path = temp_path("read_negative");
+        std::fs::write(&path, b"abcdef").expect("temp file write should succeed");
+
+        let module = test_module();
+        let (mut vm, frame_base, _fd, _buf_id) = vm_with_open_file(&module, &path, &[0u8; 4]);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, -1);
+
+        sys_read(&mut vm).expect("read should not abort on a negative count");
+        assert_eq!(memory::read_word(&vm.frames.data, frame_base), 0);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_clamps_count_to_the_buffer_length() {
+        let path = temp_path("read_clamp");
+        std::fs::write(&path, b"abcdef").expect("temp file write should succeed");
+
+        let module = test_module();
+        let (mut vm, frame_base, fd, buf_id) = vm_with_open_file(&module, &path, &[0u8; 3]);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 6);
+
+        sys_read(&mut vm).expect("read should succeed");
+        assert_eq!(
+            memory::read_word(&vm.frames.data, frame_base),
+            3,
+            "read is limited by the destination array"
+        );
+        assert_eq!(array_bytes(&vm, buf_id), b"abc");
+        let pos = vm.files.seek(fd, 0, 1).expect("seek should succeed");
+        assert_eq!(pos, 3, "discarded bytes must not advance the file offset");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_clamps_count_to_the_buffer_length() {
+        let path = temp_path("write_clamp");
+        std::fs::write(&path, b"").expect("temp file write should succeed");
+
+        let module = test_module();
+        let (mut vm, frame_base, _fd, _buf_id) = vm_with_open_file(&module, &path, b"XYZ");
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 6);
+
+        sys_write(&mut vm).expect("write should succeed");
+        assert_eq!(memory::read_word(&vm.frames.data, frame_base), 3);
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            b"XYZ",
+            "write must not pad with NUL bytes"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_returns_minus_one_on_error() {
+        let path = temp_path("write_error");
+        std::fs::write(&path, b"abc").expect("temp file write should succeed");
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        // Open read-only, then try to write through it.
+        let fd = vm
+            .files
+            .open(path.to_str().expect("temp path should be utf-8"), 0)
+            .expect("open should succeed");
+        let fd_id = alloc_fd_record(&mut vm, fd);
+        let buf_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: b"xy".to_vec(),
+                length: 2,
+            },
+        );
+        let frame_base = vm.frames.current_data_offset();
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, buf_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 2);
+
+        sys_write(&mut vm).expect("write should succeed");
+        assert_eq!(
+            memory::read_word(&vm.frames.data, frame_base),
+            -1,
+            "an I/O error is reported as -1"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn readn_loops_until_count_is_reached() {
+        use std::io::Write as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener address");
+        let writer = std::thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).expect("connect");
+            client.write_all(b"ab").expect("first chunk");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            client.write_all(b"cd").expect("second chunk");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        });
+        let (server, _) = listener.accept().expect("accept");
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fd = vm.files.insert_tcp_stream(server, None);
+        let fd_id = alloc_fd_record(&mut vm, fd);
+        let buf_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: vec![0u8; 4],
+                length: 4,
+            },
+        );
+        let frame_base = vm.frames.current_data_offset();
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, buf_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 8, 4);
+
+        sys_readn(&mut vm).expect("readn should succeed");
+
+        assert_eq!(
+            memory::read_word(&vm.frames.data, frame_base),
+            4,
+            "readn should loop until it has n bytes"
+        );
+        assert_eq!(array_bytes(&vm, buf_id), b"abcd");
+        writer.join().expect("writer thread");
+    }
+
+    #[test]
+    fn fprint_with_nil_fd_returns_error() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let frame_base = vm.frames.current_data_offset();
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, heap::NIL);
+        let fmt_id = vm.heap.alloc(0, HeapData::Str("hello".to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START + 4, fmt_id);
+
+        sys_fprint(&mut vm).expect("fprint should succeed");
+        assert_eq!(
+            memory::read_word(&vm.frames.data, frame_base),
+            -1,
+            "fprint on a nil fd must fail instead of writing to stdout"
+        );
+    }
+
+    #[test]
+    fn remove_resolves_paths_against_the_root() {
+        let root = temp_path("remove_root");
+        std::fs::create_dir_all(&root).expect("create root directory");
+        let victim = root.join("victim.txt");
+        std::fs::write(&victim, b"x").expect("write victim");
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        vm.files = crate::filetab::FileTable::with_root(root.to_string_lossy().to_string());
+        let frame_base = vm.frames.current_data_offset();
+        let path_id = vm.heap.alloc(0, HeapData::Str("/victim.txt".to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, path_id);
+
+        sys_remove(&mut vm).expect("remove should succeed");
+
+        assert_eq!(memory::read_word(&vm.frames.data, frame_base), 0);
+        assert!(
+            !victim.exists(),
+            "remove should delete the file in the root"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stat_resolves_paths_against_the_root() {
+        let root = temp_path("stat_root");
+        std::fs::create_dir_all(&root).expect("create root directory");
+        std::fs::write(root.join("target.txt"), b"abc").expect("write target");
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        vm.files = crate::filetab::FileTable::with_root(root.to_string_lossy().to_string());
+        let frame_base = vm.frames.current_data_offset();
+        let ret_off = frame_base + 48;
+        memory::write_word(&mut vm.frames.data, frame_base + 16, ret_off as i32);
+        let path_id = vm.heap.alloc(0, HeapData::Str("/target.txt".to_string()));
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, path_id);
+
+        sys_stat(&mut vm).expect("stat should succeed");
+
+        assert_eq!(
+            memory::read_word(&vm.frames.data, ret_off),
+            0,
+            "stat should find the file inside the root"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dirread_reports_eof_after_the_last_entry() {
+        let dir = temp_path("dirread");
+        std::fs::create_dir_all(&dir).expect("create directory");
+        std::fs::write(dir.join("a.txt"), b"a").expect("write a");
+        std::fs::write(dir.join("b.txt"), b"b").expect("write b");
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fd = vm
+            .files
+            .open(dir.to_str().expect("temp path should be utf-8"), 0)
+            .expect("open directory should succeed");
+        let fd_id = alloc_fd_record(&mut vm, fd);
+        let frame_base = vm.frames.current_data_offset();
+        let ret_off = frame_base + 48;
+        memory::write_word(&mut vm.frames.data, frame_base + 16, ret_off as i32);
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, fd_id);
+
+        sys_dirread(&mut vm).expect("dirread should succeed");
+        assert_eq!(memory::read_word(&vm.frames.data, ret_off), 2);
+
+        sys_dirread(&mut vm).expect("dirread should succeed");
+        assert_eq!(
+            memory::read_word(&vm.frames.data, ret_off),
+            0,
+            "a second dirread should report end of directory"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_reclaims_fds_of_freed_fd_records() {
+        let path = temp_path("fd_reclaim");
+        std::fs::write(&path, b"abc").expect("temp file write should succeed");
+
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let frame_base = vm.frames.current_data_offset();
+        let path_id = vm.heap.alloc(
+            0,
+            HeapData::Str(
+                path.to_str()
+                    .expect("temp path should be utf-8")
+                    .to_string(),
+            ),
+        );
+        write_ptr(&mut vm.frames.data, frame_base + ARG_START, path_id);
+        memory::write_word(&mut vm.frames.data, frame_base + ARG_START + 4, 0);
+
+        sys_open(&mut vm).expect("open should succeed");
+        let fd_id = read_ptr(&vm.frames.data, frame_base);
+        let fd_num = get_fd_num(&vm, fd_id);
+        assert!(vm.files.fildes(fd_num), "the fd should be open");
+
+        // The guest drops its last reference to the FD record.
+        vm.heap.dec_ref(fd_id);
+        sys_open(&mut vm).expect("open should succeed");
+
+        assert!(
+            !vm.files.fildes(fd_num),
+            "the descriptor of a reclaimed FD record should be closed"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn format_string_precision_s_counts_characters() {
+        let result = run_format("%.1s", |vm, off| {
+            let s_id = vm.heap.alloc(0, HeapData::Str("é".to_string()));
+            write_ptr(&mut vm.frames.data, off, s_id);
+        });
+        assert_eq!(result, "é", "precision must not split a UTF-8 character");
+
+        let result = run_format("%.3s", |vm, off| {
+            let s_id = vm.heap.alloc(0, HeapData::Str("hello".to_string()));
+            write_ptr(&mut vm.frames.data, off, s_id);
+        });
+        assert_eq!(result, "hel");
+    }
+
+    #[test]
+    fn format_string_bounds_huge_width() {
+        let result = run_format("%2000000000d", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 42);
+        });
+        assert!(
+            result.len() <= MAX_FORMAT_WIDTH,
+            "width should be clamped, got {} bytes",
+            result.len()
+        );
+
+        let result = run_format("%99999999999999999999d", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 42);
+        });
+        assert!(result.len() <= MAX_FORMAT_WIDTH);
+    }
+
+    #[test]
+    fn format_string_bounds_huge_precision() {
+        let result = run_format("%.99999999999999999999d", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 42);
+        });
+        assert!(result.len() <= MAX_FORMAT_WIDTH);
     }
 
     #[test]

@@ -9,6 +9,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+/// Upper bound on queued PCM data (about six seconds at 44.1 kHz stereo 16-bit).
+/// Nothing drains the queue when playback is unavailable, so writes past this
+/// bound discard the oldest samples instead of growing the buffer forever.
+const MAX_BUFFER_BYTES: usize = 1024 * 1024;
+
 pub(crate) struct AudioState {
     pub sample_rate: u32,
     pub channels: u16,
@@ -42,7 +47,15 @@ impl AudioState {
             }
         }
         if let Ok(mut buf) = self.buffer.lock() {
-            buf.extend(data);
+            // Keep only the newest MAX_BUFFER_BYTES: a guest that writes faster
+            // than the device drains (or with no device at all) must not be able
+            // to grow this buffer without bound.
+            let tail = &data[data.len().saturating_sub(MAX_BUFFER_BYTES)..];
+            let overflow = (buf.len() + tail.len())
+                .saturating_sub(MAX_BUFFER_BYTES)
+                .min(buf.len());
+            buf.drain(..overflow);
+            buf.extend(tail);
         }
         data.len()
     }
@@ -91,7 +104,7 @@ impl AudioState {
         };
         let config = cpal::StreamConfig {
             channels: self.channels,
-            sample_rate: cpal::SampleRate(self.sample_rate),
+            sample_rate: self.sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
         let buffer = Arc::clone(&self.buffer);
@@ -157,6 +170,32 @@ mod tests {
         let mut state = AudioState::new();
         let data = [0u8; 1024];
         assert_eq!(state.write(&data), 1024);
+    }
+
+    #[test]
+    fn write_bounds_buffer_growth() {
+        let mut state = AudioState::new();
+        let chunk = [0u8; 64 * 1024];
+        // Nothing drains the buffer without a working output device, so the
+        // buffer must not grow without bound.
+        for _ in 0..64 {
+            assert_eq!(state.write(&chunk), chunk.len());
+        }
+        let buffered = state.buffer.lock().expect("buffer lock").len();
+        assert!(
+            buffered <= MAX_BUFFER_BYTES,
+            "buffer grew to {buffered} bytes, above the {MAX_BUFFER_BYTES} byte bound"
+        );
+    }
+
+    #[test]
+    fn write_keeps_most_recent_samples() {
+        let mut state = AudioState::new();
+        state.write(&vec![1u8; MAX_BUFFER_BYTES]);
+        state.write(&[7u8, 8u8]);
+        let buf = state.buffer.lock().expect("buffer lock");
+        assert_eq!(buf.len(), MAX_BUFFER_BYTES);
+        assert_eq!(buf.back().copied(), Some(8), "newest samples are kept");
     }
 
     #[test]

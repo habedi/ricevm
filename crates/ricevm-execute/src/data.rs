@@ -5,6 +5,11 @@ use ricevm_core::DataItem;
 use crate::heap::{Heap, HeapData};
 use crate::memory;
 
+/// Upper bound on the byte size of an array allocated from module data.
+/// Module data comes from an untrusted `.dis` file, so a hostile length
+/// must not be able to exhaust memory at load time.
+const MAX_ARRAY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Initialize the module data pointer (MP) memory from DataItem entries.
 ///
 /// Returns a flat byte buffer of size `data_size`, with values written
@@ -30,46 +35,57 @@ pub(crate) fn init_mp_with_types(
     for item in items {
         match item {
             DataItem::Bytes { offset, values } => {
+                let Some(off) = checked_offset(*offset) else {
+                    continue;
+                };
                 let buf = active_buffer(&mut mp, heap, &array_stack);
-                let off = *offset as usize;
                 for (i, &b) in values.iter().enumerate() {
-                    if off + i < buf.len() {
-                        memory::write_byte(buf, off + i, b);
+                    match off.checked_add(i) {
+                        Some(pos) if pos < buf.len() => memory::write_byte(buf, pos, b),
+                        _ => break,
                     }
                 }
             }
             DataItem::Words { offset, values } => {
+                let Some(off) = checked_offset(*offset) else {
+                    continue;
+                };
                 let buf = active_buffer(&mut mp, heap, &array_stack);
-                let off = *offset as usize;
                 for (i, &w) in values.iter().enumerate() {
-                    let pos = off + i * 4;
-                    if pos + 4 <= buf.len() {
-                        memory::write_word(buf, pos, w);
+                    match element_pos(off, i, 4) {
+                        Some(pos) if pos + 4 <= buf.len() => memory::write_word(buf, pos, w),
+                        _ => break,
                     }
                 }
             }
             DataItem::Bigs { offset, values } => {
+                let Some(off) = checked_offset(*offset) else {
+                    continue;
+                };
                 let buf = active_buffer(&mut mp, heap, &array_stack);
-                let off = *offset as usize;
                 for (i, &b) in values.iter().enumerate() {
-                    let pos = off + i * 8;
-                    if pos + 8 <= buf.len() {
-                        memory::write_big(buf, pos, b);
+                    match element_pos(off, i, 8) {
+                        Some(pos) if pos + 8 <= buf.len() => memory::write_big(buf, pos, b),
+                        _ => break,
                     }
                 }
             }
             DataItem::Reals { offset, values } => {
+                let Some(off) = checked_offset(*offset) else {
+                    continue;
+                };
                 let buf = active_buffer(&mut mp, heap, &array_stack);
-                let off = *offset as usize;
                 for (i, &r) in values.iter().enumerate() {
-                    let pos = off + i * 8;
-                    if pos + 8 <= buf.len() {
-                        memory::write_real(buf, pos, r);
+                    match element_pos(off, i, 8) {
+                        Some(pos) if pos + 8 <= buf.len() => memory::write_real(buf, pos, r),
+                        _ => break,
                     }
                 }
             }
             DataItem::String { offset, value } => {
-                let off = *offset as usize;
+                let Some(off) = checked_offset(*offset) else {
+                    continue;
+                };
                 let id = heap.alloc(0, HeapData::Str(value.clone()));
                 let buf = active_buffer(&mut mp, heap, &array_stack);
                 if off + 4 <= buf.len() {
@@ -81,12 +97,21 @@ pub(crate) fn init_mp_with_types(
                 element_type,
                 length,
             } => {
-                let off = *offset as usize;
-                let len = *length as usize;
+                let Some(off) = checked_offset(*offset) else {
+                    continue;
+                };
+                let Ok(len) = usize::try_from(*length) else {
+                    continue;
+                };
                 let et = *element_type as usize;
                 // Look up element size from type descriptors; default to 4.
                 let elem_size = types.get(et).map(|td| td.size as usize).unwrap_or(4).max(1);
-                let data = vec![0u8; len * elem_size];
+                // Refuse hostile sizes rather than aborting on allocation.
+                let byte_len = match len.checked_mul(elem_size) {
+                    Some(n) if n <= MAX_ARRAY_BYTES => n,
+                    _ => continue,
+                };
+                let data = vec![0u8; byte_len];
                 let arr_id = heap.alloc(
                     et as u32,
                     HeapData::Array {
@@ -102,8 +127,12 @@ pub(crate) fn init_mp_with_types(
                 }
             }
             DataItem::SetArray { offset, index } => {
-                let off = *offset as usize;
-                let idx = *index as usize;
+                let Some(off) = checked_offset(*offset) else {
+                    continue;
+                };
+                let Ok(idx) = usize::try_from(*index) else {
+                    continue;
+                };
                 // Read the array HeapId from the active buffer (MP or parent array).
                 // When inside a nested array context (array_stack non-empty),
                 // the offset refers to the current array's data, not MP.
@@ -133,7 +162,10 @@ pub(crate) fn init_mp_with_types(
                     } else {
                         4
                     };
-                    array_stack.push((arr_id, elem_size, idx * elem_size));
+                    let Some(base) = idx.checked_mul(elem_size) else {
+                        continue;
+                    };
+                    array_stack.push((arr_id, elem_size, base));
                 }
             }
             DataItem::RestoreBase => {
@@ -143,6 +175,17 @@ pub(crate) fn init_mp_with_types(
     }
 
     mp
+}
+
+/// Convert an untrusted module data offset to a buffer index.
+/// Negative offsets are rejected: they can never name a valid location.
+fn checked_offset(offset: ricevm_core::Word) -> Option<usize> {
+    usize::try_from(offset).ok()
+}
+
+/// Byte position of element `index` of `size` bytes at `base`, if it does not overflow.
+fn element_pos(base: usize, index: usize, size: usize) -> Option<usize> {
+    index.checked_mul(size).and_then(|d| base.checked_add(d))
 }
 
 /// Get the active write buffer: either an array element's data or the MP.
@@ -267,6 +310,81 @@ mod tests {
             }
             _ => panic!("expected Array"),
         }
+    }
+
+    #[test]
+    fn array_with_negative_length_is_ignored() {
+        let mut heap = Heap::new();
+        let items = vec![DataItem::Array {
+            offset: 0,
+            element_type: 0,
+            length: -1,
+        }];
+        let mp = init_mp(8, &items, &mut heap);
+        assert_eq!(
+            memory::read_word(&mp, 0),
+            0,
+            "a negative array length must not allocate"
+        );
+    }
+
+    #[test]
+    fn array_with_oversized_length_is_ignored() {
+        let mut heap = Heap::new();
+        let types = vec![ricevm_core::TypeDescriptor {
+            id: 0,
+            size: 8,
+            pointer_map: ricevm_core::PointerMap { bytes: vec![] },
+            pointer_count: 0,
+        }];
+        let items = vec![DataItem::Array {
+            offset: 0,
+            element_type: 0,
+            length: i32::MAX,
+        }];
+        let mp = init_mp_with_types(8, &items, &mut heap, &types);
+        assert_eq!(
+            memory::read_word(&mp, 0),
+            0,
+            "an oversized array must not allocate"
+        );
+    }
+
+    #[test]
+    fn negative_offsets_are_ignored() {
+        let mut heap = Heap::new();
+        let items = vec![
+            DataItem::Bytes {
+                offset: -1,
+                values: vec![1, 2, 3],
+            },
+            DataItem::Words {
+                offset: -4,
+                values: vec![7, 8],
+            },
+            DataItem::Bigs {
+                offset: -8,
+                values: vec![9],
+            },
+            DataItem::Reals {
+                offset: -8,
+                values: vec![1.0],
+            },
+            DataItem::String {
+                offset: -4,
+                value: "x".to_string(),
+            },
+            DataItem::Array {
+                offset: -4,
+                element_type: 0,
+                length: 2,
+            },
+        ];
+        let mp = init_mp(16, &items, &mut heap);
+        assert!(
+            mp.iter().all(|&b| b == 0),
+            "negative offsets must not write into MP"
+        );
     }
 
     #[test]

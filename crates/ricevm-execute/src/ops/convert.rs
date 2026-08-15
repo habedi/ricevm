@@ -17,14 +17,27 @@ fn parse_strtol(s: &str) -> i64 {
         (false, s)
     };
     let mut val: i64 = 0;
+    let mut overflowed = false;
     for b in s.bytes() {
-        if b.is_ascii_digit() {
-            val = val.wrapping_mul(10).wrapping_add((b - b'0') as i64);
-        } else {
+        if !b.is_ascii_digit() {
             break;
         }
+        if overflowed {
+            continue;
+        }
+        // C's strtol/strtoll clamp to LONG_MIN/LONG_MAX; they do not wrap.
+        match val
+            .checked_mul(10)
+            .and_then(|v| v.checked_add((b - b'0') as i64))
+        {
+            Some(v) => val = v,
+            None => overflowed = true,
+        }
     }
-    if neg { val.wrapping_neg() } else { val }
+    if overflowed {
+        return if neg { i64::MIN } else { i64::MAX };
+    }
+    if neg { -val } else { val }
 }
 
 /// Emulate C's %g format for f64.
@@ -145,7 +158,8 @@ pub(crate) fn op_cvtcw(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     // string to word: parse string as base-10 integer (reference: strtol(s, nil, 10))
     let str_id = vm.src_ptr()?;
     let val = match vm.heap.get_string(str_id) {
-        Some(s) => parse_strtol(s) as i32,
+        // strtol on a 32-bit long saturates at LONG_MIN/LONG_MAX.
+        Some(s) => parse_strtol(s).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
         None => 0,
     };
     vm.set_dst_word(val)
@@ -341,11 +355,11 @@ mod tests {
 
     #[test]
     fn cvtrf_reads_f32_bits_from_word() {
-        // Store f32 3.14 as bits in a word slot, then convert to f64
+        // Store f32 3.5 as bits in a word slot, then convert to f64
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm init");
         let fp = vm.frames.current_data_offset();
-        let f32_bits = f32::to_bits(3.14_f32) as i32;
+        let f32_bits = f32::to_bits(3.5_f32) as i32;
         memory::write_word(&mut vm.frames.data, fp, f32_bits);
         vm.src = AddrTarget::Frame(fp);
         vm.dst = AddrTarget::Frame(fp + 4);
@@ -353,16 +367,16 @@ mod tests {
         op_cvtrf(&mut vm).expect("cvtrf should succeed");
 
         let result = memory::read_real(&vm.frames.data, fp + 4);
-        assert!((result - 3.14_f32 as f64).abs() < 1e-6);
+        assert!((result - 3.5_f32 as f64).abs() < 1e-6);
     }
 
     #[test]
     fn cvtfr_stores_f32_bits_in_word() {
-        // Convert f64 3.14 to f32, store bits as word
+        // Convert f64 3.5 to f32, store bits as word
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm init");
         let fp = vm.frames.current_data_offset();
-        memory::write_real(&mut vm.frames.data, fp, 3.14);
+        memory::write_real(&mut vm.frames.data, fp, 3.5);
         vm.src = AddrTarget::Frame(fp);
         vm.dst = AddrTarget::Frame(fp + 8);
 
@@ -370,7 +384,7 @@ mod tests {
 
         let word = memory::read_word(&vm.frames.data, fp + 8);
         let f32_val = f32::from_bits(word as u32);
-        assert!((f32_val - 3.14_f32).abs() < 1e-6);
+        assert!((f32_val - 3.5_f32).abs() < 1e-6);
     }
 
     #[test]
@@ -484,14 +498,14 @@ mod tests {
         let mut vm = VmState::new(&module).expect("vm init");
         let fp = vm.frames.current_data_offset();
 
-        memory::write_real(&mut vm.frames.data, fp, 3.14);
+        memory::write_real(&mut vm.frames.data, fp, 3.75);
         vm.src = AddrTarget::Frame(fp);
         vm.dst = AddrTarget::Frame(fp + 8);
         op_cvtfc(&mut vm).expect("cvtfc should succeed");
 
         let str_id = memory::read_word(&vm.frames.data, fp + 8) as u32;
         let result = vm.heap.get_string(str_id).unwrap();
-        assert_eq!(result, "3.14");
+        assert_eq!(result, "3.75");
     }
 
     #[test]
@@ -538,10 +552,72 @@ mod tests {
     }
 
     #[test]
+    fn parse_strtol_saturates_like_c() {
+        // C's strtoll clamps to LLONG_MIN/LLONG_MAX instead of wrapping.
+        assert_eq!(parse_strtol("99999999999999999999999"), i64::MAX);
+        assert_eq!(parse_strtol("-99999999999999999999999"), i64::MIN);
+        assert_eq!(parse_strtol("9223372036854775807"), i64::MAX);
+        assert_eq!(parse_strtol("-9223372036854775808"), i64::MIN);
+    }
+
+    #[test]
+    fn cvtcw_saturates_out_of_range_string() {
+        // C's strtol on a 32-bit long clamps to LONG_MAX, it does not wrap.
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let str_id = vm
+            .heap
+            .alloc(0, crate::heap::HeapData::Str("9999999999".to_string()));
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = str_id as i32;
+        vm.dst = AddrTarget::Frame(fp);
+        op_cvtcw(&mut vm).expect("cvtcw should succeed");
+
+        assert_eq!(memory::read_word(&vm.frames.data, fp), i32::MAX);
+    }
+
+    #[test]
+    fn cvtcw_saturates_negative_out_of_range_string() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let str_id = vm
+            .heap
+            .alloc(0, crate::heap::HeapData::Str("-9999999999".to_string()));
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = str_id as i32;
+        vm.dst = AddrTarget::Frame(fp);
+        op_cvtcw(&mut vm).expect("cvtcw should succeed");
+
+        assert_eq!(memory::read_word(&vm.frames.data, fp), i32::MIN);
+    }
+
+    #[test]
+    fn cvtcl_saturates_out_of_range_string() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let str_id = vm.heap.alloc(
+            0,
+            crate::heap::HeapData::Str("99999999999999999999".to_string()),
+        );
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = str_id as i32;
+        vm.dst = AddrTarget::Frame(fp);
+        op_cvtcl(&mut vm).expect("cvtcl should succeed");
+
+        assert_eq!(memory::read_big(&vm.frames.data, fp), i64::MAX);
+    }
+
+    #[test]
     fn format_g_basic() {
         assert_eq!(format_g(0.0), "0");
         assert_eq!(format_g(1.0), "1");
-        assert_eq!(format_g(3.14), "3.14");
+        assert_eq!(format_g(3.75), "3.75");
         assert_eq!(format_g(1e20), "1e+20");
         assert_eq!(format_g(-1.5), "-1.5");
         assert_eq!(format_g(100.0), "100");

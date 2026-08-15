@@ -15,6 +15,8 @@ use crate::memory;
 /// Marks all reachable objects starting from:
 /// 1. The frame stack (scanning for pointer-sized words that look like HeapIds)
 /// 2. The module data (MP)
+/// 3. The heap reference table (`indx`/`lea` element references), which holds
+///    real HeapIds that never appear as words in any scanned buffer
 ///
 /// Then sweeps all unmarked objects from the heap.
 pub(crate) fn collect(
@@ -24,6 +26,7 @@ pub(crate) fn collect(
     loaded_modules: &[crate::vm::LoadedModule],
     suspended_threads: &std::collections::VecDeque<crate::vm::SuspendedThread>,
     caller_mp_stack: &[(usize, Vec<u8>)],
+    heap_refs: &[(HeapId, usize)],
 ) {
     if heap.len() == 0 {
         return;
@@ -47,13 +50,18 @@ pub(crate) fn collect(
         scan_buffer(&lm.mp, heap, &mut marked);
     }
 
-    // Mark phase: scan suspended threads' frames, MPs, and caller stacks
+    // Mark phase: the current thread's heap reference table. `indx`/`lea` store
+    // a flagged index in the frame, so these ids are only reachable from here.
+    scan_heap_refs(heap_refs, heap, &mut marked);
+
+    // Mark phase: scan suspended threads' frames, MPs, caller stacks, and refs
     for thread in suspended_threads {
         scan_buffer(&thread.frames.data, heap, &mut marked);
         scan_buffer(&thread.mp, heap, &mut marked);
         for (_, caller_mp) in &thread.caller_mp_stack {
             scan_buffer(caller_mp, heap, &mut marked);
         }
+        scan_heap_refs(&thread.heap_refs, heap, &mut marked);
     }
 
     // Sweep phase: remove all unmarked objects
@@ -70,6 +78,15 @@ fn scan_buffer(buf: &[u8], heap: &Heap, marked: &mut HashSet<HeapId>) {
             mark_object(word, heap, marked);
         }
         offset += 4;
+    }
+}
+
+/// Mark every object named by a heap reference table entry.
+fn scan_heap_refs(refs: &[(HeapId, usize)], heap: &Heap, marked: &mut HashSet<HeapId>) {
+    for &(id, _) in refs {
+        if id != NIL && heap.contains(id) {
+            mark_object(id, heap, marked);
+        }
     }
 }
 
@@ -110,7 +127,21 @@ fn mark_object(id: HeapId, heap: &Heap, marked: &mut HashSet<HeapId>) {
             HeapData::ArraySlice { parent_id, .. } => {
                 mark_object(*parent_id, heap, marked);
             }
-            HeapData::Str(_) | HeapData::Channel { .. } => {}
+            HeapData::Channel { pending, .. } => {
+                // A value in transit through a channel is only referenced by
+                // the channel's payload buffer; scan it so it is not swept.
+                if let Some(pending) = pending {
+                    let mut offset = 0;
+                    while offset + 4 <= pending.len() {
+                        let word = memory::read_word(pending, offset) as u32;
+                        if word != NIL && heap.contains(word) {
+                            mark_object(word, heap, marked);
+                        }
+                        offset += 4;
+                    }
+                }
+            }
+            HeapData::Str(_) => {}
             HeapData::ModuleRef { .. }
             | HeapData::MainModule { .. }
             | HeapData::LoadedModule { .. } => {}
@@ -146,6 +177,7 @@ mod tests {
             &[],
             &std::collections::VecDeque::new(),
             &[],
+            &[],
         );
 
         // After GC: id2 should be collected (not referenced by any root)
@@ -168,6 +200,7 @@ mod tests {
             &[],
             &[],
             &std::collections::VecDeque::new(),
+            &[],
             &[],
         );
 
@@ -194,6 +227,7 @@ mod tests {
             &[],
             &[],
             &std::collections::VecDeque::new(),
+            &[],
             &[],
         );
 
@@ -229,7 +263,7 @@ mod tests {
             blocked_on: None,
         });
 
-        collect(&mut heap, &frames, &[], &[], &thread_queue, &[]);
+        collect(&mut heap, &frames, &[], &[], &thread_queue, &[], &[]);
 
         // Object referenced by the suspended thread must survive
         assert!(
@@ -271,6 +305,7 @@ mod tests {
             &[],
             &std::collections::VecDeque::new(),
             &[],
+            &[],
         );
 
         assert!(heap.get(arr_id).is_some(), "array should survive GC");
@@ -295,6 +330,7 @@ mod tests {
             &[],
             &std::collections::VecDeque::new(),
             &[],
+            &[],
         );
 
         for id in ids {
@@ -303,6 +339,109 @@ mod tests {
                 "unreachable object {id} should be collected"
             );
         }
+    }
+
+    #[test]
+    fn gc_preserves_heap_ref_table_entries() {
+        let mut heap = Heap::new();
+        let arr_id = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0u8; 8],
+                length: 2,
+            },
+        );
+
+        // `indx`/`lea` leave a flagged index in the frame and the real id in
+        // heap_refs, so the frame scan alone can never find this object.
+        let frames = FrameStack::new();
+        let heap_refs = vec![(arr_id, 4usize)];
+
+        collect(
+            &mut heap,
+            &frames,
+            &[],
+            &[],
+            &std::collections::VecDeque::new(),
+            &[],
+            &heap_refs,
+        );
+
+        assert!(
+            heap.get(arr_id).is_some(),
+            "objects referenced by the heap_refs table must survive GC"
+        );
+    }
+
+    #[test]
+    fn gc_preserves_suspended_thread_heap_refs() {
+        let mut heap = Heap::new();
+        let str_id = heap.alloc(0, HeapData::Str("element-ref".to_string()));
+
+        let mut thread_queue = std::collections::VecDeque::new();
+        thread_queue.push_back(crate::vm::SuspendedThread {
+            frames: FrameStack::new(),
+            mp: Vec::new(),
+            pc: 0,
+            heap_refs: vec![(str_id, 0)],
+            last_error: String::new(),
+            current_loaded_module: None,
+            caller_mp_stack: Vec::new(),
+            blocked_on: None,
+        });
+
+        collect(
+            &mut heap,
+            &FrameStack::new(),
+            &[],
+            &[],
+            &thread_queue,
+            &[],
+            &[],
+        );
+
+        assert!(
+            heap.get(str_id).is_some(),
+            "a suspended thread's heap_refs must be GC roots"
+        );
+    }
+
+    #[test]
+    fn gc_preserves_channel_payload() {
+        let mut heap = Heap::new();
+        let str_id = heap.alloc(0, HeapData::Str("in transit".to_string()));
+        let mut pending = vec![0u8; 4];
+        memory::write_word(&mut pending, 0, str_id as i32);
+        let chan_id = heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: Some(pending),
+            },
+        );
+
+        let mut frames = FrameStack::new();
+        frames.push_entry(16, -1);
+        let off = frames.current_data_offset();
+        memory::write_word(&mut frames.data, off, chan_id as i32);
+
+        collect(
+            &mut heap,
+            &frames,
+            &[],
+            &[],
+            &std::collections::VecDeque::new(),
+            &[],
+            &[],
+        );
+
+        assert!(heap.get(chan_id).is_some(), "channel should survive GC");
+        assert!(
+            heap.get(str_id).is_some(),
+            "a value in transit through a channel must survive GC"
+        );
     }
 
     #[test]
@@ -320,6 +459,7 @@ mod tests {
             &mp,
             &[],
             &std::collections::VecDeque::new(),
+            &[],
             &[],
         );
 

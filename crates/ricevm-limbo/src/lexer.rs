@@ -218,6 +218,9 @@ impl<'src> Lexer<'src> {
             let radix_str = std::str::from_utf8(&self.src[start..self.pos])
                 .map_err(|_| self.err("invalid radix"))?;
             let radix: u32 = radix_str.parse().map_err(|e| self.err(format!("{e}")))?;
+            if !(2..=36).contains(&radix) {
+                return Err(self.err(format!("radix must be between 2 and 36, found {radix}")));
+            }
             self.advance(); // skip 'r'
             let digits_start = self.pos;
             while self.pos < self.src.len()
@@ -279,11 +282,13 @@ impl<'src> Lexer<'src> {
             if self.pos >= self.src.len() {
                 return Err(self.err("unterminated string literal"));
             }
-            let ch = self.advance();
+            let ch = self.peek();
             if ch == b'"' {
+                self.advance();
                 break;
             }
             if ch == b'\\' {
+                self.advance();
                 let esc = self.advance();
                 match esc {
                     b'n' => s.push('\n'),
@@ -308,13 +313,33 @@ impl<'src> Lexer<'src> {
                     }
                 }
             } else {
-                s.push(ch as char);
+                s.push(self.next_utf8_char());
             }
         }
         Ok(Token {
             kind: TokenKind::StringLit(s),
             span,
         })
+    }
+
+    /// Decode exactly one UTF-8 scalar at the current position and advance
+    /// past its bytes. Bytes that do not start a valid scalar are consumed
+    /// one at a time and returned as-is.
+    fn next_utf8_char(&mut self) -> char {
+        let start = self.pos;
+        let lead = self.peek();
+        let end = (start + utf8_len(lead)).min(self.src.len());
+        let decoded = std::str::from_utf8(&self.src[start..end])
+            .ok()
+            .and_then(|s| s.chars().next());
+        if let Some(c) = decoded {
+            for _ in 0..c.len_utf8() {
+                self.advance();
+            }
+            return c;
+        }
+        self.advance();
+        lead as char
     }
 
     fn lex_char(&mut self, span: Span) -> Result<Token, LexError> {
@@ -333,31 +358,8 @@ impl<'src> Lexer<'src> {
                 _ => esc as i32,
             }
         } else {
-            // Handle UTF-8 character
-            let start = self.pos;
-            self.advance();
-            // Check for multi-byte UTF-8
-            let slice = &self.src[start..self.pos.min(self.src.len())];
-            if let Ok(s) = std::str::from_utf8(slice) {
-                s.chars().next().map(|c| c as i32).unwrap_or(0)
-            } else {
-                // Try reading more bytes for multi-byte chars
-                let end = (start + 4).min(self.src.len());
-                if let Ok(s) = std::str::from_utf8(&self.src[start..end]) {
-                    if let Some(c) = s.chars().next() {
-                        // Advance past the remaining bytes
-                        let extra = c.len_utf8() - 1;
-                        for _ in 0..extra {
-                            self.advance();
-                        }
-                        c as i32
-                    } else {
-                        0
-                    }
-                } else {
-                    self.src[start] as i32
-                }
-            }
+            // One UTF-8 scalar, decoded from its own bytes only
+            self.next_utf8_char() as i32
         };
         if self.peek() == b'\'' {
             self.advance();
@@ -554,6 +556,17 @@ impl<'src> Lexer<'src> {
     }
 }
 
+/// Number of bytes in the UTF-8 scalar introduced by `lead`.
+fn utf8_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +579,13 @@ mod tests {
             .map(|t| t.kind)
             .filter(|k| *k != TokenKind::Eof)
             .collect()
+    }
+
+    fn lex_err(src: &str) -> String {
+        Lexer::new(src, "<test>")
+            .tokenize()
+            .expect_err("lex should fail")
+            .message
     }
 
     #[test]
@@ -609,11 +629,11 @@ mod tests {
 
     #[test]
     fn float_literal() {
-        let tokens = lex("3.14 1e10 2.5e-3");
+        let tokens = lex("3.25 1e10 2.5e-3");
         assert_eq!(
             tokens,
             vec![
-                TokenKind::RealLit(3.14),
+                TokenKind::RealLit(3.25),
                 TokenKind::RealLit(1e10),
                 TokenKind::RealLit(2.5e-3),
             ]
@@ -821,6 +841,47 @@ include "sys.m";
     fn empty_string() {
         let tokens = lex(r#""""#);
         assert_eq!(tokens, vec![TokenKind::StringLit(String::new())]);
+    }
+
+    #[test]
+    fn radix_literal_bounds() {
+        let tokens = lex("2r1010 36rzz");
+        assert_eq!(
+            tokens,
+            vec![TokenKind::IntLit(0b1010), TokenKind::IntLit(35 * 36 + 35)]
+        );
+    }
+
+    #[test]
+    fn radix_out_of_range_is_error() {
+        // Radices outside 2..=36 must be reported, not passed to
+        // `i64::from_str_radix` (which panics on them).
+        for src in ["99r11", "1r0", "0r1"] {
+            let msg = lex_err(src);
+            assert!(msg.contains("radix"), "unexpected message for {src}: {msg}");
+        }
+    }
+
+    #[test]
+    fn string_literal_non_ascii_utf8() {
+        let tokens = lex(r#""héllo ü""#);
+        assert_eq!(tokens, vec![TokenKind::StringLit("héllo ü".to_string())]);
+    }
+
+    #[test]
+    fn char_literal_non_ascii_utf8() {
+        // Each literal must decode exactly one scalar starting at its own
+        // first byte, independent of the bytes that follow it.
+        let tokens = lex("'é''ü' '\u{20AC}' '\u{1F600}'");
+        assert_eq!(
+            tokens,
+            vec![
+                TokenKind::CharLit(0xE9),
+                TokenKind::CharLit(0xFC),
+                TokenKind::CharLit(0x20AC),
+                TokenKind::CharLit(0x1F600),
+            ]
+        );
     }
 
     #[test]

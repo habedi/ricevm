@@ -16,7 +16,7 @@ use crate::filetab::FileTable;
 use crate::frame::FrameStack;
 use crate::heap::{Heap, HeapId};
 use crate::ops;
-use crate::vm::LoadedModule;
+use crate::vm::{LoadedModule, deadlock_fault};
 
 /// Default number of instructions per quanta before switching threads.
 const DEFAULT_QUANTA: usize = 2048;
@@ -46,8 +46,10 @@ pub(crate) struct VmThread {
 pub(crate) enum ThreadState {
     Ready,
     Running,
-    BlockedSend(HeapId),
-    BlockedRecv(HeapId),
+    /// Waiting for a channel operation on the given channel to become
+    /// possible. `NIL` marks a thread blocked in `alt`, which any channel
+    /// operation wakes.
+    Blocked(HeapId),
     Exited,
 }
 
@@ -61,6 +63,8 @@ pub(crate) struct SharedState<'m> {
     pub gc_enabled: bool,
     pub gc_counter: usize,
     pub trace: bool,
+    /// Source of thread ids, shared so worker-spawned threads get unique ones.
+    pub next_thread_id: u32,
 }
 
 /// The cooperative scheduler manages multiple threads sharing a common heap and module table.
@@ -126,6 +130,13 @@ impl<'m> Scheduler<'m> {
                 break;
             }
 
+            // Bring a runnable thread to the front. Only another thread's
+            // channel operation can wake a blocked one, so when every thread
+            // is blocked the program cannot make progress.
+            if !self.rotate_to_ready() {
+                return Err(deadlock_fault());
+            }
+
             // Run the front thread for one quanta
             let quanta = DEFAULT_QUANTA;
             self.run_thread_quanta(quanta)?;
@@ -141,6 +152,22 @@ impl<'m> Scheduler<'m> {
         Ok(())
     }
 
+    /// Rotate the queue so that a runnable thread is at the front.
+    /// Returns false when every thread is blocked on a channel.
+    fn rotate_to_ready(&mut self) -> bool {
+        match self
+            .threads
+            .iter()
+            .position(|t| !matches!(t.state, ThreadState::Blocked(_)))
+        {
+            Some(idx) => {
+                self.threads.rotate_left(idx);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn run_thread_quanta(&mut self, quanta: usize) -> Result<(), ExecError> {
         for _ in 0..quanta {
             // Check if front thread exists and is still running
@@ -149,6 +176,12 @@ impl<'m> Scheduler<'m> {
                 _ => break,
             };
             if pc >= code_len {
+                // Running off the end of the code ends the thread. Without
+                // halting it here `run()` would retain it, this loop would
+                // break immediately, and the outer loop would spin forever.
+                if let Some(thread) = self.threads.front_mut() {
+                    thread.halted = true;
+                }
                 break;
             }
 
@@ -189,9 +222,12 @@ impl<'m> Scheduler<'m> {
             // Dispatch (borrows self mutably)
             dispatch_for_thread(self, &inst)?;
 
-            // Update PC
-            if let Some(thread) = self.threads.front_mut() {
-                thread.pc = thread.next_pc;
+            // Update PC. A thread that blocked on a channel keeps its PC so it
+            // re-executes the operation once woken, and yields the quanta.
+            match self.threads.front_mut() {
+                Some(thread) if matches!(thread.state, ThreadState::Blocked(_)) => break,
+                Some(thread) => thread.pc = thread.next_pc,
+                None => break,
             }
         }
         Ok(())
@@ -203,7 +239,6 @@ pub(crate) struct PreemptiveScheduler<'m> {
     shared: Arc<Mutex<SharedState<'m>>>,
     threads: Arc<Mutex<VecDeque<VmThread>>>,
     condvar: Arc<Condvar>,
-    next_thread_id: u32,
     pool_size: usize,
 }
 
@@ -224,12 +259,12 @@ impl<'m> PreemptiveScheduler<'m> {
             gc_enabled: std::env::var("RICEVM_NO_GC").is_err(),
             gc_counter: 0,
             trace: std::env::var("RICEVM_TRACE").is_ok(),
+            next_thread_id: 1,
         };
         Self {
             shared: Arc::new(Mutex::new(shared)),
             threads: Arc::new(Mutex::new(VecDeque::new())),
             condvar: Arc::new(Condvar::new()),
-            next_thread_id: 1,
             pool_size,
         }
     }
@@ -242,8 +277,14 @@ impl<'m> PreemptiveScheduler<'m> {
     }
 
     pub fn spawn_thread(&mut self, frames: FrameStack, mp: Vec<u8>, pc: usize) -> u32 {
-        let id = self.next_thread_id;
-        self.next_thread_id += 1;
+        // Take the id from the shared state so ids stay unique across the
+        // threads workers spawn while running.
+        let id = {
+            let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            let id = shared.next_thread_id;
+            shared.next_thread_id += 1;
+            id
+        };
         self.threads
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -327,12 +368,13 @@ fn worker_loop(
         };
 
         // Execute the thread for one quanta
+        let mut spawned = Vec::new();
         let result = {
             let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-            run_thread_quanta_shared(&mut state, &mut thread, DEFAULT_QUANTA)
+            run_thread_quanta_shared(&mut state, &mut thread, DEFAULT_QUANTA, &mut spawned)
         };
 
-        // Return thread to queue
+        // Return thread to queue, along with anything it spawned
         {
             let mut queue = threads.lock().unwrap_or_else(|e| e.into_inner());
             if thread.halted {
@@ -341,6 +383,7 @@ fn worker_loop(
                 thread.state = ThreadState::Ready;
             }
             queue.push_back(thread);
+            queue.extend(spawned);
         }
         condvar.notify_all();
 
@@ -352,6 +395,7 @@ fn run_thread_quanta_shared(
     state: &mut SharedState<'_>,
     thread: &mut VmThread,
     quanta: usize,
+    spawned: &mut Vec<VmThread>,
 ) -> Result<(), ExecError> {
     for _ in 0..quanta {
         if thread.halted || thread.pc >= state.module.code.len() {
@@ -412,11 +456,17 @@ fn run_thread_quanta_shared(
             last_error: std::mem::take(&mut thread.last_error),
             caller_mp_stack: Vec::new(),
             blocked_channel: None,
+            unwind_floor: 0,
             thread_queue: std::collections::VecDeque::new(),
             heap_refs: std::mem::take(&mut thread.heap_refs),
         };
 
         let result = ops::dispatch(&mut vm, &inst);
+
+        // Threads created by this instruction live in the temporary VmState's
+        // queue; hand them back instead of dropping them with it.
+        let children = std::mem::take(&mut vm.thread_queue);
+        let blocked_channel = vm.blocked_channel.take();
 
         // Move state back
         thread.mp = vm.mp;
@@ -438,7 +488,40 @@ fn run_thread_quanta_shared(
         state.files = vm.files;
         state.gc_counter = vm.gc_counter;
 
+        for child in children {
+            let id = state.next_thread_id;
+            state.next_thread_id += 1;
+            spawned.push(VmThread {
+                frames: child.frames,
+                mp: child.mp,
+                pc: child.pc,
+                next_pc: 0,
+                halted: false,
+                src: AddrTarget::None,
+                mid: AddrTarget::None,
+                dst: AddrTarget::None,
+                imm_src: 0,
+                imm_mid: 0,
+                imm_dst: 0,
+
+                heap_refs: child.heap_refs,
+                last_error: child.last_error,
+                id,
+                state: ThreadState::Ready,
+            });
+        }
+
         result?;
+
+        if let Some(chan_id) = blocked_channel {
+            // Nothing in the worker pool can wake a blocked thread: there is
+            // no per-channel wakeup protocol, so parking the thread here would
+            // hang the pool. Report the operation instead of advancing past it
+            // and leaving the receive destination unwritten.
+            return Err(ExecError::Other(format!(
+                "preemptive scheduler: blocking channel operation on {chan_id} is not supported"
+            )));
+        }
 
         thread.pc = thread.next_pc;
     }
@@ -447,6 +530,32 @@ fn run_thread_quanta_shared(
 
 /// Dispatch an instruction for the current front thread (cooperative mode).
 fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<(), ExecError> {
+    // Mirror the other threads' blocked state into the temporary VmState so a
+    // channel operation performed by this instruction wakes them, exactly as
+    // it does in the main run loop. Entry `i` mirrors `sched.threads[i + 1]`.
+    let waiters: Vec<Option<HeapId>> = sched
+        .threads
+        .iter()
+        .skip(1)
+        .map(|t| match t.state {
+            ThreadState::Blocked(chan_id) => Some(chan_id),
+            _ => None,
+        })
+        .collect();
+    let thread_queue: VecDeque<crate::vm::SuspendedThread> = waiters
+        .iter()
+        .map(|blocked_on| crate::vm::SuspendedThread {
+            frames: FrameStack::new(),
+            mp: Vec::new(),
+            pc: 0,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            current_loaded_module: None,
+            caller_mp_stack: Vec::new(),
+            blocked_on: *blocked_on,
+        })
+        .collect();
+
     let Some(thread) = sched.threads.front_mut() else {
         return Err(ExecError::Other(
             "scheduler thread queue unexpectedly empty".to_string(),
@@ -477,11 +586,18 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
         last_error: std::mem::take(&mut thread.last_error),
         caller_mp_stack: Vec::new(),
         blocked_channel: None,
-        thread_queue: std::collections::VecDeque::new(),
+        unwind_floor: 0,
+        thread_queue,
         heap_refs: std::mem::take(&mut thread.heap_refs),
     };
 
     let result = ops::dispatch(&mut vm, inst);
+
+    // Entries beyond the mirrors were spawned by this instruction; the mirrors
+    // record which blocked threads it woke.
+    let mut mirrors = std::mem::take(&mut vm.thread_queue);
+    let spawned = mirrors.split_off(waiters.len());
+    let blocked_channel = vm.blocked_channel.take();
 
     // Move state back
     let Some(thread) = sched.threads.front_mut() else {
@@ -502,9 +618,30 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
     thread.imm_dst = vm.imm_dst;
     thread.heap_refs = vm.heap_refs;
     thread.last_error = vm.last_error;
+    if let Some(chan_id) = blocked_channel {
+        // recv/alt found no data: the run loop keeps this thread's PC and
+        // leaves it blocked until another thread makes the operation possible.
+        thread.state = ThreadState::Blocked(chan_id);
+    }
     sched.heap = vm.heap;
     sched.modules = vm.modules;
     sched.loaded_modules = vm.loaded_modules;
+
+    // Wake the threads whose mirror was unblocked by this instruction.
+    for (idx, mirror) in mirrors.iter().enumerate() {
+        if mirror.blocked_on.is_none()
+            && waiters[idx].is_some()
+            && let Some(woken) = sched.threads.get_mut(idx + 1)
+        {
+            woken.state = ThreadState::Ready;
+        }
+    }
+
+    // Keep the threads this instruction spawned; they used to be dropped with
+    // the temporary VmState.
+    for child in spawned {
+        sched.spawn_thread(child.frames, child.mp, child.pc);
+    }
 
     result
 }
@@ -541,5 +678,371 @@ fn fmt_mid_short(op: &ricevm_core::MiddleOperand) -> String {
         MiddleMode::SmallOffsetFp => format!("{}(fp)", op.register1),
         MiddleMode::SmallOffsetMp => format!("{}(mp)", op.register1),
         _ => "?".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        AddressMode, Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap,
+        RuntimeFlags, TypeDescriptor, XMAGIC,
+    };
+
+    use super::*;
+    use crate::heap::HeapData;
+    use crate::memory;
+
+    fn fp_operand(offset: i32) -> Operand {
+        Operand {
+            mode: AddressMode::OffsetIndirectFp,
+            register1: offset,
+            register2: 0,
+        }
+    }
+
+    fn module_with_code(name: &str, code: Vec<Instruction>) -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: code.len() as i32,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code,
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: name.to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    fn exit_instruction() -> Instruction {
+        Instruction {
+            opcode: Opcode::Exit,
+            source: Operand::UNUSED,
+            middle: MiddleOperand::UNUSED,
+            destination: Operand::UNUSED,
+        }
+    }
+
+    /// A module whose code receives from the channel in `fp[0]` into `fp[8]`.
+    fn recv_module(name: &str) -> Module {
+        module_with_code(
+            name,
+            vec![
+                Instruction {
+                    opcode: Opcode::Recv,
+                    source: fp_operand(0),
+                    middle: MiddleOperand::UNUSED,
+                    destination: fp_operand(8),
+                },
+                exit_instruction(),
+            ],
+        )
+    }
+
+    fn entry_frames() -> FrameStack {
+        let mut frames = FrameStack::new();
+        frames.push_entry(64, -1);
+        frames
+    }
+
+    fn scheduler_with_thread<'m>(module: &'m Module, pc: usize) -> Scheduler<'m> {
+        let mut sched = Scheduler::new(module, Heap::new(), ModuleRegistry::new());
+        sched.spawn_thread(entry_frames(), Vec::new(), pc);
+        sched
+    }
+
+    /// Regression: a thread whose PC ran past the end of the code must be
+    /// halted. Leaving it alive makes `run()` retain it, the quanta loop break
+    /// immediately, and the outer loop spin forever.
+    #[test]
+    fn quanta_halts_a_thread_whose_pc_ran_off_the_end() {
+        let module = module_with_code("sched_halt", vec![exit_instruction()]);
+        let mut sched = scheduler_with_thread(&module, module.code.len());
+
+        sched.run_thread_quanta(4).expect("quanta should not error");
+
+        assert!(
+            sched.threads.front().expect("thread").halted,
+            "a thread whose pc ran off the end must be halted so run() can drop it"
+        );
+    }
+
+    /// The symptom of the above: `run()` must terminate rather than spin.
+    #[test]
+    fn run_terminates_when_a_thread_runs_off_the_end_of_the_code() {
+        let module = module_with_code("sched_run", vec![exit_instruction()]);
+        let mut sched = scheduler_with_thread(&module, module.code.len());
+
+        sched.run().expect("run should terminate");
+        assert!(
+            sched.threads.is_empty(),
+            "the halted thread must be dropped"
+        );
+    }
+
+    /// Regression: a thread spawned while dispatching must join the scheduler's
+    /// queue. It used to be pushed onto a throwaway VmState and dropped.
+    #[test]
+    fn dispatch_keeps_threads_spawned_by_the_running_thread() {
+        let module = module_with_code("sched_spawn", vec![exit_instruction(), exit_instruction()]);
+        let mut sched = scheduler_with_thread(&module, 0);
+
+        let pending = {
+            let thread = sched.threads.front_mut().expect("thread");
+            thread.frames.alloc_pending(64).expect("alloc_pending")
+        };
+        {
+            let thread = sched.threads.front_mut().expect("thread");
+            thread.src = AddrTarget::Immediate;
+            thread.imm_src = pending as i32;
+            thread.dst = AddrTarget::Immediate;
+            thread.imm_dst = 1; // spawn target pc
+            thread.next_pc = 1;
+        }
+
+        let spawn = Instruction {
+            opcode: Opcode::Spawn,
+            source: Operand::UNUSED,
+            middle: MiddleOperand::UNUSED,
+            destination: Operand::UNUSED,
+        };
+        dispatch_for_thread(&mut sched, &spawn).expect("spawn should dispatch");
+
+        assert_eq!(
+            sched.threads.len(),
+            2,
+            "the spawned child must join the scheduler's queue"
+        );
+        assert!(
+            sched.threads.iter().any(|t| t.pc == 1),
+            "the child must start at the spawn target pc"
+        );
+    }
+
+    /// Regression: a receive from an empty channel must block the thread. The
+    /// scheduler used to ignore `blocked_channel`, advancing the PC and leaving
+    /// the receive destination holding stale bytes.
+    #[test]
+    fn recv_from_an_empty_channel_blocks_instead_of_advancing() {
+        let module = recv_module("sched_block");
+        let mut sched = scheduler_with_thread(&module, 0);
+        let chan = sched.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        {
+            let thread = sched.threads.front_mut().expect("thread");
+            let fp = thread.frames.current_data_offset();
+            memory::write_word(&mut thread.frames.data, fp, chan as i32);
+            memory::write_word(&mut thread.frames.data, fp + 8, 0x5eed); // stale value
+        }
+
+        sched.run_thread_quanta(4).expect("quanta should not error");
+
+        let thread = sched.threads.front().expect("thread");
+        assert_eq!(
+            thread.state,
+            ThreadState::Blocked(chan),
+            "a receive with no data must block the thread"
+        );
+        assert_eq!(thread.pc, 0, "a blocked receive must re-execute when woken");
+        let fp = thread.frames.current_data_offset();
+        assert_eq!(
+            memory::read_word(&thread.frames.data, fp + 8),
+            0x5eed,
+            "a blocked receive must not pretend to have delivered a value"
+        );
+    }
+
+    /// With every thread blocked nothing can wake anything: report a deadlock
+    /// instead of running a blocked thread over and over.
+    #[test]
+    fn run_faults_when_every_thread_is_blocked() {
+        let module = recv_module("sched_deadlock");
+        let mut sched = scheduler_with_thread(&module, 0);
+        let chan = sched.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        {
+            let thread = sched.threads.front_mut().expect("thread");
+            let fp = thread.frames.current_data_offset();
+            memory::write_word(&mut thread.frames.data, fp, chan as i32);
+        }
+
+        match sched.run() {
+            Err(ExecError::ThreadFault(msg)) => {
+                assert!(msg.contains("deadlock"), "expected a deadlock fault: {msg}");
+            }
+            other => panic!("a blocked-only schedule must deadlock, got {other:?}"),
+        }
+    }
+
+    fn imm_operand(value: i32) -> Operand {
+        Operand {
+            mode: AddressMode::Immediate,
+            register1: value,
+            register2: 0,
+        }
+    }
+
+    fn shared_state(module: &Module) -> SharedState<'_> {
+        SharedState {
+            module,
+            heap: Heap::new(),
+            modules: ModuleRegistry::new(),
+            loaded_modules: Vec::new(),
+            files: FileTable::new(),
+            gc_enabled: false,
+            gc_counter: 0,
+            trace: false,
+            next_thread_id: 1,
+        }
+    }
+
+    fn vm_thread(frames: FrameStack, pc: usize) -> VmThread {
+        VmThread {
+            frames,
+            mp: Vec::new(),
+            pc,
+            next_pc: 0,
+            halted: false,
+            src: AddrTarget::None,
+            mid: AddrTarget::None,
+            dst: AddrTarget::None,
+            imm_src: 0,
+            imm_mid: 0,
+            imm_dst: 0,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            id: 1,
+            state: ThreadState::Ready,
+        }
+    }
+
+    /// Regression: the preemptive worker built a throwaway VmState per
+    /// instruction, so a thread spawned by the running thread was dropped.
+    #[test]
+    fn shared_quanta_keeps_threads_spawned_by_the_running_thread() {
+        let mut frames = entry_frames();
+        let pending = frames.alloc_pending(64).expect("alloc_pending");
+        let module = module_with_code(
+            "shared_spawn",
+            vec![
+                Instruction {
+                    opcode: Opcode::Spawn,
+                    source: imm_operand(pending as i32),
+                    middle: MiddleOperand::UNUSED,
+                    destination: imm_operand(1),
+                },
+                exit_instruction(),
+            ],
+        );
+        let mut state = shared_state(&module);
+        let mut thread = vm_thread(frames, 0);
+        let mut spawned = Vec::new();
+
+        run_thread_quanta_shared(&mut state, &mut thread, 1, &mut spawned)
+            .expect("quanta should not error");
+
+        assert_eq!(spawned.len(), 1, "the spawned child must be handed back");
+        assert_eq!(spawned[0].pc, 1, "the child starts at the spawn target pc");
+    }
+
+    /// Regression: `blocked_channel` was ignored, so a receive with no data
+    /// advanced the PC and left the destination holding stale bytes. The
+    /// preemptive pool has no protocol for waking a blocked thread, so the
+    /// operation must be reported rather than silently skipped.
+    #[test]
+    fn shared_quanta_reports_a_blocking_channel_operation() {
+        let module = recv_module("shared_block");
+        let mut state = shared_state(&module);
+        let chan = state.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let mut thread = vm_thread(entry_frames(), 0);
+        let fp = thread.frames.current_data_offset();
+        memory::write_word(&mut thread.frames.data, fp, chan as i32);
+        memory::write_word(&mut thread.frames.data, fp + 8, 0x5eed); // stale value
+        let mut spawned = Vec::new();
+
+        assert!(
+            run_thread_quanta_shared(&mut state, &mut thread, 4, &mut spawned).is_err(),
+            "a blocking channel operation must be reported, not skipped"
+        );
+        assert_eq!(
+            memory::read_word(&thread.frames.data, fp + 8),
+            0x5eed,
+            "a blocked receive must not pretend to have delivered a value"
+        );
+    }
+
+    /// A send that fills a channel must wake the threads blocked receiving on
+    /// it, otherwise they stay blocked and the scheduler reports a deadlock.
+    #[test]
+    fn a_send_wakes_threads_blocked_on_that_channel() {
+        let module = recv_module("sched_wake");
+        let mut sched = scheduler_with_thread(&module, 0);
+        let chan = sched.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+
+        // A second thread, blocked receiving on the channel.
+        sched.spawn_thread(entry_frames(), Vec::new(), 0);
+        if let Some(blocked) = sched.threads.back_mut() {
+            blocked.state = ThreadState::Blocked(chan);
+        }
+
+        // The running thread sends on the channel.
+        {
+            let thread = sched.threads.front_mut().expect("thread");
+            thread.src = AddrTarget::Immediate;
+            thread.imm_src = 7;
+            thread.dst = AddrTarget::Immediate;
+            thread.imm_dst = chan as i32;
+            thread.next_pc = 1;
+        }
+        let send = Instruction {
+            opcode: Opcode::Send,
+            source: Operand::UNUSED,
+            middle: MiddleOperand::UNUSED,
+            destination: Operand::UNUSED,
+        };
+        dispatch_for_thread(&mut sched, &send).expect("send should dispatch");
+
+        assert_eq!(
+            sched.threads.back().expect("blocked thread").state,
+            ThreadState::Ready,
+            "a send must wake the threads blocked on that channel"
+        );
     }
 }

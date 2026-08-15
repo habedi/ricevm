@@ -211,6 +211,7 @@ impl<'m> Debugger<'m> {
                     &self.vm.loaded_modules,
                     &self.vm.thread_queue,
                     &self.vm.caller_mp_stack,
+                    &self.vm.heap_refs,
                 );
             }
         }

@@ -9,6 +9,27 @@ pub(crate) fn op_movp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.move_ptr_to_dst(new_id)
 }
 
+/// Encode a module MP location as a virtual address.
+///
+/// Only locations inside the reserved MP window survive a round trip through
+/// `decode_virtual_addr`: a module index at or past `MAX_MODULES` lands in the
+/// unmapped gap below the heap ids, and an offset at or past `MP_STRIDE` bleeds
+/// into the next module's range. Both are rejected here, where the mistake is
+/// still attributable, instead of being encoded into a bogus address.
+fn encode_mp_addr(module_idx: usize, offset: usize) -> Result<i32, ExecError> {
+    if module_idx >= crate::address::MAX_MODULES {
+        return Err(ExecError::Other(format!(
+            "lea: module index out of range: {module_idx}"
+        )));
+    }
+    if offset >= crate::address::MP_STRIDE {
+        return Err(ExecError::Other(format!(
+            "lea: mp offset out of range: {offset}"
+        )));
+    }
+    Ok((crate::address::MP_BASE + module_idx * crate::address::MP_STRIDE + offset) as i32)
+}
+
 /// lea src, dst:load effective address: stores the address from src into dst as a pointer
 /// In our model, lea is used to get a "pointer" to a frame/mp location.
 /// lea src, dst: store the absolute address of src into dst.
@@ -18,15 +39,13 @@ pub(crate) fn op_lea(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let addr = match vm.src {
         crate::address::AddrTarget::Frame(off) => off as i32,
         crate::address::AddrTarget::Mp(off) => {
-            let module_idx = if let Some(idx) = vm.current_loaded_module {
-                idx + 1
-            } else {
-                0
-            };
-            (crate::address::MP_BASE + module_idx * crate::address::MP_STRIDE + off) as i32
+            let module_idx = vm
+                .current_loaded_module
+                .map_or(0, |idx| idx.saturating_add(1));
+            encode_mp_addr(module_idx, off)?
         }
         crate::address::AddrTarget::ModuleMp { module_idx, offset } => {
-            (crate::address::MP_BASE + module_idx * crate::address::MP_STRIDE + offset) as i32
+            encode_mp_addr(module_idx, offset)?
         }
         crate::address::AddrTarget::HeapArray { id, offset } => {
             // Store a heap ref so downstream double-indirect addressing
@@ -268,20 +287,35 @@ pub(crate) fn op_slicela(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     };
 
     // Resolve dst: if it's an ArraySlice, redirect write to the parent array.
-    let (real_dst_id, dst_byte_offset) = {
+    let (real_dst_id, dst_byte_offset, dst_len) = {
         if let Some(obj) = vm.heap.get(dst_id) {
             match &obj.data {
                 heap::HeapData::ArraySlice {
                     parent_id,
                     byte_start,
+                    length,
                     ..
-                } => (*parent_id, *byte_start),
-                _ => (dst_id, 0),
+                } => (*parent_id, *byte_start, *length),
+                heap::HeapData::Array { length, .. } => (dst_id, 0, *length),
+                _ => {
+                    return Err(ExecError::ThreadFault(
+                        "slicela: dst not an array".to_string(),
+                    ));
+                }
             }
         } else {
-            (dst_id, 0)
+            (dst_id, 0, 0)
         }
     };
+
+    // The destination must already be large enough: growing it would write
+    // past the slice's extent into sibling elements of the shared parent.
+    if insert_pos.saturating_add(src_len) > dst_len {
+        return Err(ExecError::ThreadFault(format!(
+            "array slice out of bounds: [{insert_pos}..{}] for length {dst_len}",
+            insert_pos + src_len
+        )));
+    }
 
     // For pointer-sized elements, collect old dst values before overwrite
     // so we can adjust reference counts (inc new, dec old).
@@ -317,14 +351,13 @@ pub(crate) fn op_slicela(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     if let Some(obj) = vm.heap.get_mut(real_dst_id)
         && let heap::HeapData::Array { data, length, .. } = &mut obj.data
     {
-        let copy_start = dst_byte_offset + insert_pos * elem_size;
-        let copy_bytes = src_len * elem_size;
-        let needed = copy_start + copy_bytes;
-        if needed > data.len() {
-            data.resize(needed, 0);
-        }
-        data[copy_start..copy_start + copy_bytes]
-            .copy_from_slice(&src_data[..copy_bytes.min(src_data.len())]);
+        let copy_start = (dst_byte_offset + insert_pos * elem_size).min(data.len());
+        // Copy only what both sides actually hold: a slice whose parent has
+        // gone away reads back short (or empty).
+        let copy_bytes = (src_len * elem_size)
+            .min(src_data.len())
+            .min(data.len().saturating_sub(copy_start));
+        data[copy_start..copy_start + copy_bytes].copy_from_slice(&src_data[..copy_bytes]);
         // Only update root length when writing directly to root (not through a slice).
         if dst_byte_offset == 0 {
             *length = (insert_pos + src_len).max(*length);
@@ -1094,6 +1127,128 @@ mod tests {
     }
 
     #[test]
+    fn slicela_past_destination_end_raises_bounds_error() {
+        // Writing past the extent of a slice must raise instead of silently
+        // spilling into the sibling elements of the shared parent array.
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // Parent array: [1, 2, 3, 4, 5, 6, 7, 8]
+        let mut parent_data = vec![0u8; 32];
+        for i in 0..8i32 {
+            memory::write_word(&mut parent_data, i as usize * 4, i + 1);
+        }
+        let parent_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: parent_data,
+                length: 8,
+            },
+        );
+        // dst is the first 4 elements of the parent.
+        let dst_id = vm.heap.alloc(
+            0,
+            HeapData::ArraySlice {
+                parent_id,
+                byte_start: 0,
+                elem_type: 0,
+                elem_size: 4,
+                length: 4,
+            },
+        );
+
+        // Source of 4 elements: appending at index 2 needs 6 slots, dst has 4.
+        let mut src_data = vec![0u8; 16];
+        for i in 0..4i32 {
+            memory::write_word(&mut src_data, i as usize * 4, 100 * (i + 1));
+        }
+        let src_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: src_data,
+                length: 4,
+            },
+        );
+
+        memory::write_word(&mut vm.frames.data, fp, src_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 2;
+        memory::write_word(&mut vm.frames.data, fp + 4, dst_id as i32);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        let err = op_slicela(&mut vm).expect_err("slicela past the end must raise");
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "expected out of bounds, got: {err}"
+        );
+
+        // Elements beyond the slice must be untouched.
+        let obj = vm.heap.get(parent_id).unwrap();
+        match &obj.data {
+            HeapData::Array { data, .. } => {
+                assert_eq!(memory::read_word(data, 16), 5, "parent[4] corrupted");
+                assert_eq!(memory::read_word(data, 20), 6, "parent[5] corrupted");
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
+    fn slicela_unreadable_source_slice_does_not_panic() {
+        // A slice whose parent is gone reads back as empty data; the copy must
+        // not panic on the length mismatch.
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        let src_id = vm.heap.alloc(
+            0,
+            HeapData::ArraySlice {
+                parent_id: 0xDEAD_BEEF, // dangling
+                byte_start: 0,
+                elem_type: 0,
+                elem_size: 4,
+                length: 4,
+            },
+        );
+
+        let mut dst_data = vec![0u8; 32];
+        memory::write_word(&mut dst_data, 0, 42);
+        let dst_id = vm.heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: dst_data,
+                length: 8,
+            },
+        );
+
+        memory::write_word(&mut vm.frames.data, fp, src_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        memory::write_word(&mut vm.frames.data, fp + 4, dst_id as i32);
+        vm.dst = AddrTarget::Frame(fp + 4);
+
+        op_slicela(&mut vm).expect("slicela with an unreadable source should not fail");
+
+        let obj = vm.heap.get(dst_id).unwrap();
+        match &obj.data {
+            HeapData::Array { data, .. } => {
+                assert_eq!(memory::read_word(data, 0), 42, "dst should be unchanged");
+            }
+            _ => panic!("expected Array"),
+        }
+    }
+
+    #[test]
     fn slicela_nil_source_is_noop() {
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm init");
@@ -1127,6 +1282,68 @@ mod tests {
             }
             _ => panic!("expected Array"),
         }
+    }
+
+    #[test]
+    fn lea_encodes_module_mp_addresses_that_decode_back() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::ModuleMp {
+            module_idx: crate::address::MAX_MODULES - 1,
+            offset: 12,
+        };
+        vm.dst = AddrTarget::Frame(fp);
+
+        op_lea(&mut vm).expect("the last module's MP is a valid address");
+
+        let addr = memory::read_word(&vm.frames.data, fp);
+        assert_eq!(
+            crate::address::decode_virtual_addr(addr, 0),
+            AddrTarget::ModuleMp {
+                module_idx: crate::address::MAX_MODULES - 1,
+                offset: 12,
+            },
+            "a lea-encoded MP address must decode back to the same module"
+        );
+    }
+
+    #[test]
+    fn lea_rejects_module_index_beyond_the_supported_range() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::ModuleMp {
+            module_idx: crate::address::MAX_MODULES,
+            offset: 0,
+        };
+        vm.dst = AddrTarget::Frame(fp);
+
+        let err =
+            op_lea(&mut vm).expect_err("a module index past the reserved range must not encode");
+        assert!(
+            err.to_string().contains("module"),
+            "error should mention the module: {err}"
+        );
+    }
+
+    #[test]
+    fn lea_rejects_mp_offset_past_the_module_stride() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+
+        // An offset of a whole stride would encode as the next module's base.
+        vm.src = AddrTarget::Mp(crate::address::MP_STRIDE);
+        vm.dst = AddrTarget::Frame(fp);
+
+        let err = op_lea(&mut vm).expect_err("an MP offset past the stride must not encode");
+        assert!(
+            err.to_string().contains("mp offset"),
+            "error should mention the mp offset: {err}"
+        );
     }
 
     #[test]

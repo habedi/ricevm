@@ -198,7 +198,13 @@ fn run(cli: Cli) -> i32 {
             let start = Instant::now();
             match ricevm_limbo::compile_with_options(&src, filename, &opts) {
                 Ok(module) => {
-                    let bytes = ricevm_limbo::writer::write_dis(&module);
+                    let bytes = match ricevm_limbo::writer::write_dis(&module) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            eprintln!("{} {e}", "error:".red().bold());
+                            return 1;
+                        }
+                    };
                     let out_path = output.unwrap_or_else(|| path.with_extension("dis"));
                     match fs::write(&out_path, &bytes) {
                         Ok(()) => {

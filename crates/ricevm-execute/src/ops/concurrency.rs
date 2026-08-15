@@ -230,21 +230,36 @@ pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             vm.current_loaded_module = Some(module_idx);
             vm.pc = entry_pc;
             vm.halted = false;
+            // An exception raised in the loaded module must not unwind into
+            // the caller's frames: their handler table belongs to another
+            // module, and this loop -- not the caller -- decides where
+            // execution resumes.
+            let saved_unwind_floor =
+                std::mem::replace(&mut vm.unwind_floor, vm.frames.current_base);
 
+            let mut nested = Ok(());
             while !vm.halted && vm.pc < loaded_code_len {
                 let inst = vm.loaded_modules[module_idx].module.code[vm.pc].clone();
                 if vm.trace {
                     vm.trace_instruction(&inst);
                 }
-                vm.resolve_operands(&inst)?;
+                if let Err(err) = vm.resolve_operands(&inst) {
+                    nested = Err(err);
+                    break;
+                }
                 vm.next_pc = vm.pc + 1;
-                crate::ops::dispatch(vm, &inst)?;
+                if let Err(err) = crate::ops::dispatch(vm, &inst) {
+                    nested = Err(err);
+                    break;
+                }
                 vm.pc = vm.next_pc;
 
                 if vm.frames.current_data_offset() < spawn_frame_base {
                     break;
                 }
             }
+            vm.unwind_floor = saved_unwind_floor;
+            nested?;
 
             let (_, parent_mp) = vm.caller_mp_stack.pop().unwrap_or_default();
             vm.loaded_modules[module_idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
@@ -451,7 +466,25 @@ fn parse_alt_table(
     // First nsend entries are send, next nrecv are recv.
     let nsend = read_table_word(vm, base, table_offset).max(0) as usize;
     let nrecv = read_table_word(vm, base, table_offset + 4).max(0) as usize;
-    let count = nsend + nrecv;
+    let count = nsend.saturating_add(nrecv);
+
+    // The counts are guest data: a header claiming more entries than the
+    // containing memory holds must be rejected before space is reserved for
+    // them, otherwise `0x7fffffff, 0x7fffffff` requests tens of gigabytes.
+    let available = match base {
+        TableBase::Frame => vm.frames.data.len(),
+        TableBase::Mp => vm.mp.len(),
+    };
+    let table_end = count
+        .checked_mul(8)
+        .and_then(|entries_size| entries_size.checked_add(8))
+        .and_then(|table_size| table_size.checked_add(table_offset));
+    if table_end.is_none_or(|end| end > available) {
+        return Err(ExecError::Other(format!(
+            "alt table with {nsend} send and {nrecv} recv entries does not fit in memory"
+        )));
+    }
+
     let mut entries = Vec::with_capacity(count);
     for idx in 0..count {
         let base_off = table_offset + 8 + idx * 8;
@@ -468,9 +501,8 @@ fn parse_alt_table(
     Ok((base, nsend, nrecv, entries))
 }
 
-fn execute_alt(vm: &mut VmState<'_>, select_first_if_none: bool) -> Result<AltOutcome, ExecError> {
-    let (base, nsend, nrecv, entries) = parse_alt_table(vm)?;
-    let count = nsend + nrecv;
+fn execute_alt(vm: &mut VmState<'_>, blocking: bool) -> Result<AltOutcome, ExecError> {
+    let (base, _nsend, _nrecv, entries) = parse_alt_table(vm)?;
 
     // Collect ready indices first, then pick one (reference picks randomly,
     // we pick the first ready one for determinism in our cooperative model).
@@ -500,14 +532,20 @@ fn execute_alt(vm: &mut VmState<'_>, select_first_if_none: bool) -> Result<AltOu
             write_table_bytes(vm, base, entry.data_offset, &data);
         }
 
+        // Wake threads waiting on the other side of this channel, exactly as
+        // op_send/op_recv do; the alt just performed the same transfer.
+        vm.unblock_channel(entry.channel_id);
         return Ok(AltOutcome::Selected(idx));
     }
 
-    if select_first_if_none && count > 0 {
-        Ok(AltOutcome::Selected(0))
-    } else {
-        Ok(AltOutcome::NoneReady)
+    if blocking {
+        // Nothing ready: suspend the thread instead of inventing a selection.
+        // `Some(NIL)` is the "blocked in alt" marker that any channel
+        // operation clears (see `VmState::unblock_channel`); the run loop
+        // re-executes this alt once the thread is woken.
+        vm.blocked_channel = Some(heap::NIL);
     }
+    Ok(AltOutcome::NoneReady)
 }
 
 /// send src, dst:send data through a channel.
@@ -559,18 +597,19 @@ pub(crate) fn op_recv(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 }
 
-/// alt src, dst:simplified blocking channel select.
+/// alt src, dst:blocking channel select.
 /// The table layout is:
-///   [0] = entry count
-///   [1..] = triples of (channel pointer, send flag, data offset)
+///   [0] = nsend, [1] = nrecv
+///   [2..] = pairs of (channel pointer, data offset)
 ///
 /// Send entries are ready when the single-slot channel buffer is empty.
 /// Receive entries are ready when the channel has a pending payload.
-/// If none are ready, this simplified implementation returns index 0.
+/// If none are ready the thread blocks; the run loop re-executes the alt
+/// once another thread makes an entry ready, so `dst` is left untouched.
 pub(crate) fn op_alt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     match execute_alt(vm, true)? {
         AltOutcome::Selected(idx) => vm.set_dst_word(idx as i32),
-        AltOutcome::NoneReady => vm.set_dst_word(0),
+        AltOutcome::NoneReady => Ok(()),
     }
 }
 
@@ -1213,6 +1252,124 @@ mod tests {
         vm.dst = AddrTarget::Frame(fp_base + 4);
         op_recv(&mut vm).expect("second recv");
         assert_eq!(memory::read_word(&vm.frames.data, fp_base + 4), 88);
+    }
+
+    /// Regression: a blocking `alt` with no ready entry must suspend the thread
+    /// (by setting `blocked_channel`) instead of claiming entry 0 was selected.
+    /// Reporting a selection makes the thread read an unwritten receive buffer
+    /// and drops any value a peer sends later.
+    #[test]
+    fn alt_blocks_when_no_entry_is_ready() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let chan = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        // One recv entry on an empty channel: nothing is ready.
+        memory::write_word(&mut vm.frames.data, table_off, 0); // nsend = 0
+        memory::write_word(&mut vm.frames.data, table_off + 4, 1); // nrecv = 1
+        memory::write_word(&mut vm.frames.data, table_off + 8, chan as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+
+        // Sentinel: a blocked alt must not report a selection.
+        memory::write_word(&mut vm.frames.data, fp_base, -1);
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+
+        op_alt(&mut vm).expect("alt should not error");
+
+        assert_eq!(
+            vm.blocked_channel,
+            Some(heap::NIL),
+            "a blocking alt with nothing ready must block the thread"
+        );
+        assert_eq!(
+            memory::read_word(&vm.frames.data, fp_base),
+            -1,
+            "a blocked alt must not write a selection index"
+        );
+    }
+
+    /// Regression: an `alt` that drains a channel must wake threads blocked on
+    /// it, exactly like `recv` does. Otherwise a thread blocked sending on a
+    /// full channel stays blocked forever after alt empties it.
+    #[test]
+    fn alt_recv_unblocks_thread_waiting_on_that_channel() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let chan = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: Some(5_i32.to_ne_bytes().to_vec()),
+            },
+        );
+
+        // A peer thread suspended trying to send on the (full) channel.
+        vm.thread_queue.push_back(crate::vm::SuspendedThread {
+            frames: crate::frame::FrameStack::new(),
+            mp: Vec::new(),
+            pc: 0,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            current_loaded_module: None,
+            caller_mp_stack: Vec::new(),
+            blocked_on: Some(chan),
+        });
+
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+        memory::write_word(&mut vm.frames.data, table_off, 0); // nsend = 0
+        memory::write_word(&mut vm.frames.data, table_off + 4, 1); // nrecv = 1
+        memory::write_word(&mut vm.frames.data, table_off + 8, chan as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+        op_alt(&mut vm).expect("alt should succeed");
+
+        assert_eq!(
+            memory::read_word(&vm.frames.data, fp_base + 40),
+            5,
+            "alt should have received the pending value"
+        );
+        assert!(
+            vm.thread_queue[0].blocked_on.is_none(),
+            "draining a channel via alt must wake threads blocked on it"
+        );
+    }
+
+    /// Regression: `nsend`/`nrecv` come from guest memory. A header claiming
+    /// billions of entries must be rejected instead of reserving a table that
+    /// cannot fit in the frame (which aborts the process on allocation).
+    #[test]
+    fn alt_table_with_absurd_entry_counts_is_rejected() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        memory::write_word(&mut vm.frames.data, table_off, i32::MAX);
+        memory::write_word(&mut vm.frames.data, table_off + 4, i32::MAX);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+
+        assert!(
+            op_alt(&mut vm).is_err(),
+            "an alt table larger than its containing memory must be rejected"
+        );
+        assert!(
+            op_nbalt(&mut vm).is_err(),
+            "nbalt must reject the same oversized table"
+        );
     }
 
     #[test]

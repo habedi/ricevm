@@ -505,13 +505,13 @@ mod tests {
         let mut vm = VmState::new(&module).expect("vm init");
         let fp = vm.frames.current_data_offset();
 
-        crate::memory::write_real(&mut vm.frames.data, fp, 3.14159);
+        crate::memory::write_real(&mut vm.frames.data, fp, 3.75);
         vm.src = AddrTarget::Frame(fp);
         vm.dst = AddrTarget::Frame(fp + 8);
 
         op_movf(&mut vm).expect("movf should succeed");
         let result = crate::memory::read_real(&vm.frames.data, fp + 8);
-        assert!((result - 3.14159).abs() < f64::EPSILON);
+        assert!((result - 3.75).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -520,13 +520,13 @@ mod tests {
         let mut vm = VmState::new(&module).expect("vm init");
         let fp = vm.frames.current_data_offset();
 
-        crate::memory::write_real(&mut vm.frames.data, fp, -2.71828);
+        crate::memory::write_real(&mut vm.frames.data, fp, -4.25);
         vm.src = AddrTarget::Frame(fp);
         vm.dst = AddrTarget::Frame(fp + 8);
 
         op_movf(&mut vm).expect("movf should succeed");
         let result = crate::memory::read_real(&vm.frames.data, fp + 8);
-        assert!((result - (-2.71828)).abs() < f64::EPSILON);
+        assert!((result - (-4.25)).abs() < f64::EPSILON);
     }
 
     #[test]

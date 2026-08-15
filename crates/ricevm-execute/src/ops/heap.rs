@@ -3,6 +3,19 @@ use ricevm_core::ExecError;
 use crate::heap::HeapData;
 use crate::vm::VmState;
 
+/// Dis exception for an array allocation with a negative length
+/// (Inferno: `acheck` -> `error(exNegsize)`).
+const NEGATIVE_ARRAY_SIZE: &str = "negative array size";
+
+/// Dis exception for an allocation the heap cannot serve
+/// (Inferno: `acheck` -> `error(exHeap)`).
+const OUT_OF_MEMORY: &str = "out of memory: heap";
+
+/// Largest array a single `newa` may allocate. Untrusted bytecode can ask for
+/// `i32::MAX` elements of an arbitrarily large type, which would abort the
+/// process long before the request could be honoured.
+const MAX_ARRAY_BYTES: usize = 1 << 31;
+
 /// new src, dst:allocate a record of the type given by src (type index)
 pub(crate) fn op_new(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let type_idx = vm.src_word()? as usize;
@@ -22,12 +35,22 @@ pub(crate) fn op_newz(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 /// newa src, mid, dst:allocate an array of length src, element type mid
 pub(crate) fn op_newa(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    let length = vm.src_word()? as usize;
+    let raw_length = vm.src_word()?;
+    // Reference: acheck() raises exNegsize for a negative length and exHeap
+    // when length * element size overflows the allocation.
+    if raw_length < 0 {
+        return vm.raise_exception(NEGATIVE_ARRAY_SIZE);
+    }
+    let length = raw_length as usize;
     let elem_type_idx = vm.mid_word()? as usize;
     let elem_size = vm
         .current_type_size(elem_type_idx)
         .ok_or_else(|| ExecError::Other(format!("invalid element type index: {elem_type_idx}")))?;
-    let data = vec![0u8; length * elem_size];
+    let byte_len = match length.checked_mul(elem_size) {
+        Some(n) if n <= MAX_ARRAY_BYTES => n,
+        _ => return vm.raise_exception(OUT_OF_MEMORY),
+    };
+    let data = vec![0u8; byte_len];
     let id = vm.heap.alloc(
         elem_type_idx as u32,
         HeapData::Array {
@@ -272,6 +295,66 @@ mod tests {
             }
             other => panic!("expected Array, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    #[test]
+    fn op_newa_negative_length_is_rejected() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = -1; // negative length from untrusted bytecode
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 1; // element type index 1 (size 16)
+        vm.dst = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+
+        let err = op_newa(&mut vm).expect_err("negative array size must be rejected");
+        assert!(
+            err.to_string().contains("negative array size"),
+            "expected negative array size, got: {err}"
+        );
+    }
+
+    #[test]
+    fn op_newaz_negative_length_is_rejected() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = i32::MIN;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+
+        let err = op_newaz(&mut vm).expect_err("negative array size must be rejected");
+        assert!(
+            err.to_string().contains("negative array size"),
+            "expected negative array size, got: {err}"
+        );
+    }
+
+    #[test]
+    fn op_newa_oversized_length_is_rejected() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = i32::MAX; // * 16 bytes/elem is far beyond any real heap
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 1;
+        vm.dst = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+
+        let err = op_newa(&mut vm).expect_err("oversized array must be rejected");
+        assert!(
+            err.to_string().contains("out of memory"),
+            "expected out of memory, got: {err}"
+        );
     }
 
     #[test]

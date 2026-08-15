@@ -123,7 +123,7 @@ init(nil: ref Draw->Context, nil: list of string)
     assert!(!module.imports.is_empty(), "should have $Sys import");
     assert_eq!(module.exports[0].name, "init");
 
-    let bytes = ricevm_limbo::writer::write_dis(&module);
+    let bytes = ricevm_limbo::writer::write_dis(&module).expect("module should serialize");
     assert!(bytes.len() > 20, "binary should be non-trivial");
 }
 

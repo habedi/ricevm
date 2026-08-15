@@ -13,11 +13,11 @@ pub(crate) const NIL: HeapId = 0;
 
 /// Base value for HeapId allocation.
 ///
-/// HeapIds start at this value so they never overlap with frame byte offsets
-/// (typically < 1 MB) or MP offsets (typically < 100 KB). This allows
-/// double-indirect addressing to distinguish heap pointers from frame/MP
-/// offsets by checking `value >= HEAP_ID_BASE`.
-pub(crate) const HEAP_ID_BASE: HeapId = 0x0100_0000; // 16 MB
+/// HeapIds start above the whole virtual address range used for frame offsets
+/// and module MP addresses (`address::MP_LIMIT`), so a heap pointer can never
+/// alias an MP address and vice versa. Double-indirect addressing distinguishes
+/// heap pointers from frame/MP offsets by checking `value >= HEAP_ID_BASE`.
+pub(crate) const HEAP_ID_BASE: HeapId = 0x1000_0000; // 256 MB
 
 /// The kind of data stored in a heap object.
 #[derive(Debug)]
@@ -139,31 +139,75 @@ impl Heap {
         }
     }
 
+    /// Objects that outlive their reference count. Module handles persist for
+    /// the VM lifetime because movmp/movm don't ref count embedded pointers,
+    /// and they are reached through the module tables rather than memory.
+    fn is_permanent(data: &HeapData) -> bool {
+        matches!(
+            data,
+            HeapData::ModuleRef { .. }
+                | HeapData::MainModule { .. }
+                | HeapData::LoadedModule { .. }
+        )
+    }
+
+    /// Collect the heap references owned by an object that is being freed.
+    fn child_refs(&self, data: &HeapData, out: &mut Vec<HeapId>) {
+        let scan = |buf: &[u8], out: &mut Vec<HeapId>| {
+            let mut offset = 0;
+            while offset + 4 <= buf.len() {
+                let word = crate::memory::read_word(buf, offset) as HeapId;
+                if word != NIL && self.objects.contains_key(&word) {
+                    out.push(word);
+                }
+                offset += 4;
+            }
+        };
+        match data {
+            HeapData::Record(data) | HeapData::Array { data, .. } | HeapData::Adt { data, .. } => {
+                scan(data, out)
+            }
+            HeapData::List { head, tail } => {
+                scan(head, out);
+                if *tail != NIL {
+                    out.push(*tail);
+                }
+            }
+            HeapData::ArraySlice { parent_id, .. } => {
+                if *parent_id != NIL {
+                    out.push(*parent_id);
+                }
+            }
+            // Channel payloads are copied in by `send` without an inc_ref, so
+            // there is no reference here to release.
+            HeapData::Str(_)
+            | HeapData::Channel { .. }
+            | HeapData::ModuleRef { .. }
+            | HeapData::MainModule { .. }
+            | HeapData::LoadedModule { .. } => {}
+        }
+    }
+
     /// Decrement the reference count. Frees the object if it reaches 0.
-    /// No-op for NIL.
+    /// Freeing cascades: the references an object owns (list tails, record and
+    /// array fields, a slice's parent) are released too. No-op for NIL.
     pub fn dec_ref(&mut self, id: HeapId) {
         if id == NIL {
             return;
         }
-        let should_free = if let Some(obj) = self.objects.get_mut(&id) {
-            obj.ref_count = obj.ref_count.saturating_sub(1);
-            if obj.ref_count == 0 {
-                // Don't free module references; they persist for the VM lifetime
-                // and movmp/movm don't do proper ref counting for embedded pointers.
-                !matches!(
-                    obj.data,
-                    HeapData::ModuleRef { .. }
-                        | HeapData::MainModule { .. }
-                        | HeapData::LoadedModule { .. }
-                )
+        // Iterative rather than recursive: a long list would otherwise blow the
+        // native stack when its last reference goes away.
+        let mut pending = vec![id];
+        while let Some(id) = pending.pop() {
+            let should_free = if let Some(obj) = self.objects.get_mut(&id) {
+                obj.ref_count = obj.ref_count.saturating_sub(1);
+                obj.ref_count == 0 && !Self::is_permanent(&obj.data)
             } else {
                 false
+            };
+            if should_free && let Some(obj) = self.objects.remove(&id) {
+                self.child_refs(&obj.data, &mut pending);
             }
-        } else {
-            false
-        };
-        if should_free {
-            self.objects.remove(&id);
         }
     }
 
@@ -184,17 +228,21 @@ impl Heap {
         let obj = self.get(id)?;
         match &obj.data {
             HeapData::Array { data, .. } => {
-                if offset + len <= data.len() {
-                    Some(data[offset..offset + len].to_vec())
-                } else {
-                    Some(vec![0u8; len])
+                // `offset` can come from bytecode: a plain `offset + len` would
+                // wrap and let an invalid range through the bounds check.
+                match offset.checked_add(len) {
+                    Some(end) if end <= data.len() => Some(data[offset..end].to_vec()),
+                    _ => Some(vec![0u8; len]),
                 }
             }
             HeapData::ArraySlice {
                 parent_id,
                 byte_start,
                 ..
-            } => self.array_read(*parent_id, byte_start + offset, len),
+            } => match byte_start.checked_add(offset) {
+                Some(parent_offset) => self.array_read(*parent_id, parent_offset, len),
+                None => Some(vec![0u8; len]),
+            },
             _ => None,
         }
     }
@@ -210,13 +258,18 @@ impl Heap {
         {
             let pid = *parent_id;
             let bs = *byte_start;
-            self.array_write(pid, bs + offset, data);
+            if let Some(parent_offset) = bs.checked_add(offset) {
+                self.array_write(pid, parent_offset, data);
+            }
             return;
         }
         if let Some(obj) = self.get_mut(id)
             && let HeapData::Array { data: arr_data, .. } = &mut obj.data
         {
-            let end = (offset + data.len()).min(arr_data.len());
+            let Some(end) = offset.checked_add(data.len()) else {
+                return;
+            };
+            let end = end.min(arr_data.len());
             let copy_len = end.saturating_sub(offset);
             if copy_len > 0 {
                 arr_data[offset..offset + copy_len].copy_from_slice(&data[..copy_len]);
@@ -262,9 +315,12 @@ impl Heap {
     }
 
     /// Remove all objects not in the marked set (sweep phase of GC).
+    /// Module handles are exempt, matching `dec_ref`: they stay alive for the
+    /// VM lifetime and are not reachable from any scanned buffer.
     #[allow(dead_code)]
     pub fn sweep(&mut self, marked: &std::collections::HashSet<HeapId>) {
-        self.objects.retain(|id, _| marked.contains(id));
+        self.objects
+            .retain(|id, obj| marked.contains(id) || Self::is_permanent(&obj.data));
     }
 
     /// Get the string data from a heap object, or None if not a string.
@@ -734,6 +790,178 @@ mod tests {
         assert_eq!(heap.len(), 2);
         heap.dec_ref(id1);
         assert_eq!(heap.len(), 1);
+    }
+
+    #[test]
+    fn array_read_with_huge_offset_returns_zeros() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: vec![1, 2, 3, 4],
+                length: 4,
+            },
+        );
+        // `offset + len` must not wrap past the bounds check.
+        assert_eq!(heap.array_read(id, usize::MAX - 1, 4), Some(vec![0u8; 4]));
+    }
+
+    #[test]
+    fn array_write_with_huge_offset_is_ignored() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data: vec![1, 2, 3, 4],
+                length: 4,
+            },
+        );
+        heap.array_write(id, usize::MAX - 1, &[9, 9, 9, 9]);
+        assert_eq!(heap.array_read(id, 0, 4), Some(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn sweep_keeps_module_objects() {
+        let mut heap = Heap::new();
+        let module_ref = heap.alloc(
+            0,
+            HeapData::ModuleRef {
+                module_id: 1,
+                func_map: Vec::new(),
+            },
+        );
+        let main_module = heap.alloc(
+            0,
+            HeapData::MainModule {
+                func_map: Vec::new(),
+            },
+        );
+        let loaded = heap.alloc(
+            0,
+            HeapData::LoadedModule {
+                module_idx: 0,
+                func_map: Vec::new(),
+            },
+        );
+        let plain = heap.alloc(0, HeapData::Record(vec![0; 4]));
+
+        heap.sweep(&std::collections::HashSet::new());
+
+        // Module handles are exempt from dec_ref freeing, so the sweep must
+        // keep them too; they are reached through the module tables, not memory.
+        assert!(heap.contains(module_ref), "ModuleRef must survive sweep");
+        assert!(heap.contains(main_module), "MainModule must survive sweep");
+        assert!(heap.contains(loaded), "LoadedModule must survive sweep");
+        assert!(!heap.contains(plain), "unmarked objects must be swept");
+    }
+
+    #[test]
+    fn dec_ref_releases_list_chain() {
+        let mut heap = Heap::new();
+        let elem = heap.alloc(0, HeapData::Str("elem".to_string()));
+        let tail = heap.alloc(
+            0,
+            HeapData::List {
+                head: vec![0; 4],
+                tail: NIL,
+            },
+        );
+        let mut head = vec![0u8; 4];
+        crate::memory::write_word(&mut head, 0, elem as i32);
+        let node = heap.alloc(0, HeapData::List { head, tail });
+
+        heap.dec_ref(node);
+
+        assert!(!heap.contains(node));
+        assert!(!heap.contains(tail), "list tail must be released with node");
+        assert!(!heap.contains(elem), "list element must be released");
+    }
+
+    #[test]
+    fn dec_ref_releases_record_children() {
+        let mut heap = Heap::new();
+        let child = heap.alloc(0, HeapData::Str("child".to_string()));
+        let mut data = vec![0u8; 8];
+        crate::memory::write_word(&mut data, 4, child as i32);
+        let record = heap.alloc(0, HeapData::Record(data));
+
+        heap.dec_ref(record);
+
+        assert!(!heap.contains(record));
+        assert!(!heap.contains(child), "record field must be released");
+    }
+
+    #[test]
+    fn dec_ref_releases_slice_parent() {
+        let mut heap = Heap::new();
+        let parent = heap.alloc(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data: vec![0; 16],
+                length: 4,
+            },
+        );
+        let slice = heap.alloc(
+            0,
+            HeapData::ArraySlice {
+                parent_id: parent,
+                byte_start: 0,
+                elem_type: 0,
+                elem_size: 4,
+                length: 2,
+            },
+        );
+        heap.inc_ref(parent); // the slice holds a reference to its parent
+
+        heap.dec_ref(slice);
+
+        assert!(!heap.contains(slice));
+        assert_eq!(
+            heap.get(parent).map(|obj| obj.ref_count),
+            Some(1),
+            "freeing a slice must release its parent reference"
+        );
+    }
+
+    #[test]
+    fn dec_ref_releases_long_list_without_overflowing_the_stack() {
+        let mut heap = Heap::new();
+        let mut tail = NIL;
+        for _ in 0..100_000 {
+            tail = heap.alloc(
+                0,
+                HeapData::List {
+                    head: vec![0; 4],
+                    tail,
+                },
+            );
+        }
+        heap.dec_ref(tail);
+        assert_eq!(heap.len(), 0, "the whole list must be released");
+    }
+
+    #[test]
+    fn dec_ref_keeps_shared_children_alive() {
+        let mut heap = Heap::new();
+        let child = heap.alloc(0, HeapData::Str("shared".to_string()));
+        heap.inc_ref(child); // held by two records
+        let mut data = vec![0u8; 4];
+        crate::memory::write_word(&mut data, 0, child as i32);
+        let record = heap.alloc(0, HeapData::Record(data));
+
+        heap.dec_ref(record);
+
+        assert!(
+            heap.contains(child),
+            "a child with remaining references must stay alive"
+        );
+        assert_eq!(heap.get(child).unwrap().ref_count, 1);
     }
 
     #[test]

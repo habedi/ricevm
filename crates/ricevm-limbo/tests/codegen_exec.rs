@@ -1,0 +1,585 @@
+//! Behavioral codegen tests: compile a Limbo snippet and *run* the resulting
+//! Dis module on the RiceVM.
+//!
+//! The program under test reports its result by raising an exception whose
+//! message encodes the computed values. An unhandled `raise` surfaces as
+//! `ExecError::ThreadFault("unhandled exception: <msg>")`, which gives an
+//! in-process observation channel without having to capture the guest's
+//! stdout. Anything that silently miscompiles to 0 (or loops forever) is
+//! therefore directly visible as a wrong — or missing — message.
+
+use std::sync::mpsc;
+use std::time::Duration;
+
+/// Compile and run `src`, returning the message of the exception the program
+/// raised. Runs on a worker thread with a wall-clock budget so that a
+/// miscompiled loop (the classic symptom of a dropped `break`) fails the test
+/// instead of hanging the suite forever.
+fn run_src(src: &str) -> Result<String, String> {
+    let owned = src.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let module = ricevm_limbo::compile(&owned, "test.b")?;
+            match ricevm_execute::execute(&module) {
+                Ok(()) => Err("program exited without raising a result".to_string()),
+                Err(e) => Ok(e.to_string()),
+            }
+        })();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(r) => r,
+        Err(_) => Err("timed out (probable infinite loop in generated code)".to_string()),
+    }
+}
+
+/// Wrap a statement list in a minimal module and run it.
+fn run_body(body: &str) -> Result<String, String> {
+    run_src(&format!(
+        "implement T;\ninit(nil: ref Draw->Context, nil: list of string)\n{{\n{body}\n}}\n"
+    ))
+}
+
+/// Assert that the program raises exactly `expected`.
+#[track_caller]
+fn assert_raises(result: Result<String, String>, expected: &str) {
+    let msg = result.unwrap_or_else(|e| panic!("program failed: {e}"));
+    assert_eq!(
+        msg,
+        format!("thread exited with error: unhandled exception: {expected}"),
+        "guest program produced the wrong result"
+    );
+}
+
+// ── Finding 1: break / continue ─────────────────────────────────
+
+/// `for(;;) { ...; break; }` must terminate. Before the fix `Stmt::Break` fell
+/// into gen_stmt's `_ => Ok(())` catch-all and emitted nothing at all, turning
+/// this into a genuine infinite loop.
+#[test]
+fn break_exits_infinite_for_loop() {
+    let out = run_body(
+        r#"
+    i := 0;
+    n := 0;
+    for(;;) {
+        i++;
+        if(i >= 3)
+            break;
+        n++;
+    }
+    raise "i=" + string i + " n=" + string n;
+"#,
+    );
+    assert_raises(out, "i=3 n=2");
+}
+
+/// `while(1) { if(done) break; }` must terminate.
+#[test]
+fn break_exits_while_loop() {
+    let out = run_body(
+        r#"
+    i := 0;
+    while(1) {
+        i++;
+        if(i == 4)
+            break;
+    }
+    raise "i=" + string i;
+"#,
+    );
+    assert_raises(out, "i=4");
+}
+
+/// `continue` in a `for` must jump to the post-statement, not skip it (which
+/// would loop forever) and not fall through to the rest of the body.
+#[test]
+fn continue_in_for_runs_post_statement() {
+    let out = run_body(
+        r#"
+    sum := 0;
+    for(i := 0; i < 5; i++) {
+        if(i == 2)
+            continue;
+        sum += i;
+    }
+    raise "sum=" + string sum;
+"#,
+    );
+    assert_raises(out, "sum=8");
+}
+
+/// `continue` in a `while` re-evaluates the condition.
+#[test]
+fn continue_in_while_reevaluates_condition() {
+    let out = run_body(
+        r#"
+    i := 0;
+    sum := 0;
+    while(i < 5) {
+        i++;
+        if(i == 3)
+            continue;
+        sum += i;
+    }
+    raise "sum=" + string sum;
+"#,
+    );
+    assert_raises(out, "sum=12");
+}
+
+/// `break`/`continue` inside a `do ... while` loop.
+#[test]
+fn break_and_continue_in_do_while() {
+    let out = run_body(
+        r#"
+    i := 0;
+    sum := 0;
+    do {
+        i++;
+        if(i == 2)
+            continue;
+        if(i == 5)
+            break;
+        sum += i;
+    } while(i < 100);
+    raise "i=" + string i + " sum=" + string sum;
+"#,
+    );
+    assert_raises(out, "i=5 sum=8");
+}
+
+/// A labelled `break` must leave the labelled loop, not just the innermost one.
+#[test]
+fn labelled_break_exits_outer_loop() {
+    let out = run_body(
+        r#"
+    n := 0;
+    outer:
+    for(i := 0; i < 3; i++) {
+        for(j := 0; j < 3; j++) {
+            if(j == 1)
+                break outer;
+            n++;
+        }
+    }
+    raise "n=" + string n;
+"#,
+    );
+    assert_raises(out, "n=1");
+}
+
+/// A labelled `continue` must continue the labelled loop.
+#[test]
+fn labelled_continue_targets_outer_loop() {
+    let out = run_body(
+        r#"
+    n := 0;
+    outer:
+    for(i := 0; i < 3; i++) {
+        for(j := 0; j < 3; j++) {
+            if(j == 1)
+                continue outer;
+            n++;
+        }
+    }
+    raise "n=" + string n;
+"#,
+    );
+    assert_raises(out, "n=3");
+}
+
+/// `break` inside a `case` arm leaves the case statement (and *not* the
+/// enclosing loop).
+#[test]
+fn break_inside_case_leaves_the_case() {
+    let out = run_body(
+        r#"
+    n := 0;
+    for(i := 0; i < 3; i++) {
+        case i {
+        1 =>
+            n += 100;
+            break;
+            n += 1000;
+        * =>
+            n++;
+        }
+        n += 10;
+    }
+    raise "n=" + string n;
+"#,
+    );
+    assert_raises(out, "n=132");
+}
+
+// ── Finding 2: module-level constants and variables ─────────────
+
+/// `MAX: con 100;` used from a function body must load 100, not 0.
+#[test]
+fn module_constant_is_folded_at_use_site() {
+    let out = run_src(
+        r#"implement T;
+MAX: con 100;
+GREETING: con "hi";
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := MAX;
+    raise GREETING + " x=" + string x;
+}
+"#,
+    );
+    assert_raises(out, "hi x=100");
+}
+
+/// The `iota` idiom numbers the names of a `con` declaration from zero, and
+/// restarts at the next declaration.
+#[test]
+fn iota_constants_are_numbered() {
+    let out = run_src(
+        r#"implement T;
+Ared, Agreen, Ablue: con iota;
+Bit0, Bit1, Bit2: con 1 << iota;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "r=" + string Ared + " g=" + string Agreen + " b=" + string Ablue
+        + " bits=" + string Bit0 + string Bit1 + string Bit2;
+}
+"#,
+    );
+    assert_raises(out, "r=0 g=1 b=2 bits=124");
+}
+
+/// Constants declared in the implemented module's own interface block are in
+/// scope in the implementation.
+#[test]
+fn constant_from_module_block_is_in_scope() {
+    let out = run_src(
+        r#"implement T;
+T: module {
+    LIMIT: con 7;
+    init: fn(nil: ref Draw->Context, args: list of string);
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "limit=" + string LIMIT;
+}
+"#,
+    );
+    assert_raises(out, "limit=7");
+}
+
+/// A constant expression built from other constants folds correctly.
+#[test]
+fn constant_expressions_fold() {
+    let out = run_src(
+        r#"implement T;
+BASE: con 10;
+DOUBLE: con BASE * 2;
+FLAG: con 1 << 4;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "d=" + string DOUBLE + " f=" + string FLAG;
+}
+"#,
+    );
+    assert_raises(out, "d=20 f=16");
+}
+
+/// A module-level variable assigned in one function must be visible in
+/// another: it needs real MP-resident storage, not a per-function frame slot.
+#[test]
+fn module_variable_is_shared_between_functions() {
+    let out = run_src(
+        r#"implement T;
+counter: int;
+bump()
+{
+    counter = counter + 5;
+}
+init(nil: ref Draw->Context, nil: list of string)
+{
+    counter = 1;
+    bump();
+    bump();
+    raise "counter=" + string counter;
+}
+"#,
+    );
+    assert_raises(out, "counter=11");
+}
+
+/// Module-level variables support the same read/modify forms as locals.
+#[test]
+fn module_variable_supports_compound_assign_and_incdec() {
+    let out = run_src(
+        r#"implement T;
+total: int;
+name: string;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    total = 1;
+    total += 4;
+    total++;
+    name = "n";
+    name += "x";
+    raise name + "=" + string total;
+}
+"#,
+    );
+    assert_raises(out, "nx=6");
+}
+
+/// Constant module-level initialisers are laid down in the data section.
+#[test]
+fn module_variable_constant_initialiser_is_preloaded() {
+    let out = run_src(
+        r#"implement T;
+greeting := "hi";
+count := 7;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise greeting + "=" + string count;
+}
+"#,
+    );
+    assert_raises(out, "hi=7");
+}
+
+/// A module-level initialiser that is not a compile-time constant runs at the
+/// top of the entry function, before any other code in the module.
+#[test]
+fn module_variable_computed_initialiser_runs_before_init_body() {
+    let out = run_src(
+        r#"implement T;
+SIZE: con 4;
+buf := array[SIZE] of int;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    buf[0] = 5;
+    raise "len=" + string len buf + " v=" + string buf[0];
+}
+"#,
+    );
+    assert_raises(out, "len=4 v=5");
+}
+
+// ── Finding 3: `x++` / `x--` in value context ───────────────────
+
+/// `y := x++` must yield the *old* value of x and still increment x.
+#[test]
+fn post_increment_in_value_context() {
+    let out = run_body(
+        r#"
+    x := 5;
+    y := x++;
+    z := x--;
+    raise "x=" + string x + " y=" + string y + " z=" + string z;
+"#,
+    );
+    assert_raises(out, "x=5 y=5 z=6");
+}
+
+/// `a[i++]` must index with the old i and still advance i.
+#[test]
+fn post_increment_inside_index_expression() {
+    let out = run_body(
+        r#"
+    a := array[3] of int;
+    a[0] = 10;
+    a[1] = 20;
+    a[2] = 30;
+    i := 0;
+    v := a[i++];
+    w := a[i++];
+    raise "v=" + string v + " w=" + string w + " i=" + string i;
+"#,
+    );
+    assert_raises(out, "v=10 w=20 i=2");
+}
+
+/// Post-increment of a module-level variable in value context.
+#[test]
+fn post_increment_of_module_variable() {
+    let out = run_src(
+        r#"implement T;
+seq: int;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    seq = 3;
+    a := seq++;
+    raise "a=" + string a + " seq=" + string seq;
+}
+"#,
+    );
+    assert_raises(out, "a=3 seq=4");
+}
+
+/// `++` on an array element and on an ADT field updates storage in place.
+#[test]
+fn increment_of_array_element_and_adt_field() {
+    let out = run_src(
+        r#"implement T;
+T: module {
+    init: fn(nil: ref Draw->Context, args: list of string);
+    P: adt { n: int; };
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    a := array[2] of int;
+    a[0] = 5;
+    a[0]++;
+    old := a[0]++;
+    p := ref P(1);
+    p.n++;
+    raise "a=" + string a[0] + " old=" + string old + " n=" + string p.n;
+}
+"#,
+    );
+    assert_raises(out, "a=7 old=6 n=2");
+}
+
+/// `++` on a string character reads, bumps and writes the character back.
+#[test]
+fn increment_of_string_character() {
+    let out = run_body(
+        r#"
+    s := "abc";
+    s[0]++;
+    raise "s=" + s;
+"#,
+    );
+    assert_raises(out, "s=bbc");
+}
+
+/// A constant too wide for the 30-bit Dis immediate encoding must travel
+/// through the data section instead of being truncated or rejected.
+#[test]
+fn constant_wider_than_the_immediate_encoding() {
+    let out = run_src(
+        r#"implement T;
+LIMIT: con 16r7fffffff;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string LIMIT;
+}
+"#,
+    );
+    assert_raises(out, "v=2147483647");
+}
+
+// ── Finding 4: `case` range patterns ────────────────────────────
+
+/// A value below the range must fall through to the next arm. Before the fix
+/// the "skip if val < lo" branch was never patched and jumped to PC 0,
+/// re-entering the function from its entry point.
+#[test]
+fn case_range_below_low_bound_falls_through() {
+    let out = run_body(
+        r#"
+    x := 0;
+    r := 9;
+    case x {
+    1 to 10 =>
+        r = 1;
+    * =>
+        r = 2;
+    }
+    raise "r=" + string r;
+"#,
+    );
+    assert_raises(out, "r=2");
+}
+
+/// A value inside the range still selects the arm, and one above it does not.
+#[test]
+fn case_range_matches_inside_and_not_above() {
+    let out = run_body(
+        r#"
+    lo := 9;
+    hi := 9;
+    case 5 {
+    1 to 10 =>
+        lo = 1;
+    * =>
+        lo = 2;
+    }
+    case 11 {
+    1 to 10 =>
+        hi = 1;
+    * =>
+        hi = 2;
+    }
+    raise "lo=" + string lo + " hi=" + string hi;
+"#,
+    );
+    assert_raises(out, "lo=1 hi=2");
+}
+
+// ── Finding 5: slot sizing for `:=` / `=` in expression position ─
+
+/// `(r := 3.25)` inside an expression must allocate an 8-byte slot for r.
+/// With the hardcoded 4-byte slot the real value spilled into the following
+/// temp and the comparison read garbage.
+#[test]
+fn decl_assign_in_expression_sizes_real_slot() {
+    let out = run_body(
+        r#"
+    n := 0;
+    if((r := 3.25) > 0.0)
+        n = 1;
+    raise "n=" + string n + " r=" + string int (r * 4.0);
+"#,
+    );
+    assert_raises(out, "n=1 r=13");
+}
+
+/// The `=`-to-a-fresh-name fallback must size the new slot by the value's
+/// kind too, or the 8-byte store clobbers the next variable's slot.
+#[test]
+fn assign_fallback_sizes_real_slot() {
+    let out = run_body(
+        r#"
+    x = 2.5;
+    y = 7;
+    raise "x=" + string int (x * 2.0) + " y=" + string y;
+"#,
+    );
+    assert_raises(out, "x=5 y=7");
+}
+
+// ── Cross-cutting: the frame must still be big enough ───────────
+
+/// A function with many locals still gets a frame that fits them, and calls
+/// between differently-sized frames keep working (guards the per-function
+/// frame-size reset that goes with the entry_type fix).
+#[test]
+fn functions_with_different_frame_sizes_interoperate() {
+    let out = run_src(
+        r#"implement T;
+small(a: int): int
+{
+    return a + 1;
+}
+big_frame(a: int): int
+{
+    b := a * 2;
+    c := b * 2;
+    d := c * 2;
+    e := d + b;
+    f := e + c;
+    g := f + d;
+    h := g + e;
+    return h;
+}
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := small(1);
+    y := big_frame(1);
+    raise "x=" + string x + " y=" + string y;
+}
+"#,
+    );
+    assert_raises(out, "x=2 y=32");
+}

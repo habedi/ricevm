@@ -40,10 +40,20 @@ impl Slot {
 
 /// A folded compile-time constant value.
 #[derive(Clone, Debug, PartialEq)]
-enum ConstVal {
+pub(crate) enum ConstVal {
     Int(i64),
     Real(f64),
     Str(String),
+}
+
+impl From<&ConstVal> for ConstValue {
+    fn from(value: &ConstVal) -> Self {
+        match value {
+            ConstVal::Int(v) => ConstValue::Int(*v),
+            ConstVal::Real(v) => ConstValue::Real(*v),
+            ConstVal::Str(s) => ConstValue::String(s.clone()),
+        }
+    }
 }
 
 /// A breakable (and usually continuable) construct being generated. `break`
@@ -235,13 +245,13 @@ impl ConstVal {
 /// declarations: it counts up within one declaration (whose names all carry
 /// the same span) and restarts at the next declaration.
 #[derive(Default)]
-struct IotaCounter {
+pub(crate) struct IotaCounter {
     group: Option<Span>,
     value: i64,
 }
 
 impl IotaCounter {
-    fn next(&mut self, span: Span) -> i64 {
+    pub(crate) fn next(&mut self, span: Span) -> i64 {
         if self.group != Some(span) {
             self.group = Some(span);
             self.value = 0;
@@ -253,7 +263,11 @@ impl IotaCounter {
 }
 
 /// Fold a binary operation over two constant values.
-fn fold_const_binary(lhs: &ConstVal, op: BinOp, rhs: &ConstVal) -> Result<ConstVal, String> {
+pub(crate) fn fold_const_binary(
+    lhs: &ConstVal,
+    op: BinOp,
+    rhs: &ConstVal,
+) -> Result<ConstVal, String> {
     match (lhs, rhs) {
         (ConstVal::Str(a), ConstVal::Str(b)) if op == BinOp::Add => {
             Ok(ConstVal::Str(format!("{a}{b}")))
@@ -303,6 +317,26 @@ fn fold_const_binary(lhs: &ConstVal, op: BinOp, rhs: &ConstVal) -> Result<ConstV
         }
         _ => Err(format!("unsupported constant operator {op:?}")),
     }
+}
+
+/// A name an `import` declaration put into unqualified scope.
+///
+/// Limbo's `NAMES: import m;` takes either a module *variable* (`sys: Sys;
+/// ... : import sys;`) or a module *type* name (`... : import Fs;`). The
+/// distinction matters: a function can only be reached through a variable,
+/// because the call needs a live module reference — the reference compiler
+/// rejects calling a function imported from an interface name with "cannot
+/// call X because M is a module interface" (typecheck.c:1459).
+#[derive(Clone, Debug)]
+struct Imported {
+    /// The operand of `import`, spelled as in the source.
+    module: String,
+    /// The module's type name, when the interface is known. `None` when no
+    /// declaration for the module could be found, which is what happens when
+    /// the `.m` file was not on the include path.
+    module_type: Option<String>,
+    /// Whether `module` names a variable (rather than an interface name).
+    from_variable: bool,
 }
 
 /// Code generation context.
@@ -372,6 +406,12 @@ pub struct CodeGen {
     /// Symbols gathered from included `.m` files, when the driver supplies
     /// them. Consulted for constants that this file does not declare itself.
     symtab: Option<SymbolTable>,
+    /// Names an `import` declaration brought into unqualified scope, keyed by
+    /// the imported name. Every use site resolves through the owning module,
+    /// so an imported constant folds to the module's value and an imported
+    /// function compiles to the same cross-module call its qualified spelling
+    /// `mod->f(...)` would produce.
+    imported: std::collections::HashMap<String, Imported>,
     /// Module-level initialisers that are not compile-time constants. They
     /// are emitted at the top of the entry function, which runs before any
     /// other code in the module.
@@ -419,6 +459,7 @@ impl CodeGen {
             module_consts: std::collections::HashMap::new(),
             qualified_consts: std::collections::HashMap::new(),
             symtab: None,
+            imported: std::collections::HashMap::new(),
             pending_global_inits: Vec::new(),
             loop_stack: Vec::new(),
             pending_label: None,
@@ -443,6 +484,9 @@ impl CodeGen {
         self.sys_mp_ref = self.alloc_mp(4);
         self.collect_strings(file);
         self.collect_adts(file);
+        // `import` runs before constant folding: an imported constant has to
+        // be usable inside another module-level constant expression.
+        self.collect_imports(file)?;
         // Module-level `con` values are folded once, up front, so use sites
         // can resolve them to literals; module-level variables get real MP
         // storage so every function sees the same slot.
@@ -694,6 +738,101 @@ impl CodeGen {
         }
     }
 
+    /// Resolve every `import` declaration, binding the imported names in
+    /// unqualified scope.
+    ///
+    /// `import` may appear at the top level or inside a function body; both
+    /// forms bind the same way. The operand names either a module variable,
+    /// whose declared type gives the interface, or an interface directly.
+    fn collect_imports(&mut self, file: &SourceFile) -> Result<(), String> {
+        for decl in &file.decls {
+            match decl {
+                Decl::Import(imp) => self.bind_import(imp)?,
+                Decl::Func(f) => self.collect_stmt_imports(&f.body.stmts)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn collect_stmt_imports(&mut self, stmts: &[Stmt]) -> Result<(), String> {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Import(imp) => self.bind_import(imp)?,
+                Stmt::Block(b) => self.collect_stmt_imports(&b.stmts)?,
+                Stmt::If(s) => {
+                    self.collect_stmt_imports(std::slice::from_ref(&s.then))?;
+                    if let Some(e) = &s.else_ {
+                        self.collect_stmt_imports(std::slice::from_ref(e))?;
+                    }
+                }
+                Stmt::For(s) => self.collect_stmt_imports(std::slice::from_ref(&s.body))?,
+                Stmt::While(s) => self.collect_stmt_imports(std::slice::from_ref(&s.body))?,
+                Stmt::Do(s) => self.collect_stmt_imports(std::slice::from_ref(&s.body))?,
+                Stmt::Label(_, s) => self.collect_stmt_imports(std::slice::from_ref(s))?,
+                Stmt::Case(s) => {
+                    for arm in &s.arms {
+                        self.collect_stmt_imports(&arm.body)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind one `NAMES: import m;` declaration.
+    ///
+    /// A name the module does not declare is a hard error naming both, which
+    /// is what the reference compiler reports ("X is not a member of m",
+    /// typecheck.c:942). The one case that cannot be checked is a module whose
+    /// interface was never found; the names are still recorded so their use
+    /// sites can say why they are unresolvable.
+    fn bind_import(&mut self, imp: &ImportDecl) -> Result<(), String> {
+        let (module_type, from_variable) = self.resolve_import_operand(&imp.module);
+        for name in &imp.names {
+            if let Some(ty) = &module_type
+                && self.module_member(ty, name).is_none()
+            {
+                return Err(format!(
+                    "`{name}` is not a member of module `{}`",
+                    imp.module
+                ));
+            }
+            self.imported.insert(
+                name.clone(),
+                Imported {
+                    module: imp.module.clone(),
+                    module_type: module_type.clone(),
+                    from_variable,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Map the operand of `import` to `(interface name, is a variable)`.
+    fn resolve_import_operand(&self, operand: &str) -> (Option<String>, bool) {
+        let Some(symtab) = self.symtab.as_ref() else {
+            return (None, false);
+        };
+        match symtab.lookup(operand) {
+            // `sys: Sys;` — a variable whose type is a module interface.
+            Some(Symbol::Var {
+                ty: ResolvedType::Module(name),
+            }) => (Some(name.clone()), true),
+            // `import Fs;` — the interface named directly.
+            Some(Symbol::Module { name, .. }) => (Some(name.clone()), false),
+            _ if symtab.modules.contains_key(operand) => (Some(operand.to_string()), false),
+            _ => (None, false),
+        }
+    }
+
+    /// Look up a member of a module interface by interface name.
+    fn module_member(&self, module_type: &str, member: &str) -> Option<&Symbol> {
+        self.symtab.as_ref()?.lookup_qualified(module_type, member)
+    }
+
     /// Fold every module-level `con` declaration into a literal value.
     ///
     /// Constants declared in the interface block of the module this file
@@ -793,9 +932,43 @@ impl CodeGen {
         if let Some(v) = self.module_consts.get(name) {
             return Some(v.clone());
         }
+        // An imported constant folds exactly like a locally declared one, in
+        // constant expressions as well as at ordinary use sites.
+        if let Some(imp) = self.imported.get(name)
+            && let Some(module_type) = &imp.module_type
+            && let Some(v) = self.qualified_const_value(module_type, name)
+        {
+            return Some(v);
+        }
         match self.symtab.as_ref()?.lookup(name) {
             Some(Symbol::Const { value, .. }) => Some(Ok(ConstVal::from(value))),
             _ => None,
+        }
+    }
+
+    /// Explain why an imported name cannot stand for a value here.
+    ///
+    /// Reached only after `const_value` has declined it, so the name is bound
+    /// to something that is not a constant.
+    fn imported_value_error(&self, name: &str, imp: &Imported) -> String {
+        let Some(module_type) = &imp.module_type else {
+            return format!(
+                "undefined identifier `{name}`: it is imported from `{}`, whose interface was \
+                 not found (is the include path set?)",
+                imp.module
+            );
+        };
+        match self.module_member(module_type, name) {
+            Some(Symbol::Type { .. }) => format!("`{name}` is a type, not a value"),
+            Some(Symbol::Func { .. }) => {
+                format!("`{name}` is a function; it can only be called, not used as a value")
+            }
+            Some(Symbol::Var { .. }) => format!(
+                "`{name}` is a variable of module `{}`; qualified access to another module's \
+                 variables is not supported yet",
+                imp.module
+            ),
+            _ => format!("`{name}` is not a member of module `{}`", imp.module),
         }
     }
 
@@ -2330,11 +2503,16 @@ impl CodeGen {
                     }
                     return Ok(());
                 }
-                // Module-level constant: materialize its folded value.
+                // Module-level or imported constant: materialize its folded
+                // value.
                 if let Some(value) = self.const_value(name) {
                     let value = value
                         .map_err(|why| format!("constant `{name}` cannot be folded: {why}"))?;
                     return self.gen_const_to(&value, dst);
+                }
+                // Imported, but not as something that has a value here.
+                if let Some(imp) = self.imported.get(name) {
+                    return Err(self.imported_value_error(name, imp));
                 }
                 // Anything else used to compile to `Movw $0` — a silent zero.
                 Err(format!("undefined identifier `{name}`"))

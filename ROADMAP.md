@@ -72,7 +72,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Reference counting for deterministic destruction (module refs protected from premature freeing)
 - [x] `op_ret` frees frame pointers via type descriptor pointer maps (matching reference `freeptrs`)
 - [x] Mark-and-sweep garbage collector (scans frames, MP, caller MP stacks, all loaded module MPs, and all suspended threads)
-- [x] Optional toggle to disable mark-and-sweep collection (`--no-gc` flag)
+- [x] Optional toggle to disable mark-and-sweep collection (`--no-gc` flag; debug only, since reference counting alone leaks -- see Known Limitations)
 - [x] Bounds-safe memory access (out-of-bounds reads return 0; writes are no-ops)
 
 ### Scheduler
@@ -263,6 +263,13 @@ This document outlines the features implemented in RiceVM and the future goals f
   VM; a preemptive scheduler with OS threads exists but is not connected because it would require `Arc<Mutex<>>` refactoring of VmState
 - `op_ret` does not restore module context from the frame; the `mcall` wrapper handles module context restoration instead (correct behavior, different
   structure from reference)
+- Heap tracing is conservative, not precise. `dec_ref` cascades only through slots whose reference is provably taken on store (list tails, array-slice
+  parents), and mark-and-sweep scans record/array/ADT buffers word by word, retaining anything that looks like a live id. Telling a genuine pointer slot
+  from a coincidental byte pattern needs the type descriptor pointer maps, which the heap cannot reach: `HeapObject::type_id` is a bare per-module type
+  index with no module identity, and list nodes carry no descriptor at all. The result is sound -- nothing is freed while still reachable -- but imprecise
+  in both directions: pointers owned by a buffer survive until the collector runs, and byte or `real` data can keep an object alive by coincidence.
+  Making it precise means giving heap objects a module-qualified type id and reference counting every block write (`heap_write`, `array_write`,
+  `cons_bytes`, `movm`), which today copy bytes without counting anything.
 
 #### Unimplementable on Host OS
 

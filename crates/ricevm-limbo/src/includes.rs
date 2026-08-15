@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::ast::*;
+use crate::codegen::{ConstVal, IotaCounter, fold_const_binary};
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use crate::symtab::*;
@@ -36,16 +37,9 @@ pub fn process_includes(file: &SourceFile, symtab: &mut SymbolTable) {
                 symtab.define(name, Symbol::Var { ty });
             }
         }
-        if let Decl::Import(imp) = decl {
-            // name: import module — bring module members into scope
-            if let Some(Symbol::Module { members, .. }) = symtab.lookup(&imp.module).cloned() {
-                for import_name in &imp.names {
-                    if let Some(sym) = members.get(import_name) {
-                        symtab.define(import_name, sym.clone());
-                    }
-                }
-            }
-        }
+        // `Decl::Import` is deliberately *not* handled here. Resolving it needs
+        // the module-variable-to-module-type mapping and has to report an
+        // unknown member as an error, so codegen owns it (`collect_imports`).
     }
 }
 
@@ -89,14 +83,15 @@ fn process_include(path: &str, symtab: &mut SymbolTable) {
                 }
             }
             Decl::Const(c) => {
-                let value = eval_const_expr(&c.value);
-                symtab.define(
-                    &c.name,
-                    Symbol::Const {
-                        ty: ResolvedType::Int,
-                        value,
-                    },
-                );
+                if let Some(value) = eval_const_expr(&c.value, 0, &HashMap::new()) {
+                    symtab.define(
+                        &c.name,
+                        Symbol::Const {
+                            ty: ResolvedType::Int,
+                            value,
+                        },
+                    );
+                }
             }
             _ => {}
         }
@@ -121,14 +116,29 @@ fn find_include_file(path: &str, search_paths: &[String]) -> Option<PathBuf> {
 
 fn extract_module_members(members: &[ModuleMember]) -> HashMap<String, Symbol> {
     let mut map = HashMap::new();
+    // `iota` counts up within one `con` declaration and restarts at the next,
+    // so `Next, Down, Skip, Quit: con iota;` yields 0,1,2,3 — not four zeroes.
+    // Earlier constants of the same interface are visible to later ones.
+    let mut iota = IotaCounter::default();
+    let mut prior: HashMap<String, ConstValue> = HashMap::new();
     for member in members {
         match member {
             ModuleMember::Const(c) => {
-                let value = eval_const_expr(&c.value);
+                // A constant this evaluator cannot fold is left out of the
+                // interface entirely: a use site then reports the name as
+                // undefined instead of silently reading zero.
+                let Some(value) = eval_const_expr(&c.value, iota.next(c.span), &prior) else {
+                    continue;
+                };
+                prior.insert(c.name.clone(), value.clone());
                 map.insert(
                     c.name.clone(),
                     Symbol::Const {
-                        ty: ResolvedType::Int,
+                        ty: match &value {
+                            ConstValue::Real(_) => ResolvedType::Real,
+                            ConstValue::String(_) => ResolvedType::String,
+                            ConstValue::Int(_) => ResolvedType::Int,
+                        },
                         value,
                     },
                 );
@@ -247,67 +257,51 @@ fn resolve_ast_type(ty: Option<&Type>, symtab: &SymbolTable) -> ResolvedType {
     }
 }
 
-/// Evaluate a constant expression (simplified).
-fn eval_const_expr(expr: &Expr) -> ConstValue {
+/// Evaluate a module-interface constant expression.
+///
+/// `iota` supplies the value of the `iota` keyword for the declaration being
+/// folded and `prior` holds the constants already declared in the same
+/// interface, which a later one may refer to. Returns `None` when the
+/// expression is not a compile-time constant — the caller then leaves the name
+/// out of the interface rather than inventing a value for it.
+fn eval_const_expr(
+    expr: &Expr,
+    iota: i64,
+    prior: &HashMap<String, ConstValue>,
+) -> Option<ConstValue> {
+    let folded = fold(expr, iota, prior)?;
+    Some(ConstValue::from(&folded))
+}
+
+fn fold(expr: &Expr, iota: i64, prior: &HashMap<String, ConstValue>) -> Option<ConstVal> {
     match expr {
-        Expr::IntLit(v, _) => ConstValue::Int(*v),
-        Expr::RealLit(v, _) => ConstValue::Real(*v),
-        Expr::StringLit(s, _) => ConstValue::String(s.clone()),
-        Expr::Ident(name, _) if name == "iota" => ConstValue::Int(0), // simplified
-        Expr::Binary(l, BinOp::Add, r, _) => {
-            if let (ConstValue::Int(a), ConstValue::Int(b)) =
-                (eval_const_expr(l), eval_const_expr(r))
-            {
-                ConstValue::Int(a + b)
-            } else {
-                ConstValue::Int(0)
-            }
+        Expr::IntLit(v, _) => Some(ConstVal::Int(*v)),
+        Expr::CharLit(v, _) => Some(ConstVal::Int(*v as i64)),
+        Expr::RealLit(v, _) => Some(ConstVal::Real(*v)),
+        Expr::StringLit(s, _) => Some(ConstVal::Str(s.clone())),
+        Expr::Ident(name, _) if name == "iota" => Some(ConstVal::Int(iota)),
+        Expr::Ident(name, _) => prior.get(name).map(ConstVal::from),
+        Expr::Unary(op, inner, _) => match (op, fold(inner, iota, prior)?) {
+            (UnaryOp::Neg, ConstVal::Int(v)) => Some(ConstVal::Int(-v)),
+            (UnaryOp::Neg, ConstVal::Real(v)) => Some(ConstVal::Real(-v)),
+            (UnaryOp::BitNot, ConstVal::Int(v)) => Some(ConstVal::Int(!v)),
+            (UnaryOp::Not, ConstVal::Int(v)) => Some(ConstVal::Int((v == 0) as i64)),
+            _ => None,
+        },
+        Expr::Binary(lhs, op, rhs, _) => {
+            let l = fold(lhs, iota, prior)?;
+            let r = fold(rhs, iota, prior)?;
+            fold_const_binary(&l, *op, &r).ok()
         }
-        Expr::Binary(l, BinOp::Sub, r, _) => {
-            if let (ConstValue::Int(a), ConstValue::Int(b)) =
-                (eval_const_expr(l), eval_const_expr(r))
-            {
-                ConstValue::Int(a - b)
-            } else {
-                ConstValue::Int(0)
+        Expr::Cast(ty, inner, _) => match (ty.as_ref(), fold(inner, iota, prior)?) {
+            (Type::Basic(BasicType::Real), ConstVal::Int(v)) => Some(ConstVal::Real(v as f64)),
+            (Type::Basic(BasicType::Int | BasicType::Big | BasicType::Byte), ConstVal::Real(v)) => {
+                Some(ConstVal::Int(v as i64))
             }
-        }
-        Expr::Binary(l, BinOp::Mul, r, _) => {
-            if let (ConstValue::Int(a), ConstValue::Int(b)) =
-                (eval_const_expr(l), eval_const_expr(r))
-            {
-                ConstValue::Int(a * b)
-            } else {
-                ConstValue::Int(0)
-            }
-        }
-        Expr::Binary(l, BinOp::Lshift, r, _) => {
-            if let (ConstValue::Int(a), ConstValue::Int(b)) =
-                (eval_const_expr(l), eval_const_expr(r))
-            {
-                ConstValue::Int(a << b)
-            } else {
-                ConstValue::Int(0)
-            }
-        }
-        Expr::Binary(l, BinOp::Or, r, _) => {
-            if let (ConstValue::Int(a), ConstValue::Int(b)) =
-                (eval_const_expr(l), eval_const_expr(r))
-            {
-                ConstValue::Int(a | b)
-            } else {
-                ConstValue::Int(0)
-            }
-        }
-        Expr::Unary(UnaryOp::Neg, inner, _) => {
-            if let ConstValue::Int(v) = eval_const_expr(inner) {
-                ConstValue::Int(-v)
-            } else {
-                ConstValue::Int(0)
-            }
-        }
-        Expr::CharLit(v, _) => ConstValue::Int(*v as i64),
-        _ => ConstValue::Int(0),
+            (Type::Basic(BasicType::String), ConstVal::Int(v)) => Some(ConstVal::Str(v.to_string())),
+            (_, v) => Some(v),
+        },
+        _ => None,
     }
 }
 
@@ -319,7 +313,10 @@ mod tests {
     #[test]
     fn eval_const_int() {
         let expr = Expr::IntLit(42, Span::default());
-        assert!(matches!(eval_const_expr(&expr), ConstValue::Int(42)));
+        assert!(matches!(
+            eval_const_expr(&expr, 0, &HashMap::new()),
+            Some(ConstValue::Int(42))
+        ));
     }
 
     #[test]
@@ -330,7 +327,10 @@ mod tests {
             Box::new(Expr::IntLit(32, Span::default())),
             Span::default(),
         );
-        assert!(matches!(eval_const_expr(&expr), ConstValue::Int(42)));
+        assert!(matches!(
+            eval_const_expr(&expr, 0, &HashMap::new()),
+            Some(ConstValue::Int(42))
+        ));
     }
 
     #[test]
@@ -341,7 +341,10 @@ mod tests {
             Box::new(Expr::IntLit(8, Span::default())),
             Span::default(),
         );
-        assert!(matches!(eval_const_expr(&expr), ConstValue::Int(256)));
+        assert!(matches!(
+            eval_const_expr(&expr, 0, &HashMap::new()),
+            Some(ConstValue::Int(256))
+        ));
     }
 
     #[test]
@@ -351,13 +354,18 @@ mod tests {
             Box::new(Expr::IntLit(7, Span::default())),
             Span::default(),
         );
-        assert!(matches!(eval_const_expr(&expr), ConstValue::Int(-7)));
+        assert!(matches!(
+            eval_const_expr(&expr, 0, &HashMap::new()),
+            Some(ConstValue::Int(-7))
+        ));
     }
 
     #[test]
     fn eval_const_string() {
         let expr = Expr::StringLit("hello".to_string(), Span::default());
-        assert!(matches!(eval_const_expr(&expr), ConstValue::String(s) if s == "hello"));
+        assert!(
+            matches!(eval_const_expr(&expr, 0, &HashMap::new()), Some(ConstValue::String(s)) if s == "hello")
+        );
     }
 
     #[test]

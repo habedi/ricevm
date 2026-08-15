@@ -583,3 +583,137 @@ init(nil: ref Draw->Context, nil: list of string)
     );
     assert_raises(out, "x=2 y=32");
 }
+
+// ── import declarations ─────────────────────────────────────────
+
+/// `NAME: import modvar;` brings a module constant into unqualified scope.
+/// Before the fix codegen had no `Decl::Import` arm at all, so the name never
+/// entered scope and every use site failed with "undefined identifier".
+#[test]
+fn imported_constant_folds_to_its_value() {
+    let out = run_src(
+        r#"implement T;
+M: module {
+    UTFmax: con 4;
+};
+m: M;
+UTFmax: import m;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    n := 3;
+    raise "v=" + string (n * UTFmax + 1);
+}
+"#,
+    );
+    assert_raises(out, "v=13");
+}
+
+/// The operand of `import` may also be the module *type* name rather than a
+/// module variable — `Next, Down, Skip, Quit: import Fs;` is the idiom used
+/// throughout appl/alphabet.
+#[test]
+fn imported_constant_from_module_type_name() {
+    let out = run_src(
+        r#"implement T;
+Fs: module {
+    Next, Down, Skip, Quit: con iota;
+};
+Next, Down, Skip, Quit: import Fs;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string Next + string Down + string Skip + string Quit;
+}
+"#,
+    );
+    assert_raises(out, "v=0123");
+}
+
+/// An imported constant must be usable inside another constant expression,
+/// exactly like a locally declared one.
+#[test]
+fn imported_constant_folds_inside_a_constant_expression() {
+    let out = run_src(
+        r#"implement T;
+M: module {
+    Udphdrlen: con 12;
+};
+m: M;
+Udphdrlen: import m;
+Udphdrsize: con Udphdrlen + 8;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string Udphdrsize;
+}
+"#,
+    );
+    assert_raises(out, "v=20");
+}
+
+/// Importing a name the module does not declare is a hard error that names
+/// both the module and the member — never a silent zero.
+#[test]
+fn importing_a_name_the_module_lacks_is_an_error() {
+    let err = run_src(
+        r#"implement T;
+M: module {
+    Real: con 1;
+};
+m: M;
+Bogus: import m;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string Bogus;
+}
+"#,
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("Bogus") && err.contains("M"),
+        "error should name the missing member and its module, got: {err}"
+    );
+}
+
+/// A function-body `import` binds names too; the parser used to drop it on the
+/// floor with the comment "import handled as side effect", and there was no
+/// such side effect.
+#[test]
+fn import_in_statement_position_binds_names() {
+    let out = run_src(
+        r#"implement T;
+M: module {
+    Bufsize: con 7;
+};
+m: M;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    Bufsize: import m;
+    raise "v=" + string (Bufsize * 3);
+}
+"#,
+    );
+    assert_raises(out, "v=21");
+}
+
+/// An imported function must reach the module it came from. `sprint` imported
+/// from `sys` has to make the same cross-module call `sys->sprint(...)` makes,
+/// so the $Sys builtin actually formats the string.
+#[test]
+fn imported_sys_function_runs_as_a_cross_module_call() {
+    let out = run_src(
+        r#"implement T;
+include "sys.m";
+Sys: module {
+    PATH: con "$Sys";
+    sprint: fn(s: string): string;
+};
+sys: Sys;
+sprint: import sys;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    sys = load Sys Sys->PATH;
+    raise sprint("v=%d", 40 + 2);
+}
+"#,
+    );
+    assert_raises(out, "v=42");
+}

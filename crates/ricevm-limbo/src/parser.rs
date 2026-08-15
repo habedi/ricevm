@@ -1288,9 +1288,13 @@ impl Parser {
         // Handle special forms: import, con, type
         if self.at(&TokenKind::Import) {
             self.advance();
-            let _module = self.expect_ident()?;
+            let module = self.expect_ident()?;
             self.expect_semi()?;
-            return Ok(Stmt::Empty); // import handled as side effect
+            return Ok(Stmt::Import(ImportDecl {
+                names,
+                module,
+                span,
+            }));
         }
         if self.at(&TokenKind::Con) {
             self.advance();

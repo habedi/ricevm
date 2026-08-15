@@ -29,6 +29,13 @@ pub(crate) struct VmState<'m> {
     pub next_pc: usize,
     pub halted: bool,
     pub trace: bool,
+    /// Whether the mark-and-sweep pass runs (`--no-gc` / `RICEVM_NO_GC` clears it).
+    ///
+    /// Debug use only. `Heap::dec_ref` deliberately does not cascade into record,
+    /// array or ADT buffers, because it cannot tell a pointer slot from a
+    /// coincidental byte pattern (see `Heap::child_refs`), so the collector is the
+    /// only thing that reclaims what those buffers own. With it off, a program
+    /// that builds such structures leaks without bound.
     pub gc_enabled: bool,
     pub(crate) gc_counter: usize,
     /// Index of the currently executing loaded module (None = main module).

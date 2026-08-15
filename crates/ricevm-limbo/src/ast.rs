@@ -188,6 +188,10 @@ pub enum BasicType {
 pub enum Stmt {
     Expr(Expr),
     VarDecl(VarDecl),
+    /// `names: import modvar;` in statement position. Declares no storage, but
+    /// it does bind names, so it has to reach codegen rather than being
+    /// discarded by the parser.
+    Import(ImportDecl),
     Block(Block),
     If(IfStmt),
     For(ForStmt),

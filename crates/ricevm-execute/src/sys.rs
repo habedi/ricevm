@@ -71,6 +71,18 @@ fn accumulate_digit(value: usize, digit: char) -> usize {
 }
 
 /// Format a printf-style string with arguments from the frame.
+/// Advance `arg_offset` to the next 8-byte boundary measured from the frame
+/// base, which is where a `big` or `real` vararg lives.
+///
+/// The reference walker spells this `while((va - fp) & (IBY2LG-1)) va++;`
+/// (`libinterp/runt.c`), and the compiler lays frames out to match --
+/// `sizeids` aligns every field to its own alignment, 8 for those two types.
+/// Word-sized arguments carry no such rule, so a 64-bit value that follows an
+/// odd number of words is preceded by four bytes of padding.
+fn align_vararg(frame_base: usize, arg_offset: usize) -> usize {
+    arg_offset + (arg_offset.wrapping_sub(frame_base).wrapping_neg() & 7)
+}
+
 fn format_string(
     vm: &VmState<'_>,
     frame_base: usize,
@@ -222,6 +234,7 @@ fn format_string(
                 arg_offset += 4;
             }
             Some(fc @ ('g' | 'f' | 'e')) => {
+                arg_offset = align_vararg(frame_base, arg_offset);
                 let val = memory::read_real(&vm.frames.data, arg_offset);
                 let s = match (fc, precision) {
                     ('f', Some(p)) => format!("{val:.prec$}", prec = p),
@@ -290,6 +303,7 @@ fn format_string(
             // %bd = big decimal, %bx = big hex, %bo = big octal
             // %bud = big unsigned decimal, %bux = big unsigned hex
             Some('b') => {
+                arg_offset = align_vararg(frame_base, arg_offset);
                 let unsigned = chars.next_if_eq(&'u').is_some();
                 match chars.next() {
                     Some('d') => {
@@ -1843,6 +1857,38 @@ mod tests {
     }
 
     #[test]
+    fn format_big_vararg_sits_at_an_eight_byte_boundary() {
+        // A 64-bit vararg starts at an 8-byte boundary measured from the frame
+        // base, exactly as the reference walker does:
+        // `while((va - fp) & (IBY2LG-1)) va++;` (libinterp/runt.c). The format
+        // string pointer takes the first four bytes, so the next slot is
+        // offset 36 and the big is padded up to 40.
+        let result = run_format("%bd", |vm, off| {
+            memory::write_big(&mut vm.frames.data, off + 4, 5_000_000_000);
+        });
+        assert_eq!(result, "5000000000");
+    }
+
+    #[test]
+    fn format_real_vararg_sits_at_an_eight_byte_boundary() {
+        let result = run_format("%g", |vm, off| {
+            memory::write_real(&mut vm.frames.data, off + 4, 2.5);
+        });
+        assert_eq!(result, "2.5");
+    }
+
+    #[test]
+    fn format_word_vararg_before_a_big_does_not_shift_it() {
+        // The word takes offsets 36..40, which leaves the big already aligned
+        // at 40 with no padding.
+        let result = run_format("%d %bd", |vm, off| {
+            memory::write_word(&mut vm.frames.data, off, 7);
+            memory::write_big(&mut vm.frames.data, off + 4, 5_000_000_000);
+        });
+        assert_eq!(result, "7 5000000000");
+    }
+
+    #[test]
     fn format_string_width_d() {
         let result = run_format("%7d", |vm, off| {
             memory::write_word(&mut vm.frames.data, off, 42);
@@ -1853,7 +1899,9 @@ mod tests {
     #[test]
     fn format_string_precision_f() {
         let result = run_format("%.2f", |vm, off| {
-            memory::write_real(&mut vm.frames.data, off, 3.755);
+            // `off` is the first slot after the format pointer; a real is
+            // padded up to the next 8-byte boundary from there.
+            memory::write_real(&mut vm.frames.data, off + 4, 3.755);
         });
         assert_eq!(result, "3.75");
     }
@@ -2007,7 +2055,7 @@ mod tests {
     #[test]
     fn format_string_g_float() {
         let result = run_format("%g", |vm, off| {
-            memory::write_real(&mut vm.frames.data, off, 3.75);
+            memory::write_real(&mut vm.frames.data, off + 4, 3.75);
         });
         assert_eq!(result, "3.75");
     }

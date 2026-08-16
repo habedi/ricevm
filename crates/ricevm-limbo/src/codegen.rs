@@ -302,6 +302,18 @@ impl TupleLayout {
     }
 }
 
+/// Round a frame offset up to the boundary an argument needs.
+///
+/// `sizeids` in the reference compiler aligns every field to its own
+/// alignment (`off = align(off, a)`, limbo/types.c) -- 8 for `big` and `real`,
+/// 4 for everything narrower, and the widest field's alignment for a tuple.
+/// The runtime relies on the same rule when it walks varargs, so a `big` after
+/// an odd number of words is preceded by four bytes of padding.
+fn align_arg(off: i32, align: i32) -> i32 {
+    let a = align.max(4);
+    (off + a - 1) & !(a - 1)
+}
+
 /// Lay out a tuple's fields using the same width and alignment rules as an
 /// ADT's, which is what the reference compiler does.
 fn compute_tuple_layout(fields: &[Type]) -> TupleLayout {
@@ -636,6 +648,9 @@ struct ArgSlot {
     op: Opcode,
     /// Bytes a non-tuple argument occupies in the callee frame.
     width: i32,
+    /// Boundary this argument starts on. Taken from the type, not the width:
+    /// a `(int, int)` is eight bytes wide but only 4-aligned.
+    align: i32,
 }
 
 /// One communication guard of an `alt`, resolved to the table entry it
@@ -2364,10 +2379,15 @@ impl CodeGen {
                 let kind = type_num_kind(&param.ty);
                 // A tuple parameter occupies its whole width in the frame,
                 // and the caller packs it at exactly these offsets.
-                let param_width = match &param.ty {
-                    Type::Tuple(fields) => compute_tuple_layout(fields).size,
-                    _ => kind.byte_size(),
+                let (param_width, param_align) = match &param.ty {
+                    Type::Tuple(fields) => {
+                        (compute_tuple_layout(fields).size, type_size_align(&param.ty).1)
+                    }
+                    _ => (kind.byte_size(), kind.byte_size()),
                 };
+                // The caller pads to the same boundary before storing, so both
+                // sides agree on where each parameter starts.
+                param_off = align_arg(param_off, param_align);
                 if name != "nil" {
                     self.locals.push((name.clone(), param_off, ty, kind));
                     if let Type::Tuple(fields) = &param.ty {
@@ -2394,9 +2414,6 @@ impl CodeGen {
                     // can call `b->open(...)`.
                     self.note_module_handle(name, Some(&param.ty), None);
                 }
-                // Frame param slots are 4-byte aligned in the reference ABI;
-                // big/real params occupy two adjacent slots. This keeps the
-                // offsets consistent with how the caller packs arguments.
                 param_off += param_width;
             }
         }
@@ -3054,11 +3071,18 @@ impl CodeGen {
         if let Some(layout) = self.tuple_layout_of(arg) {
             let tmp = self.alloc_temp_block(layout.size);
             self.gen_expr_to(arg, tmp)?;
+            let align = layout
+                .fields
+                .iter()
+                .map(|(ty, _)| type_size_align(ty).1)
+                .max()
+                .unwrap_or(4);
             return Ok(ArgSlot {
                 tmp,
                 tuple: Some(layout),
                 op: Opcode::Movw,
                 width: 0,
+                align,
             });
         }
         let kind = self.infer_num_kind(arg);
@@ -3076,6 +3100,7 @@ impl CodeGen {
             tuple: None,
             op,
             width: kind.byte_size(),
+            align: kind.byte_size(),
         })
     }
 
@@ -3086,6 +3111,7 @@ impl CodeGen {
     /// moves field by field; the callee's own parameter layout advances by
     /// the same amount, which is what keeps the two in step.
     fn store_arg(&mut self, slot: &ArgSlot, frame_tmp: i32, arg_off: i32) -> i32 {
+        let arg_off = align_arg(arg_off, slot.align);
         match &slot.tuple {
             Some(layout) => {
                 for (ty, off) in layout.fields.clone() {

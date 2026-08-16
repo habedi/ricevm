@@ -1540,18 +1540,20 @@ impl Parser {
         self.expect(&TokenKind::LBrace)?;
         let mut arms = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
-            let guard = if self.at(&TokenKind::Star) {
+            let guards = if self.at(&TokenKind::Star) {
                 self.advance();
-                AltGuard::Wildcard
+                vec![AltGuard::Wildcard]
             } else {
-                // Parse guard: expr [or expr]* =>
-                // Consume everything until => at depth 0
-                let expr = self.parse_expr()?;
+                // Guard list: `expr [or expr]* =>`. Every guard gets its own
+                // entry in the alt table and they all share this arm's body,
+                // so all of them are kept.
+                let mut guards = vec![self.classify_alt_guard(self.parse_expr()?)?];
                 while self.at(&TokenKind::Or) {
                     self.advance();
-                    let _ = self.parse_expr()?; // consume alternative guard
+                    let expr = self.parse_expr()?;
+                    guards.push(self.classify_alt_guard(expr)?);
                 }
-                AltGuard::Recv(None, expr)
+                guards
             };
             self.expect(&TokenKind::FatArrow)?;
             let mut body = Vec::new();
@@ -2853,5 +2855,120 @@ test()
         if let Stmt::Expr(Expr::Assign(_, rhs, _)) = &f.body.stmts[0] {
             assert!(matches!(rhs.as_ref(), Expr::Load(_, _, _)));
         }
+    }
+
+    /// Pull the single `alt` statement out of a one-function file.
+    fn alt_of(src: &str) -> AltStmt {
+        let file = parse(src);
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        match &f.body.stmts[0] {
+            Stmt::Alt(a) => a.clone(),
+            other => panic!("expected alt, got {other:?}"),
+        }
+    }
+
+    /// `x := <-c1 or x = <-c2 or x = <-c3 =>` names three channels, and an
+    /// `alt` that listens on one of them is a different program. The guards
+    /// after the first used to be parsed and dropped on the floor.
+    #[test]
+    fn alt_arm_retains_every_or_joined_guard() {
+        let alt = alt_of(
+            r#"implement T;
+test(c1: chan of int, c2: chan of int, c3: chan of int)
+{
+    alt {
+    x := <-c1 or
+    x = <-c2 or
+    x = <-c3 =>
+        y = x;
+    }
+}
+"#,
+        );
+        assert_eq!(alt.arms.len(), 1, "one arm");
+        let text = format!("{:?}", alt.arms[0].guards);
+        for chan in ["c1", "c2", "c3"] {
+            assert!(
+                text.contains(chan),
+                "guard for {chan} was discarded: {text}"
+            );
+        }
+        assert_eq!(alt.arms[0].guards.len(), 3, "three guards share one body");
+    }
+
+    /// Guards are classified at parse time, so codegen never has to guess
+    /// whether `Recv` really holds a send.
+    #[test]
+    fn alt_classifies_send_and_recv_and_wildcard_guards() {
+        let alt = alt_of(
+            r#"implement T;
+test(c: chan of int, d: chan of int)
+{
+    alt {
+    c <-= 1 =>
+        x = 1;
+    y := <-d =>
+        x = y;
+    * =>
+        x = 3;
+    }
+}
+"#,
+        );
+        assert_eq!(alt.arms.len(), 3);
+        assert!(
+            matches!(alt.arms[0].guards[0], AltGuard::Send(_, _)),
+            "`c <-= 1` is a send guard, got {:?}",
+            alt.arms[0].guards[0]
+        );
+        assert!(
+            matches!(alt.arms[1].guards[0], AltGuard::Recv(_, _)),
+            "`y := <-d` is a recv guard, got {:?}",
+            alt.arms[1].guards[0]
+        );
+        assert!(matches!(alt.arms[2].guards[0], AltGuard::Wildcard));
+    }
+
+    /// `c <- = v` — a space between `<-` and `=` — is a channel send. The
+    /// reference lexes `<-` as `Lcomm` and the grammar accepts
+    /// `exp Lcomm '=' exp` (lex.c:1041-1047, limbo.y:1127-1134).
+    #[test]
+    fn chan_send_accepts_space_between_arrow_and_equals() {
+        let file = parse(
+            r#"implement T;
+test(c: chan of int)
+{
+    c <- = 1;
+}
+"#,
+        );
+        let Decl::Func(f) = &file.decls[0] else {
+            panic!("expected func");
+        };
+        assert!(
+            matches!(&f.body.stmts[0], Stmt::Expr(Expr::Send(_, _, _))),
+            "expected a send, got {:?}",
+            f.body.stmts[0]
+        );
+    }
+
+    /// The spaced form is a send in guard position too — that is where the
+    /// corpus actually uses it.
+    #[test]
+    fn chan_send_with_space_parses_in_an_alt_guard() {
+        let alt = alt_of(
+            r#"implement T;
+test(c: chan of int)
+{
+    alt {
+    c <- = 1 =>
+        x = 1;
+    }
+}
+"#,
+        );
+        assert!(matches!(alt.arms[0].guards[0], AltGuard::Send(_, _)));
     }
 }

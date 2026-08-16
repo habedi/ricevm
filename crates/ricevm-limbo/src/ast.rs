@@ -267,17 +267,46 @@ pub struct AltStmt {
     pub span: Span,
 }
 
+/// One arm of an `alt`. Limbo lets several guards share a body:
+///
+/// ```text
+/// x := <-c1 or x = <-c2 or x = <-c3 =>
+/// ```
+///
+/// Each guard is a separate entry in the `alt` table, and all of them run
+/// this one body, so the arm holds every guard rather than just the first —
+/// an arm that kept only `c1` would be a program that listens on one channel
+/// instead of three.
 #[derive(Debug, Clone)]
 pub struct AltArm {
-    pub guard: AltGuard,
+    pub guards: Vec<AltGuard>,
     pub body: Vec<Stmt>,
 }
 
+/// A communication guard of an `alt` arm, classified at parse time so that
+/// codegen never has to re-derive whether a guard sends or receives.
 #[derive(Debug, Clone)]
 pub enum AltGuard {
-    Recv(Option<Expr>, Expr),
+    /// `c <-= v`: send `v` on channel `c`. Fields are `(chan, value)`.
     Send(Expr, Expr),
+    /// `<-c`, optionally binding the received value. Fields are
+    /// `(destination, chan)`; the destination is `None` for a bare `<-c`,
+    /// whose value is discarded.
+    Recv(Option<AltDest>, Expr),
+    /// `*`: the arm taken when no guard is ready.
     Wildcard,
+}
+
+/// Where an `alt` receive guard puts the value it receives.
+#[derive(Debug, Clone)]
+pub enum AltDest {
+    /// `x := <-c` — declares `x`.
+    Decl(Vec<String>),
+    /// `(a, b) := <-c` — declares each tuple field. `nil` names a field
+    /// that is received but not bound.
+    TupleDecl(Vec<String>),
+    /// `x = <-c`, `a[i] = <-c`, `p.f = <-c` — assigns to an existing lvalue.
+    Assign(Expr),
 }
 
 #[derive(Debug, Clone)]

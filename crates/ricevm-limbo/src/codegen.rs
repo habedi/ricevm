@@ -132,17 +132,14 @@ fn type_basic(ty: &Type) -> Option<BasicType> {
     }
 }
 
-/// Extract the channel element BasicType from a VarDecl, if any.
-fn decl_chan_elem_basic(v: &VarDecl) -> Option<BasicType> {
-    if let Some(Type::Chan(elem)) = &v.ty
-        && let Type::Basic(b) = elem.as_ref()
-    {
-        return Some(*b);
+/// Extract the channel element Type from a VarDecl, if any.
+fn decl_chan_elem_type(v: &VarDecl) -> Option<Type> {
+    match &v.ty {
+        Some(Type::Chan(elem)) | Some(Type::BufChan(_, elem)) => return Some((**elem).clone()),
+        _ => {}
     }
-    if let Some(Expr::ChanAlloc(ty, _)) = v.init.as_ref()
-        && let Type::Basic(b) = ty.as_ref()
-    {
-        return Some(*b);
+    if let Some(Expr::ChanAlloc(ty, _)) = v.init.as_ref() {
+        return Some((**ty).clone());
     }
     None
 }
@@ -153,31 +150,111 @@ fn decl_chan_elem_basic(v: &VarDecl) -> Option<BasicType> {
 fn type_size_align(ty: &Type) -> (i32, i32) {
     match ty {
         Type::Basic(BasicType::Big) | Type::Basic(BasicType::Real) => (8, 8),
+        // A tuple is stored inline, so it occupies its whole width and
+        // inherits its widest field's alignment. Treating it as one word
+        // would have every field but the first overwrite its neighbours.
+        Type::Tuple(fields) => {
+            let align = fields
+                .iter()
+                .map(|f| type_size_align(f).1)
+                .max()
+                .unwrap_or(4);
+            (compute_tuple_layout(fields).size, align)
+        }
         // byte stored in a 4-byte slot in records (matches reference).
         _ => (4, 4),
     }
 }
 
-/// Compute an ADT's field layout: list of `(name, type, byte_offset)`.
-fn compute_adt_layout(adt: &AdtDecl) -> Vec<(String, Type, i32)> {
+/// `t0`, `t1`, ... name a tuple's fields by position. Returns the position.
+fn tuple_field_index(field: &str) -> Option<usize> {
+    field.strip_prefix('t')?.parse::<usize>().ok()
+}
+
+/// The storage class of a value of this type.
+fn val_type_of(ty: &Type) -> ValType {
+    match ty {
+        Type::Basic(BasicType::Int)
+        | Type::Basic(BasicType::Byte)
+        | Type::Basic(BasicType::Big)
+        | Type::Basic(BasicType::Real) => ValType::Word,
+        Type::Array(_) => ValType::Array,
+        _ => ValType::Ptr,
+    }
+}
+
+/// Where an ADT's own fields start. A tagged (`pick`) ADT keeps its tag in
+/// word 0 and its fields follow it, which is what `tagof` and every `pick` arm
+/// rely on (`limbo/types.c:2176`).
+fn adt_field_base(adt: &AdtDecl) -> i32 {
+    match adt.pick {
+        Some(_) => 4,
+        None => 0,
+    }
+}
+
+/// The field declarations of an ADT, in declaration order.
+fn adt_field_decls(adt: &AdtDecl) -> impl Iterator<Item = &VarDecl> {
+    adt.members.iter().filter_map(|m| match m {
+        AdtMember::Field(v) => Some(v),
+        _ => None,
+    })
+}
+
+/// Place `decls` from `base` onwards, returning the placed fields and the
+/// offset just past the last one.
+fn layout_fields<'a>(
+    base: i32,
+    decls: impl Iterator<Item = &'a VarDecl>,
+) -> (Vec<(String, Type, i32)>, i32) {
     let mut fields = Vec::new();
-    let mut off = 0i32;
-    for member in &adt.members {
-        if let AdtMember::Field(v) = member {
-            let ty = match &v.ty {
-                Some(t) => t.clone(),
-                None => continue,
-            };
-            let (size, align) = type_size_align(&ty);
-            // Round `off` up to alignment.
-            off = align_up(off, align);
-            for name in &v.names {
-                fields.push((name.clone(), ty.clone(), off));
-                off += size;
-            }
+    let mut off = base;
+    for v in decls {
+        let ty = match &v.ty {
+            Some(t) => t.clone(),
+            None => continue,
+        };
+        let (size, align) = type_size_align(&ty);
+        // Round `off` up to alignment.
+        off = align_up(off, align);
+        for name in &v.names {
+            fields.push((name.clone(), ty.clone(), off));
+            off += size;
         }
     }
+    (fields, off)
+}
+
+/// Compute an ADT's field layout: list of `(name, type, byte_offset)`.
+fn compute_adt_layout(adt: &AdtDecl) -> Vec<(String, Type, i32)> {
+    layout_fields(adt_field_base(adt), adt_field_decls(adt)).0
+}
+
+/// The layout one `pick` variant presents: the ADT's own fields followed by
+/// that variant's, which start where the common fields end. Every variant
+/// starts at the same offset, so they overlay one another
+/// (`limbo/types.c:2183-2199`).
+fn compute_variant_layout(adt: &AdtDecl, case: &PickCase) -> Vec<(String, Type, i32)> {
+    let (mut fields, common_end) = layout_fields(adt_field_base(adt), adt_field_decls(adt));
+    fields.extend(layout_fields(common_end, case.fields.iter()).0);
     fields
+}
+
+/// The storage shape of a record with these fields, whose first `base` bytes
+/// are the tag (or nothing, for an untagged ADT).
+fn shape_of(base: i32, fields: &[(String, Type, i32)]) -> RecordShape {
+    let mut ptr_offsets = Vec::new();
+    let mut end = base;
+    for (_, ty, off) in fields {
+        end = end.max(off + type_size_align(ty).0);
+        if type_is_ptr(ty) {
+            ptr_offsets.push(*off);
+        }
+    }
+    RecordShape {
+        size: align_up(end.max(4), 4),
+        ptr_offsets,
+    }
 }
 
 /// The storage shape of a record built from an ADT declaration.
@@ -188,34 +265,61 @@ fn compute_adt_layout(adt: &AdtDecl) -> Vec<(String, Type, i32)> {
 /// variants' pointer slots are all marked, which over-approximates for any one
 /// variant and is the safe direction for tracing.
 fn compute_adt_shape(adt: &AdtDecl) -> RecordShape {
-    let common = compute_adt_layout(adt);
-    let mut ptr_offsets: Vec<i32> = Vec::new();
-    let mut end = 0i32;
-    for (_, ty, off) in &common {
-        end = end.max(off + type_size_align(ty).0);
-        if type_is_ptr(ty) {
-            ptr_offsets.push(*off);
-        }
-    }
-    let base = align_up(end, 8);
-    let mut size = end;
+    let base = adt_field_base(adt);
+    let mut shape = shape_of(base, &compute_adt_layout(adt));
     for case in adt.pick.iter().flatten() {
-        let mut off = base;
-        for field in &case.fields {
-            let Some(ty) = &field.ty else { continue };
-            let (fsize, align) = type_size_align(ty);
-            off = align_up(off, align);
-            for _ in &field.names {
-                if type_is_ptr(ty) {
-                    ptr_offsets.push(off);
-                }
-                off += fsize;
+        let variant = shape_of(base, &compute_variant_layout(adt, case));
+        shape.size = shape.size.max(variant.size);
+        for off in variant.ptr_offsets {
+            if !shape.ptr_offsets.contains(&off) {
+                shape.ptr_offsets.push(off);
             }
         }
-        size = size.max(off);
     }
-    RecordShape {
-        size: align_up(size, 4),
+    shape
+}
+
+/// The byte layout of a tuple value.
+///
+/// A tuple is a contiguous block, not a pointer to one, so every consumer —
+/// frame slot, call argument, channel message, return value — has to agree on
+/// exactly these offsets and this size. Having one function produce all of
+/// them is what keeps them agreeing.
+#[derive(Clone, Debug, Default)]
+struct TupleLayout {
+    /// `(field type, byte offset)` in declaration order.
+    fields: Vec<(Type, i32)>,
+    /// Total size, which is what a channel of this tuple moves per message.
+    size: i32,
+    /// Offsets of the fields holding heap pointers, for the descriptor.
+    ptr_offsets: Vec<i32>,
+}
+
+impl TupleLayout {
+    /// Offset and type of field `n`, i.e. of `.tN`.
+    fn field(&self, n: usize) -> Option<&(Type, i32)> {
+        self.fields.get(n)
+    }
+}
+
+/// Lay out a tuple's fields using the same width and alignment rules as an
+/// ADT's, which is what the reference compiler does.
+fn compute_tuple_layout(fields: &[Type]) -> TupleLayout {
+    let mut out = Vec::new();
+    let mut ptr_offsets = Vec::new();
+    let mut off = 0i32;
+    for ty in fields {
+        let (size, align) = type_size_align(ty);
+        off = align_up(off, align);
+        if type_is_ptr(ty) {
+            ptr_offsets.push(off);
+        }
+        out.push((ty.clone(), off));
+        off += size;
+    }
+    TupleLayout {
+        fields: out,
+        size: align_up(off, 4).max(4),
         ptr_offsets,
     }
 }
@@ -229,6 +333,18 @@ fn newc_opcode(basic: Option<BasicType>) -> Opcode {
         Some(BasicType::String) => Opcode::Newcp,
         // int and unknown default to a 4-byte word channel.
         _ => Opcode::Newcw,
+    }
+}
+
+/// Pick the Mov opcode that copies a single value of this type.
+fn mov_opcode_for_type(ty: &Type) -> Opcode {
+    match ty {
+        Type::Basic(BasicType::Big) => Opcode::Movl,
+        Type::Basic(BasicType::Real) => Opcode::Movf,
+        Type::Basic(BasicType::Int) | Type::Basic(BasicType::Byte) => Opcode::Movw,
+        // Strings, arrays, refs, channels and lists are heap ids the
+        // collector has to see move.
+        _ => Opcode::Movp,
     }
 }
 
@@ -495,6 +611,10 @@ enum TypeKey {
     Adt(String),
     /// One element of an array of primitives or pointers.
     Elem(ElemKind),
+    /// A block of known size whose pointer slots are known: a tuple. Keyed by
+    /// the layout itself rather than by the source type, so two structurally
+    /// identical tuples share one descriptor.
+    Block { size: i32, ptr_offsets: Vec<i32> },
     /// A record whose layout is not known. Traced conservatively.
     OpaqueRecord,
 }
@@ -504,6 +624,45 @@ enum TypeKey {
 enum TypeOperand {
     Source,
     Middle,
+}
+
+/// An evaluated call argument, waiting to be stored into a callee frame.
+struct ArgSlot {
+    /// Frame offset holding the value.
+    tmp: i32,
+    /// Set when the argument is a tuple, which moves field by field.
+    tuple: Option<TupleLayout>,
+    /// Move opcode for a non-tuple argument.
+    op: Opcode,
+    /// Bytes a non-tuple argument occupies in the callee frame.
+    width: i32,
+}
+
+/// One communication guard of an `alt`, resolved to the table entry it
+/// occupies and the storage the transfer uses.
+struct AltEntry<'a> {
+    guard: &'a AltGuard,
+    /// Position in the alt table: sends occupy `0..nsend`, receives the rest.
+    index: usize,
+    /// Index of the arm whose body this guard runs.
+    arm: usize,
+    /// Frame offset of the value the entry sends from or receives into.
+    slot: i32,
+    prologue: AltPrologue,
+}
+
+/// What an `alt` arm does with a received value before its body runs.
+enum AltPrologue {
+    /// The instruction already wrote the value where the source wants it.
+    None,
+    /// `(a, b) := <-c`: unpack the received tuple into the named locals.
+    Tuple {
+        names: Vec<String>,
+        fields: Vec<Type>,
+    },
+    /// `a[i] = <-c`, `m = <-c` for a module-level `m`: store the value from
+    /// the frame temp the instruction wrote it into.
+    Store { target: Expr, ty: Type },
 }
 
 /// A record's storage shape: total size in bytes and the byte offsets of the
@@ -663,10 +822,17 @@ pub struct CodeGen {
     /// element type is `array of big`, which the recursive Index handler
     /// then peels to compute the inner indexing.
     local_array_elem: std::collections::HashMap<String, Type>,
-    /// Sidecar map for channel locals: name -> element BasicType. Lets
-    /// Send/Recv size the data temp by the channel's element width and
-    /// pick the right Newc* opcode at allocation time.
-    local_chan_elem: std::collections::HashMap<String, BasicType>,
+    /// Sidecar map for channel locals: name -> element Type. Lets Send/Recv
+    /// size the data temp by the channel's element width and pick the right
+    /// Newc* opcode at allocation time. The full Type is kept rather than a
+    /// BasicType because a channel of a tuple moves the tuple's whole width
+    /// per message, and a channel that thinks its elements are 4 bytes wide
+    /// silently delivers only the first word.
+    local_chan_elem: std::collections::HashMap<String, Type>,
+    /// Sidecar map for tuple-typed locals: name -> field types. A tuple lives
+    /// inline in the frame as a contiguous block, so this is what says how
+    /// wide the local's slot is and where each `.tN` sits inside it.
+    local_tuple: std::collections::HashMap<String, Vec<Type>>,
     /// Sidecar map for function return tuple shapes: name -> field Types.
     /// Lets `(a, b, c) := func()` allocate per-field locals at correct
     /// offsets and use kind-matched Mov for each field.
@@ -691,6 +857,11 @@ pub struct CodeGen {
     /// method of a foreign ADT is implemented by that module, so calling it
     /// is a cross-module call through a handle for that interface.
     adt_owner: std::collections::HashMap<String, String>,
+    /// The variants of every tagged ADT, keyed `"Shape.Circle"`: the tag its
+    /// constructor writes into word 0, and the index of the `pick` group whose
+    /// fields it carries. Tags of one group share a layout, so an arm naming
+    /// several of them can still resolve that group's fields.
+    adt_variants: std::collections::HashMap<String, (i32, usize)>,
     /// Declared return type of each function this file defines, so a local
     /// whose value comes from a call knows which ADT it holds.
     func_ret_types: std::collections::HashMap<String, Type>,
@@ -770,11 +941,13 @@ impl CodeGen {
             func_frames: Vec::new(),
             local_array_elem: std::collections::HashMap::new(),
             local_chan_elem: std::collections::HashMap::new(),
+            local_tuple: std::collections::HashMap::new(),
             pending_call_fixups: Vec::new(),
             adt_layouts: std::collections::HashMap::new(),
             adt_shapes: std::collections::HashMap::new(),
             adt_methods: std::collections::HashMap::new(),
             adt_owner: std::collections::HashMap::new(),
+            adt_variants: std::collections::HashMap::new(),
             func_ret_types: std::collections::HashMap::new(),
             needed_types: Vec::new(),
             pending_type_fixups: Vec::new(),
@@ -1024,6 +1197,27 @@ impl CodeGen {
         off
     }
 
+    /// Reserve a contiguous `size`-byte block of frame. A tuple lives inline,
+    /// so its slot has to be the whole tuple wide — a 4-byte slot would have
+    /// every field but the first overwrite whatever came next.
+    fn alloc_temp_block(&mut self, size: i32) -> i32 {
+        let off = self.next_local;
+        self.next_local += align_up(size.max(4), 4);
+        self.grow_frame();
+        off
+    }
+
+    /// Like `alloc_local`, but reserving a whole `size`-byte block.
+    fn alloc_local_block(&mut self, name: &str, size: i32) -> i32 {
+        if let Some((_, off, _, _)) = self.locals.iter().find(|(n, _, _, _)| n == name) {
+            return *off;
+        }
+        let off = self.alloc_temp_block(size);
+        self.locals
+            .push((name.to_string(), off, ValType::Word, NumKind::Word));
+        off
+    }
+
     fn grow_frame(&mut self) {
         if self.next_local > self.frame_size - 8 {
             self.frame_size = ((self.next_local + 24) + 7) & !7;
@@ -1123,13 +1317,34 @@ impl CodeGen {
                 _ => None,
             })
             .collect();
-        self.adt_methods.insert(adt.name.clone(), methods);
+        self.adt_methods.insert(adt.name.clone(), methods.clone());
         match owner {
             Some(owner) => {
                 self.adt_owner.insert(adt.name.clone(), owner.to_string());
             }
             None => {
                 self.adt_owner.remove(&adt.name);
+            }
+        }
+        // Each variant of a tagged ADT is a type of its own: `ref Shape.Circle`
+        // allocates the Circle layout and a `pick` arm reads its fields.
+        // Tags are dense from zero in declaration order, one per name, so
+        // `Square or Rect` numbers both while they share one field layout
+        // (`limbo/types.c:681-717`).
+        let mut tag = 0i32;
+        for (group, case) in adt.pick.iter().flatten().enumerate() {
+            let layout = compute_variant_layout(adt, case);
+            let shape = shape_of(adt_field_base(adt), &layout);
+            for name in &case.tags {
+                let key = format!("{}.{name}", adt.name);
+                self.adt_layouts.insert(key.clone(), layout.clone());
+                self.adt_shapes.insert(key.clone(), shape.clone());
+                self.adt_methods.insert(key.clone(), methods.clone());
+                if let Some(owner) = owner {
+                    self.adt_owner.insert(key.clone(), owner.to_string());
+                }
+                self.adt_variants.insert(key, (tag, group));
+                tag += 1;
             }
         }
     }
@@ -1542,7 +1757,7 @@ impl CodeGen {
         let ty = self.infer_decl_type(v);
         let kind = self.decl_num_kind(v);
         let elem_type = decl_array_elem_type(v);
-        let chan_elem_basic = decl_chan_elem_basic(v);
+        let chan_elem_type = decl_chan_elem_type(v);
         let adt_name = v.ty.as_ref().and_then(Self::adt_name_for_type);
         // A constant initialiser goes straight into the data section;
         // anything else is deferred to the top of the entry function.
@@ -1569,8 +1784,8 @@ impl CodeGen {
             if let Some(t) = &elem_type {
                 self.local_array_elem.insert(name.clone(), t.clone());
             }
-            if let Some(b) = chan_elem_basic {
-                self.local_chan_elem.insert(name.clone(), b);
+            if let Some(t) = &chan_elem_type {
+                self.local_chan_elem.insert(name.clone(), t.clone());
             }
             if let Some(a) = &adt_name {
                 self.local_adt_type.insert(name.clone(), a.clone());
@@ -1886,6 +2101,9 @@ impl CodeGen {
             }
             // An element of an `array of ref Adt` is that ADT.
             Expr::Index(arr, _, _) => Self::adt_name_for_type(&self.array_elem_type_for_expr(arr)?),
+            // A message off a `chan of ref Adt` is that ADT, which is what
+            // lets `pick m := <-c` resolve its tags.
+            Expr::Recv(chan, _) => Self::adt_name_for_type(&self.chan_elem_type(chan)?),
             Expr::Call(_, _, _) => self.adt_name_from_call(expr),
             _ => None,
         }
@@ -2039,6 +2257,7 @@ impl CodeGen {
                 kind.byte_size(),
                 if kind.is_ptr() { vec![0] } else { vec![] },
             ),
+            TypeKey::Block { size, ptr_offsets } => (*size, ptr_offsets.clone()),
             // No layout to describe. Every slot is marked so the collector
             // follows all of them: a slot that turns out to hold an `int` is
             // merely retained, whereas an unmarked pointer slot would let a
@@ -2127,6 +2346,11 @@ impl CodeGen {
     fn gen_func(&mut self, func: &FuncDecl) -> Result<(), String> {
         let entry_pc = self.code.len();
         self.locals.clear();
+        // Tuple shapes are keyed by name and decide how *wide* a slot is, so
+        // one function's `t: (int, int)` must not make another function's
+        // `t: int` be read eight bytes at a time. Frame locals are per
+        // function; this map has to be too.
+        self.local_tuple.clear();
         self.next_local = 40;
         // Each function gets its own frame layout; without this reset every
         // function's descriptor would carry the running maximum frame size.
@@ -2138,8 +2362,17 @@ impl CodeGen {
             for name in &param.names {
                 let ty = self.infer_param_type(param);
                 let kind = type_num_kind(&param.ty);
+                // A tuple parameter occupies its whole width in the frame,
+                // and the caller packs it at exactly these offsets.
+                let param_width = match &param.ty {
+                    Type::Tuple(fields) => compute_tuple_layout(fields).size,
+                    _ => kind.byte_size(),
+                };
                 if name != "nil" {
                     self.locals.push((name.clone(), param_off, ty, kind));
+                    if let Type::Tuple(fields) = &param.ty {
+                        self.local_tuple.insert(name.clone(), fields.clone());
+                    }
                     // Track array params' element Type so indexing into
                     // them later picks the right Ind/Mov opcode pair, and
                     // recursive nested types (`array of array of T`) work
@@ -2149,10 +2382,8 @@ impl CodeGen {
                     }
                     // Same for chan params so Send/Recv on them know the
                     // element width.
-                    if let Type::Chan(elem) = &param.ty
-                        && let Type::Basic(b) = elem.as_ref()
-                    {
-                        self.local_chan_elem.insert(name.clone(), *b);
+                    if let Type::Chan(elem) | Type::BufChan(_, elem) = &param.ty {
+                        self.local_chan_elem.insert(name.clone(), (**elem).clone());
                     }
                     // ADT-typed params (`p: ref Foo` or `p: Foo`): record the
                     // ADT name so field access through `p` finds the layout.
@@ -2166,7 +2397,7 @@ impl CodeGen {
                 // Frame param slots are 4-byte aligned in the reference ABI;
                 // big/real params occupy two adjacent slots. This keeps the
                 // offsets consistent with how the caller packs arguments.
-                param_off += kind.byte_size();
+                param_off += param_width;
             }
         }
         self.next_local = param_off.max(40);
@@ -2306,15 +2537,24 @@ impl CodeGen {
                 // record its full element Type so nested `array of array
                 // of T` works through recursive peeling.
                 let elem_type = decl_array_elem_type(v);
-                let chan_elem_basic = decl_chan_elem_basic(v);
+                let chan_elem_type = decl_chan_elem_type(v);
                 let adt_name = v.ty.as_ref().and_then(Self::adt_name_for_type);
                 for name in &v.names {
-                    self.alloc_local(name, ty, kind);
+                    match &v.ty {
+                        // A declared tuple type sizes the local by the whole
+                        // tuple and records where each `.tN` sits in it.
+                        Some(t @ Type::Tuple(_)) => {
+                            self.declare_local_of_type(name, t);
+                        }
+                        _ => {
+                            self.alloc_local(name, ty, kind);
+                        }
+                    }
                     if let Some(t) = &elem_type {
                         self.local_array_elem.insert(name.clone(), t.clone());
                     }
-                    if let Some(b) = chan_elem_basic {
-                        self.local_chan_elem.insert(name.clone(), b);
+                    if let Some(t) = &chan_elem_type {
+                        self.local_chan_elem.insert(name.clone(), t.clone());
                     }
                     if let Some(a) = &adt_name {
                         self.local_adt_type.insert(name.clone(), a.clone());
@@ -2333,21 +2573,18 @@ impl CodeGen {
                     // Tuple return: write each field through the return
                     // pointer at the appropriate cumulative offset, sized
                     // by each field's NumKind.
-                    if let Expr::Tuple(fields, _) = e {
-                        let mut field_off = 0i32;
-                        for field in fields {
-                            let ty = self.infer_expr_type(field);
-                            let kind = self.infer_num_kind(field);
-                            let tmp = self.alloc_temp_for(kind);
-                            self.gen_expr_to(field, tmp)?;
-                            let op = match (ty, kind) {
-                                (_, NumKind::Big) => Opcode::Movl,
-                                (_, NumKind::Real) => Opcode::Movf,
-                                (ValType::Word, NumKind::Word) => Opcode::Movw,
-                                _ => Opcode::Movp,
-                            };
-                            self.emit(op, op_fp(tmp), mid_unused(), op_fp_ind(16, field_off));
-                            field_off += kind.byte_size();
+                    if let Some(layout) = self.tuple_layout_of(e) {
+                        // The whole tuple goes through the return pointer at
+                        // the very offsets the caller reads it back from.
+                        let block = self.alloc_temp_block(layout.size);
+                        self.gen_expr_to(e, block)?;
+                        for (ty, off) in layout.fields.clone() {
+                            self.emit(
+                                mov_opcode_for_type(&ty),
+                                op_fp(block + off),
+                                mid_unused(),
+                                op_fp_ind(16, off),
+                            );
                         }
                     } else {
                         // Single value: kind-matched opcode through return ptr.
@@ -2430,23 +2667,8 @@ impl CodeGen {
                         // spawnee's kind-sized param layout.
                         let mut arg_off = 32i32;
                         for arg in args.iter() {
-                            let kind = self.infer_num_kind(arg);
-                            let arg_tmp = self.alloc_temp_for(kind);
-                            self.gen_expr_to(arg, arg_tmp)?;
-                            let ty = self.infer_expr_type(arg);
-                            let op = match (ty, kind) {
-                                (_, NumKind::Big) => Opcode::Movl,
-                                (_, NumKind::Real) => Opcode::Movf,
-                                (ValType::Word, NumKind::Word) => Opcode::Movw,
-                                _ => Opcode::Movp,
-                            };
-                            self.emit(
-                                op,
-                                op_fp(arg_tmp),
-                                mid_unused(),
-                                op_fp_ind(frame_tmp, arg_off),
-                            );
-                            arg_off += kind.byte_size();
+                            let slot = self.gen_arg_value(arg)?;
+                            arg_off = self.store_arg(&slot, frame_tmp, arg_off);
                         }
                         let spawn_idx = self.code.len();
                         self.emit(Opcode::Spawn, op_fp(frame_tmp), mid_unused(), op_imm(pc));
@@ -2467,10 +2689,10 @@ impl CodeGen {
             // Already bound by `collect_imports`; declares no storage and
             // emits no code.
             Stmt::Import(_) => Ok(()),
+            Stmt::Alt(s) => self.gen_alt(s),
+            Stmt::Pick(s) => self.gen_pick(s),
             // Unsupported constructs are hard errors: emitting nothing at all
             // would silently drop the statement's behavior.
-            Stmt::Alt(_) => Err("`alt` statements are not supported yet".to_string()),
-            Stmt::Pick(_) => Err("`pick` statements are not supported yet".to_string()),
             Stmt::Raise(None, _) => Err("bare `raise` (re-raise) is not supported yet".to_string()),
         }
     }
@@ -2534,6 +2756,357 @@ impl CodeGen {
         }
         for idx in frame.continues {
             self.code[idx].destination = op_imm(continue_pc);
+        }
+    }
+
+    // ── Tuple values ──────────────────────────────────────────
+    //
+    // A tuple is a contiguous block of frame, not a pointer to one. Every
+    // site that stores, passes, sends or returns one has to agree on the
+    // layout `compute_tuple_layout` produces, and has to reserve the whole
+    // block: a tuple written into a 4-byte slot loses every field but the
+    // first, silently.
+
+    /// The element type of the channel `chan` denotes, if it is known.
+    fn chan_elem_type(&self, chan: &Expr) -> Option<Type> {
+        match chan {
+            Expr::Ident(name, _) => self.local_chan_elem.get(name).cloned(),
+            Expr::ChanAlloc(ty, _) => Some((**ty).clone()),
+            Expr::Dot(inner, field, _) => self
+                .adt_name_for_expr(inner)
+                .and_then(|a| self.adt_field_info(&a, field))
+                .and_then(|(_, t)| match t {
+                    Type::Chan(e) | Type::BufChan(_, e) => Some(*e),
+                    _ => None,
+                }),
+            _ => None,
+        }
+    }
+
+    /// The type of a tuple element written as an expression. Only two things
+    /// about it matter here — how wide it is, and whether the collector has
+    /// to follow it — so a pointer of any kind is reported as `string`.
+    fn tuple_field_type(&self, e: &Expr) -> Type {
+        // A field that is itself a tuple is as wide as that tuple; calling it
+        // one word would let its later fields overwrite the outer tuple's.
+        if let Some(fields) = self.tuple_fields_of(e) {
+            return Type::Tuple(fields);
+        }
+        match self.infer_num_kind(e) {
+            NumKind::Big => Type::Basic(BasicType::Big),
+            NumKind::Real => Type::Basic(BasicType::Real),
+            NumKind::Word => match self.infer_expr_type(e) {
+                ValType::Word => Type::Basic(BasicType::Int),
+                _ => Type::Basic(BasicType::String),
+            },
+        }
+    }
+
+    /// The field types of `expr`, if `expr` denotes a tuple.
+    fn tuple_fields_of(&self, expr: &Expr) -> Option<Vec<Type>> {
+        match expr {
+            Expr::Tuple(elems, _) => Some(elems.iter().map(|e| self.tuple_field_type(e)).collect()),
+            Expr::Ident(name, _) => self.local_tuple.get(name).cloned(),
+            Expr::Call(callee, _, _) => match callee.as_ref() {
+                Expr::Ident(n, _) => self.func_tuple_ret.get(n).cloned(),
+                _ => None,
+            },
+            Expr::Recv(chan, _) => match self.chan_elem_type(chan) {
+                Some(Type::Tuple(fields)) => Some(fields),
+                _ => None,
+            },
+            Expr::Index(arr, _, _) => match self.array_elem_type_of(arr) {
+                Some(Type::Tuple(fields)) => Some(fields),
+                _ => None,
+            },
+            Expr::Dot(inner, field, _) => {
+                // An ADT field of tuple type, or `.tN` of a tuple whose Nth
+                // field is itself a tuple.
+                if let Some(fields) = self.tuple_fields_of(inner)
+                    && let Some(n) = tuple_field_index(field)
+                {
+                    return match compute_tuple_layout(&fields).field(n) {
+                        Some((Type::Tuple(inner_fields), _)) => Some(inner_fields.clone()),
+                        _ => None,
+                    };
+                }
+                self.adt_name_for_expr(inner)
+                    .and_then(|a| self.adt_field_info(&a, field))
+                    .and_then(|(_, t)| match t {
+                        Type::Tuple(fields) => Some(fields),
+                        _ => None,
+                    })
+            }
+            Expr::TupleDeclAssign(_, rhs, _)
+            | Expr::DeclAssign(_, rhs, _)
+            | Expr::Assign(_, rhs, _) => self.tuple_fields_of(rhs),
+            _ => None,
+        }
+    }
+
+    /// The element type of the array `arr` denotes, if it is known.
+    fn array_elem_type_of(&self, arr: &Expr) -> Option<Type> {
+        match arr {
+            Expr::Ident(name, _) => self.local_array_elem.get(name).cloned(),
+            _ => None,
+        }
+    }
+
+    fn tuple_layout_of(&self, expr: &Expr) -> Option<TupleLayout> {
+        self.tuple_fields_of(expr)
+            .map(|fields| compute_tuple_layout(&fields))
+    }
+
+    /// Copy one value of `ty` between two frame offsets. A tuple is copied
+    /// field by field, because no single Mov is wide enough for one.
+    fn copy_value(&mut self, ty: &Type, src: i32, dst: i32) {
+        if src == dst {
+            return;
+        }
+        if let Type::Tuple(fields) = ty {
+            for (fty, off) in compute_tuple_layout(fields).fields {
+                self.copy_value(&fty, src + off, dst + off);
+            }
+            return;
+        }
+        self.emit(
+            mov_opcode_for_type(ty),
+            op_fp(src),
+            mid_unused(),
+            op_fp(dst),
+        );
+    }
+
+    /// Declare a local of the given Limbo type, reserving a whole block for a
+    /// tuple and registering its shape so `.tN` and destructuring resolve.
+    fn declare_local_of_type(&mut self, name: &str, ty: &Type) -> i32 {
+        if let Type::Tuple(fields) = ty {
+            let size = compute_tuple_layout(fields).size;
+            let off = self.alloc_local_block(name, size);
+            self.local_tuple.insert(name.to_string(), fields.clone());
+            return off;
+        }
+        self.alloc_local(name, val_type_of(ty), type_num_kind(ty))
+    }
+
+    /// Write a tuple literal's fields into the block at `dst`.
+    fn gen_tuple_literal_to(&mut self, elems: &[Expr], dst: i32) -> Result<(), String> {
+        let fields: Vec<Type> = elems.iter().map(|e| self.tuple_field_type(e)).collect();
+        let layout = compute_tuple_layout(&fields);
+        for (elem, (ty, off)) in elems.iter().zip(layout.fields.iter()) {
+            self.gen_expr_to_kind(elem, dst + off, type_num_kind(ty))?;
+        }
+        Ok(())
+    }
+
+    /// Get `expr`'s tuple value into a frame block, returning where it is and
+    /// how it is laid out. A tuple already living in a local is used where it
+    /// lies; anything else is materialised into a fresh block.
+    fn gen_tuple_block(&mut self, expr: &Expr) -> Result<(i32, TupleLayout), String> {
+        if let Expr::Ident(name, _) = expr
+            && let Some(fields) = self.local_tuple.get(name).cloned()
+            && let Some((off, _)) = self.get_local(name)
+        {
+            return Ok((off, compute_tuple_layout(&fields)));
+        }
+        // Array indexing has a fixed element stride and hands back one word,
+        // so an array of tuples would yield the first field and three
+        // uninitialised ones. Say so instead of producing that quietly.
+        if let Expr::Index(arr, _, _) = expr
+            && matches!(self.array_elem_type_of(arr), Some(Type::Tuple(_)))
+        {
+            return Err(
+                "an array of tuples is not supported yet: element indexing moves a \
+                        single word, so every field but the first would be read from the \
+                        wrong place"
+                    .to_string(),
+            );
+        }
+        let Some(layout) = self.tuple_layout_of(expr) else {
+            return Err(format!(
+                "{} has no known tuple type here",
+                describe_expr_kind(expr)
+            ));
+        };
+        let block = self.alloc_temp_block(layout.size);
+        self.gen_expr_to(expr, block)?;
+        Ok((block, layout))
+    }
+
+    /// `(a, b) = rhs` — assignment, not declaration. The right-hand side is
+    /// built whole before any target is written, so `(a, b) = (b, a)` swaps
+    /// rather than reading back what it has just stored.
+    fn gen_tuple_assign(&mut self, targets: &[Expr], rhs: &Expr) -> Result<(), String> {
+        let layout = match self.tuple_layout_of(rhs) {
+            Some(l) if l.fields.len() == targets.len() => l,
+            _ => compute_tuple_layout(&vec![Type::Basic(BasicType::Int); targets.len()]),
+        };
+        let block = self.alloc_temp_block(layout.size);
+        self.gen_expr_to(rhs, block)?;
+        for (target, (ty, off)) in targets.iter().zip(layout.fields.clone()) {
+            match target {
+                // `nil` names a field that is deliberately dropped.
+                Expr::Nil(_) => {}
+                Expr::Ident(name, _) => {
+                    let slot = match self.lookup_var(name) {
+                        Some((slot, _, _)) => slot,
+                        // Matches `x = expr`'s leniency about undeclared
+                        // names rather than rejecting what used to compile.
+                        None => Slot::Local(self.declare_local_of_type(name, &ty)),
+                    };
+                    match (&ty, slot) {
+                        (Type::Tuple(_), Slot::Local(dst)) => {
+                            self.copy_value(&ty, block + off, dst)
+                        }
+                        _ => self.emit(
+                            mov_opcode_for_type(&ty),
+                            op_fp(block + off),
+                            mid_unused(),
+                            slot.operand(),
+                        ),
+                    }
+                }
+                // `(date, tm.mday) = datenum(date)`, `(m[i], adp) = ...`:
+                // any lvalue an ordinary assignment accepts works here too.
+                // The field is named to the assignment machinery by parking
+                // a synthetic local on the block slot it already occupies —
+                // no copy, and no second implementation of lvalue stores.
+                other => {
+                    let alias = format!("\u{0}tuple-field-{}", self.locals.len());
+                    self.locals.push((
+                        alias.clone(),
+                        block + off,
+                        val_type_of(&ty),
+                        type_num_kind(&ty),
+                    ));
+                    let assign = Expr::Assign(
+                        Box::new(other.clone()),
+                        Box::new(Expr::Ident(alias, Span::default())),
+                        Span::default(),
+                    );
+                    let result = self.gen_expr_discard(&assign);
+                    self.locals.pop();
+                    result?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `(a, b) := rhs`. `dst`, when given, is a block the caller has already
+    /// sized to the tuple, and also receives the value — that is what makes
+    /// `((a, b) := <-c).t0` work.
+    fn gen_tuple_decl_assign(
+        &mut self,
+        names: &[String],
+        rhs: &Expr,
+        dst: Option<i32>,
+    ) -> Result<(), String> {
+        // An rhs of unknown shape keeps the historical one-word-per-name
+        // packing, which is what tuple-returning calls into other modules
+        // still rely on.
+        let layout = match self.tuple_layout_of(rhs) {
+            Some(l) if l.fields.len() == names.len() => l,
+            _ => compute_tuple_layout(&vec![Type::Basic(BasicType::Int); names.len()]),
+        };
+        let block = match dst {
+            Some(d) => d,
+            None => self.alloc_temp_block(layout.size),
+        };
+        self.gen_expr_to(rhs, block)?;
+        for (name, (ty, off)) in names.iter().zip(layout.fields.iter()) {
+            if name == "nil" {
+                continue;
+            }
+            let local = self.declare_local_of_type(name, ty);
+            self.copy_value(ty, block + off, local);
+        }
+        Ok(())
+    }
+
+    /// `chan <-= val`. The value slot is sized by the channel's element type,
+    /// because `op_send` reads exactly `elem_size` bytes out of it: too
+    /// narrow a slot sends whatever happens to follow it in the frame.
+    fn gen_send(&mut self, chan_expr: &Expr, val_expr: &Expr) -> Result<(), String> {
+        let elem = self.chan_elem_type(chan_expr);
+        let chan_tmp = self.alloc_temp();
+        self.gen_expr_to(chan_expr, chan_tmp)?;
+        if let Some(Type::Tuple(fields)) = &elem {
+            let layout = compute_tuple_layout(fields);
+            let val_tmp = self.alloc_temp_block(layout.size);
+            self.gen_expr_to(val_expr, val_tmp)?;
+            self.emit(Opcode::Send, op_fp(val_tmp), mid_unused(), op_fp(chan_tmp));
+            return Ok(());
+        }
+        let val_kind = elem
+            .as_ref()
+            .map(type_num_kind)
+            .unwrap_or_else(|| self.infer_num_kind(val_expr));
+        let val_tmp = self.alloc_temp_for(val_kind);
+        self.gen_expr_to_kind(val_expr, val_tmp, val_kind)?;
+        self.emit(Opcode::Send, op_fp(val_tmp), mid_unused(), op_fp(chan_tmp));
+        Ok(())
+    }
+
+    /// Evaluate one call argument into a temp, recording what it takes to
+    /// move it into a callee frame later.
+    fn gen_arg_value(&mut self, arg: &Expr) -> Result<ArgSlot, String> {
+        if let Some(layout) = self.tuple_layout_of(arg) {
+            let tmp = self.alloc_temp_block(layout.size);
+            self.gen_expr_to(arg, tmp)?;
+            return Ok(ArgSlot {
+                tmp,
+                tuple: Some(layout),
+                op: Opcode::Movw,
+                width: 0,
+            });
+        }
+        let kind = self.infer_num_kind(arg);
+        let tmp = self.alloc_temp_for(kind);
+        self.gen_expr_to(arg, tmp)?;
+        let ty = self.infer_expr_type(arg);
+        let op = match (ty, kind) {
+            (_, NumKind::Big) => Opcode::Movl,
+            (_, NumKind::Real) => Opcode::Movf,
+            (ValType::Word, NumKind::Word) => Opcode::Movw,
+            _ => Opcode::Movp,
+        };
+        Ok(ArgSlot {
+            tmp,
+            tuple: None,
+            op,
+            width: kind.byte_size(),
+        })
+    }
+
+    /// Store an evaluated argument into the callee frame at `arg_off`,
+    /// returning the offset the next argument goes to.
+    ///
+    /// A tuple argument occupies its whole width in the callee's frame and
+    /// moves field by field; the callee's own parameter layout advances by
+    /// the same amount, which is what keeps the two in step.
+    fn store_arg(&mut self, slot: &ArgSlot, frame_tmp: i32, arg_off: i32) -> i32 {
+        match &slot.tuple {
+            Some(layout) => {
+                for (ty, off) in layout.fields.clone() {
+                    self.emit(
+                        mov_opcode_for_type(&ty),
+                        op_fp(slot.tmp + off),
+                        mid_unused(),
+                        op_fp_ind(frame_tmp, arg_off + off),
+                    );
+                }
+                arg_off + layout.size
+            }
+            None => {
+                self.emit(
+                    slot.op,
+                    op_fp(slot.tmp),
+                    mid_unused(),
+                    op_fp_ind(frame_tmp, arg_off),
+                );
+                arg_off + slot.width
+            }
         }
     }
 
@@ -2645,9 +3218,9 @@ impl CodeGen {
             // `<-chan` returns the channel's element kind.
             Expr::Recv(chan_expr, _) => {
                 if let Expr::Ident(name, _) = chan_expr.as_ref()
-                    && let Some(b) = self.local_chan_elem.get(name)
+                    && let Some(t) = self.local_chan_elem.get(name)
                 {
-                    type_num_kind(&Type::Basic(*b))
+                    type_num_kind(t)
                 } else {
                     NumKind::Word
                 }
@@ -2971,6 +3544,495 @@ impl CodeGen {
         Ok(())
     }
 
+    /// `alt { guard => body ... }`: wait until one of several channel
+    /// operations can proceed, then run that guard's arm.
+    ///
+    /// The instruction reads a table of `{nsend, nrecv}` followed by one
+    /// `{channel, value address}` pair per guard, sends first, and answers
+    /// with the index of the entry it selected. Two properties of the
+    /// instruction shape the lowering:
+    ///
+    /// - A `*` arm occupies no entry. Its index is `nsend + nrecv`, which is
+    ///   what `nbalt` reports when nothing was ready, and a zeroed entry would
+    ///   name a nil channel, which the VM raises on.
+    /// - A blocking `alt` parks the thread and re-executes the same
+    ///   instruction when it wakes, so everything the guards need has to be in
+    ///   the table before the instruction runs, and the addresses in the table
+    ///   have to survive the suspension. Frame slots do, which is why the
+    ///   table and every value slot live in the frame.
+    fn gen_alt(&mut self, s: &AltStmt) -> Result<(), String> {
+        // An `alt` is breakable (a `break` in an arm leaves the alt) but not
+        // continuable, exactly like a `case` (`limbo/com.c:579-605`).
+        self.push_loop(false);
+        let result = self.gen_alt_body(s);
+        if result.is_err() {
+            self.loop_stack.pop();
+        }
+        result
+    }
+
+    fn gen_alt_body(&mut self, s: &AltStmt) -> Result<(), String> {
+        // Entry indices follow the reference (`limbo/com.c:969-988`): the
+        // n-th send is entry n, the m-th receive is entry `nsend + m`, both in
+        // source order, and a `*` guard is skipped.
+        let guards = || s.arms.iter().flat_map(|a| &a.guards);
+        let nsend = guards()
+            .filter(|g| matches!(g, AltGuard::Send(_, _)))
+            .count();
+        let nrecv = guards()
+            .filter(|g| matches!(g, AltGuard::Recv(_, _)))
+            .count();
+        let count = nsend + nrecv;
+
+        let mut entries: Vec<AltEntry<'_>> = Vec::with_capacity(count);
+        let mut wildcard_arm: Option<usize> = None;
+        let mut next_send = 0usize;
+        let mut next_recv = 0usize;
+        for (arm, alt_arm) in s.arms.iter().enumerate() {
+            for guard in &alt_arm.guards {
+                let index = match guard {
+                    AltGuard::Send(_, _) => {
+                        next_send += 1;
+                        next_send - 1
+                    }
+                    // Receives are numbered from `nsend`, not from zero: they
+                    // share one table with the sends.
+                    AltGuard::Recv(_, _) => {
+                        next_recv += 1;
+                        nsend + next_recv - 1
+                    }
+                    AltGuard::Wildcard => {
+                        if wildcard_arm.is_some() {
+                            return Err("an `alt` may have only one `*` arm".to_string());
+                        }
+                        wildcard_arm = Some(arm);
+                        continue;
+                    }
+                };
+                entries.push(AltEntry {
+                    guard,
+                    index,
+                    arm,
+                    slot: 0,
+                    prologue: AltPrologue::None,
+                });
+            }
+        }
+
+        let table = self.alloc_temp_block(8 + 8 * count as i32);
+        let selection = self.alloc_temp();
+
+        // Setup: one channel word and one value address per entry, then the
+        // header, then the instruction. Guards are evaluated in source order,
+        // as the reference does, so a guard's side effects happen in the order
+        // the program wrote them.
+        for entry in &mut entries {
+            let guard = entry.guard;
+            let (chan_expr, value) = match guard {
+                AltGuard::Send(chan, value) => (chan, Some(value)),
+                AltGuard::Recv(_, chan) => (chan, None),
+                // Wildcard guards never became entries.
+                AltGuard::Wildcard => continue,
+            };
+            // `(i, v) := <-a` over an `array of chan of T` waits on every
+            // element at once. The reference expands one table entry per
+            // element (`libinterp/alt.c:19-40`); our table names one channel
+            // per entry and the instruction reports an entry index, not an
+            // array index, so there is nothing to lower this to.
+            if let Some(Type::Chan(_) | Type::BufChan(_, _)) = self.array_elem_type_of(chan_expr) {
+                return Err(
+                    "an `alt` guard on an array of channels is not supported: each table \
+                     entry names one channel, so the array's elements cannot be waited on \
+                     together"
+                        .to_string(),
+                );
+            }
+            let elem = self.chan_elem_type(chan_expr);
+            let chan_tmp = self.alloc_temp();
+            self.gen_expr_to(chan_expr, chan_tmp)?;
+            self.emit(
+                Opcode::Movp,
+                op_fp(chan_tmp),
+                mid_unused(),
+                op_fp(table + 8 + 8 * entry.index as i32),
+            );
+            match value {
+                Some(value) => {
+                    // The instruction sends out of this slot, so the value has
+                    // to be there before it executes.
+                    let slot = self.alloc_chan_slot(elem.as_ref());
+                    match &elem {
+                        Some(Type::Tuple(_)) | None => self.gen_expr_to(value, slot)?,
+                        Some(t) => self.gen_expr_to_kind(value, slot, type_num_kind(t))?,
+                    }
+                    entry.slot = slot;
+                }
+                None => {
+                    let AltGuard::Recv(dest, _) = guard else {
+                        continue;
+                    };
+                    let (slot, prologue) = self.alt_recv_destination(dest, elem.as_ref())?;
+                    entry.slot = slot;
+                    entry.prologue = prologue;
+                }
+            }
+            self.emit(
+                Opcode::Lea,
+                op_fp(entry.slot),
+                mid_unused(),
+                op_fp(table + 12 + 8 * entry.index as i32),
+            );
+        }
+        self.emit(
+            Opcode::Movw,
+            op_imm(nsend as i32),
+            mid_unused(),
+            op_fp(table),
+        );
+        self.emit(
+            Opcode::Movw,
+            op_imm(nrecv as i32),
+            mid_unused(),
+            op_fp(table + 4),
+        );
+        // `nbalt` is chosen by the presence of a `*` arm, and by nothing else
+        // (`limbo/com.c:1073-1075`).
+        let op = match wildcard_arm {
+            Some(_) => Opcode::Nbalt,
+            None => Opcode::Alt,
+        };
+        self.emit(op, op_fp(table), mid_unused(), op_fp(selection));
+
+        // Dispatch on the reported index: one landing pad per entry, plus the
+        // `*` arm at index `count`.
+        let mut pads: Vec<usize> = Vec::with_capacity(count);
+        for index in 0..count {
+            pads.push(self.code.len());
+            self.emit(
+                Opcode::Beqw,
+                op_fp(selection),
+                mid_imm(index as i32),
+                op_imm(0),
+            );
+        }
+        let wildcard_pad = wildcard_arm.map(|_| {
+            let at = self.code.len();
+            self.emit(
+                Opcode::Beqw,
+                op_fp(selection),
+                mid_imm(count as i32),
+                op_imm(0),
+            );
+            at
+        });
+        let no_match = self.code.len();
+        self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(0));
+
+        // Arms, in source order. Each guard of an arm has its own landing pad
+        // and its own prologue, and they all fall through to the one body.
+        let mut end_jumps = vec![no_match];
+        for (arm, alt_arm) in s.arms.iter().enumerate() {
+            let mine: Vec<usize> = entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.arm == arm)
+                .map(|(i, _)| i)
+                .collect();
+            let is_wildcard = wildcard_arm == Some(arm);
+            let mut to_body = Vec::new();
+            for (n, &i) in mine.iter().enumerate() {
+                let pad_pc = op_imm(self.code.len() as i32);
+                self.code[pads[entries[i].index]].destination = pad_pc;
+                self.gen_alt_prologue(&entries[i])?;
+                if n + 1 < mine.len() || is_wildcard {
+                    to_body.push(self.code.len());
+                    self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(0));
+                }
+            }
+            if is_wildcard && let Some(at) = wildcard_pad {
+                let pad_pc = op_imm(self.code.len() as i32);
+                self.code[at].destination = pad_pc;
+            }
+            let body_pc = self.code.len() as i32;
+            for at in to_body {
+                self.code[at].destination = op_imm(body_pc);
+            }
+            for stmt in &alt_arm.body {
+                self.gen_stmt(stmt)?;
+            }
+            end_jumps.push(self.code.len());
+            self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(0));
+        }
+
+        let end_pc = self.code.len() as i32;
+        for at in end_jumps {
+            self.code[at].destination = op_imm(end_pc);
+        }
+        // `break` in an arm lands here too; `continue` never targets an `alt`.
+        self.pop_loop(end_pc, end_pc);
+        Ok(())
+    }
+
+    /// `pick x := e { Tag => ... }`: run the arm naming the variant `e` was
+    /// built with, with `x` bound to `e` at that variant's type.
+    ///
+    /// The tag lives in word 0 of the record, so the dispatch is an ordinary
+    /// comparison chain over a word load. A `pick` that names neither every
+    /// variant nor `*` falls through to the statement after it, which is what
+    /// the single-arm downcast idiom relies on.
+    fn gen_pick(&mut self, s: &PickStmt) -> Result<(), String> {
+        // Breakable but not continuable, exactly like `case` and `alt`
+        // (`limbo/com.c:579-605`).
+        self.push_loop(false);
+        let result = self.gen_pick_body(s);
+        if result.is_err() {
+            self.loop_stack.pop();
+        }
+        result
+    }
+
+    fn gen_pick_body(&mut self, s: &PickStmt) -> Result<(), String> {
+        let Some(adt) = self.adt_name_for_expr(&s.expr) else {
+            return Err(format!(
+                "`pick {} := ...`: the ADT of the value being picked over is \
+                 not known here, so its tags cannot be resolved",
+                s.name
+            ));
+        };
+        // The value may already be narrowed to a variant (`pick y := x` inside
+        // another arm); tags are named against the ADT either way.
+        let base = adt.split('.').next().unwrap_or(&adt).to_string();
+
+        let bind = self.alloc_local(&s.name, ValType::Ptr, NumKind::Word);
+        self.gen_expr_to(&s.expr, bind)?;
+        let tag = self.alloc_temp();
+        self.emit(Opcode::Movw, op_fp_ind(bind, 0), mid_unused(), op_fp(tag));
+
+        let mut pads: Vec<(usize, usize)> = Vec::new();
+        let mut wildcard: Option<usize> = None;
+        for (arm, pick_arm) in s.arms.iter().enumerate() {
+            for name in &pick_arm.tags {
+                if name == "*" {
+                    if wildcard.is_some() {
+                        return Err("a `pick` may have only one `*` arm".to_string());
+                    }
+                    wildcard = Some(arm);
+                    continue;
+                }
+                let Some((value, _)) = self.adt_variants.get(&format!("{base}.{name}")).copied()
+                else {
+                    // An ADT with no declaration in scope has no variants
+                    // either, and that is the more useful thing to report.
+                    return Err(if self.adt_layouts.contains_key(&base) {
+                        format!("`{name}` is not a variant of `{base}`")
+                    } else {
+                        format!(
+                            "the declaration of `{base}` was not found, so `{name}` cannot be \
+                             resolved to a tag (is the include path set?)"
+                        )
+                    });
+                };
+                pads.push((self.code.len(), arm));
+                self.emit(Opcode::Beqw, op_fp(tag), mid_imm(value), op_imm(0));
+            }
+        }
+        let default = self.code.len();
+        self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(0));
+
+        // Inside an arm the bound name has that arm's variant type, so the
+        // variant's own fields resolve; outside it goes back to whatever it
+        // was, which is what makes a `pick` over a name that already exists
+        // leave that name alone.
+        let saved = self.local_adt_type.get(&s.name).cloned();
+        let mut end_jumps = Vec::new();
+        for (arm, pick_arm) in s.arms.iter().enumerate() {
+            let body_pc = op_imm(self.code.len() as i32);
+            for (at, owner) in &pads {
+                if *owner == arm {
+                    self.code[*at].destination = body_pc;
+                }
+            }
+            if wildcard == Some(arm) {
+                self.code[default].destination = body_pc;
+            }
+            let layout = self.pick_arm_type(&base, &pick_arm.tags);
+            self.local_adt_type.insert(s.name.clone(), layout);
+            for stmt in &pick_arm.body {
+                self.gen_stmt(stmt)?;
+            }
+            end_jumps.push(self.code.len());
+            self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(0));
+        }
+        match saved {
+            Some(previous) => self.local_adt_type.insert(s.name.clone(), previous),
+            None => self.local_adt_type.remove(&s.name),
+        };
+
+        let end_pc = self.code.len() as i32;
+        if wildcard.is_none() {
+            self.code[default].destination = op_imm(end_pc);
+        }
+        for at in end_jumps {
+            self.code[at].destination = op_imm(end_pc);
+        }
+        self.pop_loop(end_pc, end_pc);
+        Ok(())
+    }
+
+    /// The layout the bound name has inside one arm: the variant's own when
+    /// the arm names a single variant or several from one `pick` group, and
+    /// the ADT's common fields when the arm spans groups or is `*`.
+    fn pick_arm_type(&self, base: &str, tags: &[String]) -> String {
+        let mut group = None;
+        for name in tags {
+            match self.adt_variants.get(&format!("{base}.{name}")) {
+                Some((_, g)) if group.is_none_or(|seen| seen == *g) => group = Some(*g),
+                _ => return base.to_string(),
+            }
+        }
+        match tags.first() {
+            Some(name) if group.is_some() => format!("{base}.{name}"),
+            _ => base.to_string(),
+        }
+    }
+
+    /// Reserve an anonymous frame slot wide enough for one message of a
+    /// channel with this element type. Too narrow a slot would have the
+    /// transfer run over whatever follows it in the frame.
+    fn alloc_chan_slot(&mut self, elem: Option<&Type>) -> i32 {
+        match elem {
+            Some(Type::Tuple(fields)) => {
+                let size = compute_tuple_layout(fields).size;
+                self.alloc_temp_block(size)
+            }
+            Some(t) => self.alloc_temp_for(type_num_kind(t)),
+            None => self.alloc_temp(),
+        }
+    }
+
+    /// Where an `alt` receive guard puts its value, and what the arm has to do
+    /// with it afterwards.
+    ///
+    /// The address in the table is read as an offset into the frame, so the
+    /// slot has to be a frame slot: a module-level variable or an array
+    /// element is written by the arm's prologue instead, out of a frame temp.
+    fn alt_recv_destination(
+        &mut self,
+        dest: &Option<AltDest>,
+        elem: Option<&Type>,
+    ) -> Result<(i32, AltPrologue), String> {
+        match dest {
+            // `<-c`: the value is received and dropped.
+            None => Ok((self.alloc_chan_slot(elem), AltPrologue::None)),
+            Some(AltDest::Decl(names)) => {
+                let [name] = names.as_slice() else {
+                    return Err(format!(
+                        "an `alt` receive guard declares one name, not {}",
+                        names.len()
+                    ));
+                };
+                let slot = match elem {
+                    Some(t) => self.declare_local_of_type(name, t),
+                    None => self.alloc_local(name, ValType::Word, NumKind::Word),
+                };
+                // The same sidecars `x := <-c` records outside an `alt`, so
+                // that the arm body can index, call through, or select fields
+                // of the value it just received.
+                if let Some(t) = elem {
+                    match t {
+                        Type::Array(e) => {
+                            self.local_array_elem.insert(name.clone(), (**e).clone());
+                        }
+                        Type::Chan(e) | Type::BufChan(_, e) => {
+                            self.local_chan_elem.insert(name.clone(), (**e).clone());
+                        }
+                        _ => {}
+                    }
+                    if let Some(adt) = Self::adt_name_for_type(t) {
+                        self.local_adt_type.insert(name.clone(), adt);
+                    }
+                }
+                Ok((slot, AltPrologue::None))
+            }
+            Some(AltDest::TupleDecl(names)) => {
+                let Some(Type::Tuple(fields)) = elem else {
+                    return Err(
+                        "an `alt` guard receiving into a tuple needs a channel of a known \
+                         tuple type"
+                            .to_string(),
+                    );
+                };
+                let layout = compute_tuple_layout(fields);
+                let block = self.alloc_temp_block(layout.size);
+                Ok((
+                    block,
+                    AltPrologue::Tuple {
+                        names: names.clone(),
+                        fields: fields.clone(),
+                    },
+                ))
+            }
+            // A plain frame local receives in place; anything else needs a
+            // store from a temp once the arm is chosen.
+            Some(AltDest::Assign(target)) => {
+                if let Expr::Ident(name, _) = target
+                    && let Some((Slot::Local(off), _, _)) = self.lookup_var(name)
+                {
+                    return Ok((off, AltPrologue::None));
+                }
+                let slot = self.alloc_chan_slot(elem);
+                Ok((
+                    slot,
+                    AltPrologue::Store {
+                        target: target.clone(),
+                        ty: elem.cloned().unwrap_or(Type::Basic(BasicType::Int)),
+                    },
+                ))
+            }
+        }
+    }
+
+    /// Code that runs after an `alt` selects an entry and before the arm's
+    /// body: it moves the received value from where the instruction had to put
+    /// it to where the source says it goes.
+    fn gen_alt_prologue(&mut self, entry: &AltEntry<'_>) -> Result<(), String> {
+        match &entry.prologue {
+            AltPrologue::None => Ok(()),
+            AltPrologue::Tuple { names, fields } => {
+                let layout = compute_tuple_layout(fields);
+                for (name, (ty, off)) in names.iter().zip(layout.fields.clone()) {
+                    if name == "nil" {
+                        continue;
+                    }
+                    let local = self.declare_local_of_type(name, &ty);
+                    self.copy_value(&ty, entry.slot + off, local);
+                }
+                Ok(())
+            }
+            // Name the temp to the ordinary assignment path, which already
+            // knows how to write every kind of lvalue there is.
+            AltPrologue::Store { target, ty } => {
+                let alias = format!("\u{0}alt-recv-{}", self.locals.len());
+                self.locals.push((
+                    alias.clone(),
+                    entry.slot,
+                    val_type_of(ty),
+                    type_num_kind(ty),
+                ));
+                let assign = Expr::Assign(
+                    Box::new(target.clone()),
+                    Box::new(Expr::Ident(alias.clone(), Span::default())),
+                    Span::default(),
+                );
+                let result = self.gen_expr_discard(&assign);
+                // Removed by name: the assignment may have declared a local of
+                // its own, and popping would take that one instead.
+                self.locals.retain(|(name, _, _, _)| name != &alias);
+                result
+            }
+        }
+    }
+
     /// Generate condition code. For pointer nil comparisons, use Bnew/Beqw with $0.
     fn gen_cond_to(&mut self, expr: &Expr, dst: i32) -> Result<(), String> {
         match expr {
@@ -3009,6 +4071,8 @@ impl CodeGen {
             Expr::Assign(lhs, rhs, _) => {
                 if let Expr::Ident(name, _) = lhs.as_ref() {
                     self.gen_assign_to_ident(name, rhs, None)
+                } else if let Expr::Tuple(targets, _) = lhs.as_ref() {
+                    self.gen_tuple_assign(targets, rhs)
                 } else if let Expr::Index(arr_expr, idx_expr, _) = lhs.as_ref() {
                     // Distinguish array-element write from string-character
                     // insert by the lvalue's ValType. Strings are Ptr; arrays
@@ -3072,6 +4136,36 @@ impl CodeGen {
                     // p.field = val → write through the ref pointer. Use the
                     // ADT layout when available so big/real fields use the
                     // wide opcode and the right offset.
+                    //
+                    // A tuple's `.tN` is not reached through a pointer — the
+                    // tuple is the value. Writing one as if it were a ref
+                    // would dereference the first field as an address, so
+                    // write into the block, or say why we can't.
+                    if let Some(n) = tuple_field_index(field)
+                        && let Some(fields) = self.tuple_fields_of(inner_expr)
+                    {
+                        let layout = compute_tuple_layout(&fields);
+                        let Some((fty, foff)) = layout.field(n).cloned() else {
+                            return Err(format!(
+                                "`.{field}` is out of range for a {}-field tuple",
+                                layout.fields.len()
+                            ));
+                        };
+                        let Expr::Ident(base, _) = inner_expr.as_ref() else {
+                            return Err(
+                                "assigning to a field of a tuple that is not a variable is \
+                                 not supported yet"
+                                    .to_string(),
+                            );
+                        };
+                        let Some((base_off, _)) = self.get_local(base) else {
+                            return Err(format!("`{base}` is not a tuple this function declares"));
+                        };
+                        let val_tmp = self.alloc_temp_for(type_num_kind(&fty));
+                        self.gen_expr_to_kind(rhs, val_tmp, type_num_kind(&fty))?;
+                        self.copy_value(&fty, val_tmp, base_off + foff);
+                        return Ok(());
+                    }
                     let ref_tmp = self.alloc_temp();
                     let (field_off, write_kind) = match self
                         .adt_name_for_expr(inner_expr)
@@ -3197,6 +4291,13 @@ impl CodeGen {
                 let ty = self.infer_expr_type(rhs);
                 let kind = self.infer_num_kind(rhs);
                 let name = names.first().map(|s| s.as_str()).unwrap_or("_");
+                // A tuple-valued rhs needs a block-sized local: `t := (1, 2)`
+                // into a 4-byte slot would write the second field over
+                // whatever local came next.
+                if let Some(fields) = self.tuple_fields_of(rhs) {
+                    let off = self.declare_local_of_type(name, &Type::Tuple(fields));
+                    return self.gen_expr_to(rhs, off);
+                }
                 let off = self.alloc_local(name, ty, kind);
                 // Capture array element type when the rhs is `array[N] of T`
                 // so subsequent indexing picks the right opcode pair.
@@ -3215,11 +4316,13 @@ impl CodeGen {
                     }
                     _ => {}
                 }
-                // Same for `chan of T` so Send/Recv can pick the right width.
-                if let Expr::ChanAlloc(ty, _) = rhs.as_ref()
-                    && let Type::Basic(b) = ty.as_ref()
-                {
-                    self.local_chan_elem.insert(name.to_string(), *b);
+                // Same for a channel, so Send/Recv and `alt` move a whole
+                // message rather than a word. `c := chan of T` is the common
+                // case, but a channel that arrives through another variable
+                // (`r := dummy`, `r = f.read`) carries its element type just
+                // as much.
+                if let Some(elem) = self.chan_elem_type(rhs) {
+                    self.local_chan_elem.insert(name.to_string(), elem);
                 }
                 // ADT inference: the parser emits `ref Foo(...)` as
                 // `Unary(Ref, Call(Ident(Foo), args))`, not RefAlloc. Detect
@@ -3242,86 +4345,11 @@ impl CodeGen {
                 self.note_module_handle(name, None, Some(rhs));
                 self.gen_expr_to(rhs, off)
             }
-            Expr::TupleDeclAssign(names, rhs, _) => {
-                // For function-call rhs with a known tuple return shape, lay
-                // out per-field offsets using each field's actual width.
-                // Otherwise fall back to a 4-byte stride (the historical
-                // behavior, accurate for word-only tuples).
-                let field_types: Option<Vec<Type>> = if let Expr::Call(callee, _, _) = rhs.as_ref()
-                {
-                    let cname = match callee.as_ref() {
-                        Expr::Ident(n, _) => Some(n.clone()),
-                        _ => None,
-                    };
-                    cname.and_then(|n| self.func_tuple_ret.get(&n).cloned())
-                } else {
-                    None
-                };
-                let kinds: Vec<NumKind> = if let Some(types) = &field_types {
-                    types.iter().map(type_num_kind).collect()
-                } else {
-                    names.iter().map(|_| NumKind::Word).collect()
-                };
-                // Allocate ret_tmp wide enough to hold the whole tuple by
-                // summing field widths. Without this, big/real fields would
-                // overflow into adjacent temps.
-                let total: i32 = kinds.iter().map(|k| k.byte_size()).sum();
-                let ret_tmp = self.next_local;
-                self.next_local += total.max(4);
-                self.grow_frame();
-                self.gen_expr_to(rhs, ret_tmp)?;
-                let mut field_off = ret_tmp;
-                for (i, name) in names.iter().enumerate() {
-                    let kind = kinds.get(i).copied().unwrap_or(NumKind::Word);
-                    let ty = field_types
-                        .as_ref()
-                        .and_then(|t| t.get(i))
-                        .map(|t| match t {
-                            Type::Basic(BasicType::Int)
-                            | Type::Basic(BasicType::Byte)
-                            | Type::Basic(BasicType::Big)
-                            | Type::Basic(BasicType::Real) => ValType::Word,
-                            _ => ValType::Ptr,
-                        })
-                        .unwrap_or(ValType::Word);
-                    if name != "nil" {
-                        let off = self.alloc_local(name, ty, kind);
-                        if field_off != off {
-                            let op = match kind {
-                                NumKind::Big => Opcode::Movl,
-                                NumKind::Real => Opcode::Movf,
-                                NumKind::Word if ty == ValType::Ptr => Opcode::Movp,
-                                NumKind::Word => Opcode::Movw,
-                            };
-                            self.emit(op, op_fp(field_off), mid_unused(), op_fp(off));
-                        }
-                    }
-                    field_off += kind.byte_size();
-                }
-                Ok(())
-            }
+            Expr::TupleDeclAssign(names, rhs, _) => self.gen_tuple_decl_assign(names, rhs, None),
             Expr::PostInc(inner, _) => self.gen_inc_dec(inner, true, None),
             Expr::PostDec(inner, _) => self.gen_inc_dec(inner, false, None),
             Expr::Call(_, _, _) => self.gen_call_expr(expr),
-            Expr::Send(chan_expr, val_expr, _) => {
-                // Size the value temp by the channel's element kind so the
-                // VM's op_send (which reads `elem_size` bytes from the val
-                // slot) doesn't truncate big/real messages.
-                let chan_elem = if let Expr::Ident(name, _) = chan_expr.as_ref() {
-                    self.local_chan_elem.get(name).copied()
-                } else {
-                    None
-                };
-                let val_kind = chan_elem
-                    .map(|b| type_num_kind(&Type::Basic(b)))
-                    .unwrap_or_else(|| self.infer_num_kind(val_expr));
-                let chan_tmp = self.alloc_temp();
-                let val_tmp = self.alloc_temp_for(val_kind);
-                self.gen_expr_to(chan_expr, chan_tmp)?;
-                self.gen_expr_to_kind(val_expr, val_tmp, val_kind)?;
-                self.emit(Opcode::Send, op_fp(val_tmp), mid_unused(), op_fp(chan_tmp));
-                Ok(())
-            }
+            Expr::Send(chan_expr, val_expr, _) => self.gen_send(chan_expr, val_expr),
             _ => {
                 if let Expr::ModQual(_, _, _) = expr {
                     return self.gen_call_expr(expr);
@@ -3373,6 +4401,15 @@ impl CodeGen {
                 Ok(())
             }
             Expr::Ident(name, _) => {
+                // A tuple local is wider than any single move: copying it
+                // with one Mov would take the first field and leave the rest
+                // of the destination holding whatever was there before.
+                if let Some(fields) = self.local_tuple.get(name).cloned()
+                    && let Some((src, _)) = self.get_local(name)
+                {
+                    self.copy_value(&Type::Tuple(fields), src, dst);
+                    return Ok(());
+                }
                 // Frame local or module-level variable. Big/real values carry
                 // an 8-byte payload and use the matching wide move regardless
                 // of the surrounding ValType (Word for both); strings, lists,
@@ -3640,9 +4677,32 @@ impl CodeGen {
                             self.gen_expr_to(inner, dst)?;
                             self.emit(Opcode::Cvtac, op_fp(dst), mid_unused(), op_fp(dst));
                         } else {
-                            // int to string: Cvtwc
-                            self.gen_expr_to(inner, dst)?;
-                            self.emit(Opcode::Cvtwc, op_fp(dst), mid_unused(), op_fp(dst));
+                            // Each conversion reads its operand at that
+                            // operand's own width, so pick it from the operand:
+                            // a big or a real is eight bytes and has to be
+                            // staged in a slot that size, not in the string
+                            // destination.
+                            match self.infer_num_kind(inner) {
+                                NumKind::Big => {
+                                    let tmp = self.alloc_temp_for(NumKind::Big);
+                                    self.gen_expr_to(inner, tmp)?;
+                                    self.emit(Opcode::Cvtlc, op_fp(tmp), mid_unused(), op_fp(dst));
+                                }
+                                NumKind::Real => {
+                                    let tmp = self.alloc_temp_for(NumKind::Real);
+                                    self.gen_expr_to(inner, tmp)?;
+                                    self.emit(Opcode::Cvtfc, op_fp(tmp), mid_unused(), op_fp(dst));
+                                }
+                                NumKind::Word => {
+                                    self.gen_expr_to(inner, dst)?;
+                                    self.emit(
+                                        Opcode::Cvtwc,
+                                        op_fp(dst),
+                                        mid_unused(),
+                                        op_fp(dst),
+                                    );
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -3671,6 +4731,22 @@ impl CodeGen {
                 self.gen_record_alloc(&name, args, dst)
             }
             Expr::Dot(inner, field, _) => {
+                // `t.tN` on a tuple is not a load through a pointer: the
+                // tuple is inline in the frame, so the field is read straight
+                // out of the block at its layout offset.
+                if let Some(n) = tuple_field_index(field)
+                    && self.tuple_fields_of(inner).is_some()
+                {
+                    let (block, layout) = self.gen_tuple_block(inner)?;
+                    let Some((ty, off)) = layout.field(n).cloned() else {
+                        return Err(format!(
+                            "`.{field}` is out of range for a {}-field tuple",
+                            layout.fields.len()
+                        ));
+                    };
+                    self.copy_value(&ty, block + off, dst);
+                    return Ok(());
+                }
                 // expr.field → read through the ref pointer using the ADT
                 // layout when known. Falls back to the historical heuristic
                 // (`estimate_field_offset` + Movw) for unknown types so the
@@ -3704,12 +4780,40 @@ impl CodeGen {
                 // chan of T → Newc{w/b/l/f/p} $0, dst, picking the opcode
                 // by element width so Send/Recv copy the right number of
                 // bytes per message.
+                //
+                // A tuple element has no fixed-width opcode: its size comes
+                // from a type descriptor, via Newcm/Newcmp. Allocating one of
+                // those channels with Newcw instead fixed elem_size at 4 and
+                // the channel delivered only the message's first word.
+                if let Type::Tuple(fields) = ty.as_ref() {
+                    let layout = compute_tuple_layout(fields);
+                    let opcode = if layout.ptr_offsets.is_empty() {
+                        Opcode::Newcm
+                    } else {
+                        Opcode::Newcmp
+                    };
+                    let at = self.code.len();
+                    self.emit(opcode, op_imm(0), mid_unused(), op_fp(dst));
+                    self.need_type(
+                        at,
+                        TypeOperand::Source,
+                        TypeKey::Block {
+                            size: layout.size,
+                            ptr_offsets: layout.ptr_offsets.clone(),
+                        },
+                    );
+                    return Ok(());
+                }
                 let elem = match ty.as_ref() {
                     Type::Basic(b) => Some(*b),
                     _ => None,
                 };
                 self.emit(newc_opcode(elem), op_unused(), mid_imm(0), op_fp(dst));
                 Ok(())
+            }
+            Expr::Tuple(elems, _) => self.gen_tuple_literal_to(elems, dst),
+            Expr::TupleDeclAssign(names, rhs, _) => {
+                self.gen_tuple_decl_assign(names, rhs, Some(dst))
             }
             Expr::Recv(chan_expr, _) => {
                 // <-chan → Recv chan, dst. The dst slot is the receiver's
@@ -3722,13 +4826,22 @@ impl CodeGen {
                 Ok(())
             }
             Expr::Send(chan_expr, val_expr, _) => {
-                // chan <-= val → Send val, chan
-                let chan_tmp = self.alloc_temp();
-                let val_tmp = self.alloc_temp();
-                self.gen_expr_to(chan_expr, chan_tmp)?;
-                self.gen_expr_to(val_expr, val_tmp)?;
-                self.emit(Opcode::Send, op_fp(val_tmp), mid_unused(), op_fp(chan_tmp));
+                self.gen_send(chan_expr, val_expr)?;
                 self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
+                Ok(())
+            }
+            // A tagged value carries its tag in word 0, so `tagof e` is a word
+            // load through the reference. `tagof Adt.Variant` names a variant
+            // rather than a value, and folds to that variant's tag
+            // (`limbo/ecom.c:459-463`, `limbo/nodes.c:489-497`).
+            Expr::Tagof(inner, _) => {
+                if let Some(tag) = self.variant_tag(inner) {
+                    self.gen_word_const_to(tag, dst);
+                    return Ok(());
+                }
+                let tmp = self.alloc_temp();
+                self.gen_expr_to(inner, tmp)?;
+                self.emit(Opcode::Movw, op_fp_ind(tmp, 0), mid_unused(), op_fp(dst));
                 Ok(())
             }
             Expr::ListLit(elems, _) => {
@@ -4283,13 +5396,9 @@ impl CodeGen {
 
             // Evaluate args first into temps sized by each arg's kind so
             // big/real values aren't truncated.
-            let mut arg_temps: Vec<(i32, ValType, NumKind)> = Vec::new();
+            let mut arg_temps: Vec<ArgSlot> = Vec::new();
             for arg in args {
-                let kind = self.infer_num_kind(arg);
-                let tmp = self.alloc_temp_for(kind);
-                self.gen_expr_to(arg, tmp)?;
-                let ty = self.infer_expr_type(arg);
-                arg_temps.push((tmp, ty, kind));
+                arg_temps.push(self.gen_arg_value(arg)?);
             }
 
             let frame_tmp = self.alloc_temp();
@@ -4311,15 +5420,8 @@ impl CodeGen {
             // Big/Real). The callee's `param_off += kind.byte_size()` loop
             // produces matching offsets.
             let mut arg_off = 32i32;
-            for (tmp, ty, kind) in &arg_temps {
-                let op = match (ty, kind) {
-                    (_, NumKind::Big) => Opcode::Movl,
-                    (_, NumKind::Real) => Opcode::Movf,
-                    (ValType::Word, NumKind::Word) => Opcode::Movw,
-                    _ => Opcode::Movp,
-                };
-                self.emit(op, op_fp(*tmp), mid_unused(), op_fp_ind(frame_tmp, arg_off));
-                arg_off += kind.byte_size();
+            for slot in std::mem::take(&mut arg_temps) {
+                arg_off = self.store_arg(&slot, frame_tmp, arg_off);
             }
 
             // When the caller wants the result, install dst directly as the
@@ -4415,13 +5517,9 @@ impl CodeGen {
         // allocating the call frame. Nested calls (like sys->fildes(1))
         // complete first; each temp's width matches its arg's kind so big
         // and real values aren't truncated when packed.
-        let mut arg_temps: Vec<(i32, ValType, NumKind)> = Vec::new();
+        let mut arg_temps: Vec<ArgSlot> = Vec::new();
         for arg in args {
-            let kind = self.infer_num_kind(arg);
-            let tmp = self.alloc_temp_for(kind);
-            self.gen_expr_to(arg, tmp)?;
-            let ty = self.infer_expr_type(arg);
-            arg_temps.push((tmp, ty, kind));
+            arg_temps.push(self.gen_arg_value(arg)?);
         }
 
         // Phase 2: Allocate call frame and fill it
@@ -4442,15 +5540,8 @@ impl CodeGen {
         // `sys->print`, this puts the format-string-driven $Sys formatter's
         // expected layout in place: %d reads 4 bytes, %bd 8, %f 8, etc.
         let mut arg_off = 32i32;
-        for (tmp, ty, kind) in &arg_temps {
-            let op = match (ty, kind) {
-                (_, NumKind::Big) => Opcode::Movl,
-                (_, NumKind::Real) => Opcode::Movf,
-                (ValType::Word, NumKind::Word) => Opcode::Movw,
-                _ => Opcode::Movp,
-            };
-            self.emit(op, op_fp(*tmp), mid_unused(), op_fp_ind(frame_tmp, arg_off));
-            arg_off += kind.byte_size();
+        for slot in std::mem::take(&mut arg_temps) {
+            arg_off = self.store_arg(&slot, frame_tmp, arg_off);
         }
 
         // Same direct-return-target trick as gen_local_call: skip the
@@ -4628,12 +5719,43 @@ impl CodeGen {
     /// The ADT a constructor expression names, spelled either bare (`Xfid`)
     /// or through the interface that declares it (`Bufio->Iobuf`).
     fn adt_ctor_name(&self, expr: &Expr) -> Option<String> {
+        // `ref Shape.Circle(...)` names one variant of a tagged ADT, which has
+        // a layout, a size, and a tag of its own.
+        if let Expr::Dot(base, variant, _) = expr
+            && let Some(adt) = self.adt_variant_owner(base)
+        {
+            let key = format!("{adt}.{variant}");
+            return self.adt_variants.contains_key(&key).then_some(key);
+        }
         let name = match expr {
             Expr::Ident(name, _) => name,
             Expr::ModQual(_, name, _) => name,
             _ => return None,
         };
         self.adt_layouts.contains_key(name).then(|| name.clone())
+    }
+
+    /// The tag of the variant `expr` names, for the constant-folded
+    /// `tagof Adt.Variant` form.
+    fn variant_tag(&self, expr: &Expr) -> Option<i32> {
+        let Expr::Dot(base, variant, _) = expr else {
+            return None;
+        };
+        let adt = self.adt_variant_owner(base)?;
+        self.adt_variants
+            .get(&format!("{adt}.{variant}"))
+            .map(|(tag, _)| *tag)
+    }
+
+    /// The ADT `expr` names when it is used as the left half of a variant
+    /// name. A local variable of the same name wins: `x.f` selects a field of
+    /// `x`, whatever ADTs are in scope.
+    fn adt_variant_owner(&self, expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Ident(name, _) if self.lookup_var(name).is_none() => Some(name.clone()),
+            Expr::ModQual(_, name, _) => Some(name.clone()),
+            _ => None,
+        }
     }
 
     /// The element kind of an array literal: its declared element type when
@@ -4780,6 +5902,11 @@ impl CodeGen {
         let at = self.code.len();
         self.emit(Opcode::New, op_imm(0), mid_unused(), op_fp(dst));
         self.need_type(at, TypeOperand::Source, key);
+        // A variant of a tagged ADT carries its tag in word 0: that word is
+        // what `tagof` reads and what every `pick` dispatches on.
+        if let Some((tag, _)) = self.adt_variants.get(adt).copied() {
+            self.emit(Opcode::Movw, op_imm(tag), mid_unused(), op_fp_ind(dst, 0));
+        }
         let layout = self.adt_layouts.get(adt).cloned();
         for (i, arg) in args.iter().enumerate() {
             let (field_off, field_ty) = match layout.as_ref().and_then(|l| l.get(i)) {
@@ -5005,6 +6132,113 @@ mod tests {
     /// populate the symbol table that `import` resolves against.
     fn compile_resolved(src: &str) -> Result<Module, String> {
         crate::compile(src, "test.b")
+    }
+
+    /// `alt` over an array of channels has no lowering, and the diagnostic has
+    /// to say which construct is missing: the guard reads like an ordinary
+    /// tuple receive, and calling it one would send the reader looking for a
+    /// tuple problem that is not there.
+    #[test]
+    fn alt_over_an_array_of_channels_names_the_missing_construct() {
+        let err = compile_src(
+            r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    a := array[2] of chan of string;
+    alt {
+    (i, s) := <-a =>
+        return;
+    }
+}
+"#,
+        )
+        .expect_err("an alt over an array of channels must not compile to nothing");
+        assert!(
+            err.contains("array of channels"),
+            "diagnostic should name the construct: {err}"
+        );
+    }
+
+    /// A `pick` over an ADT whose declaration never arrived (its interface was
+    /// not on the include path) has no tags to resolve against. Reporting that
+    /// the tag is "not a variant" would send the reader looking at the wrong
+    /// file.
+    #[test]
+    fn pick_over_an_undeclared_adt_reports_the_missing_declaration() {
+        let err = compile_src(
+            r#"
+implement Test;
+init(nil: ref Draw->Context, nil: list of string)
+{
+}
+handle(e: ref Event)
+{
+    pick x := e {
+    Emouse =>
+        return;
+    }
+}
+"#,
+        )
+        .expect_err("a pick over an unknown ADT must not compile to nothing");
+        assert!(
+            err.contains("declaration of `Event` was not found"),
+            "diagnostic should name the missing declaration: {err}"
+        );
+    }
+
+    /// The byte offsets of a tagged ADT are an ABI, not an internal choice: a
+    /// record built here is read by reference-compiled modules and vice versa.
+    /// A run-time test cannot see a layout that is merely shifted, because our
+    /// own writer and reader would shift together, so the offsets are pinned
+    /// here: tag at 0, the ADT's own fields from 4, and the variant's fields
+    /// where the common ones end (`limbo/types.c:2176-2199`).
+    #[test]
+    fn tagged_adt_places_the_tag_then_common_then_variant_fields() {
+        let module = compile_src(
+            r#"
+implement Test;
+Shape: adt {
+    name: string;
+    pick {
+    Circle =>
+        r: int;
+    Square =>
+        s: int;
+    }
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    c := ref Shape.Circle("circ", 5);
+}
+"#,
+        )
+        .expect("a tagged ADT constructor should compile");
+        // Every write through the new record, as (field offset, mode).
+        let writes: Vec<i32> = module
+            .code
+            .iter()
+            .filter(|i| i.destination.mode == AddressMode::OffsetDoubleIndirectFp)
+            .map(|i| i.destination.register2)
+            .collect();
+        assert_eq!(
+            writes,
+            vec![0, 4, 8],
+            "tag at 0, `name` at 4, `r` at 8; got {writes:?}"
+        );
+        // The descriptor has to cover the variant, and to name `name` as the
+        // one word the collector follows.
+        let circle = module
+            .types
+            .iter()
+            .find(|t| t.size == 12)
+            .expect("a 12-byte descriptor for Shape.Circle");
+        assert_eq!(circle.pointer_count, 1, "only `name` is a pointer");
+        assert_eq!(
+            circle.pointer_map.bytes[0], 0b0100_0000,
+            "the pointer is word 1, the `name` field"
+        );
     }
 
     // ── import ──────────────────────────────────────────────────
@@ -5346,49 +6580,6 @@ init(nil: ref Draw->Context, nil: list of string)
     }
 
     // ── Unsupported constructs are diagnosed, not silently dropped ──
-
-    #[test]
-    fn alt_statement_is_a_compile_error() {
-        let src = r#"
-implement Test;
-init(nil: ref Draw->Context, nil: list of string)
-{
-    c := chan of int;
-    alt {
-    v := <-c =>
-        v = 0;
-    }
-}
-"#;
-        let err = compile_src(src).expect_err("alt must not compile to nothing");
-        assert!(err.contains("alt"), "diagnostic should mention alt: {err}");
-    }
-
-    #[test]
-    fn pick_statement_is_a_compile_error() {
-        let src = r#"
-implement Test;
-Shape: adt {
-    pick {
-    Circle => r: int;
-    Square => s: int;
-    }
-};
-init(nil: ref Draw->Context, nil: list of string)
-{
-    sh: ref Shape;
-    pick x := sh {
-    Circle =>
-        x.r = 1;
-    }
-}
-"#;
-        let err = compile_src(src).expect_err("pick must not compile to nothing");
-        assert!(
-            err.contains("pick"),
-            "diagnostic should mention pick: {err}"
-        );
-    }
 
     #[test]
     fn break_outside_a_loop_is_a_compile_error() {

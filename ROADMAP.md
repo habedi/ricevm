@@ -245,11 +245,22 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] .dis binary writer: complete format with operand encoding, handler tables, and null terminators
 - [x] CLI integration: `ricevm-cli compile source.b [-o output.dis] [-I include_path]`
 - [x] `make test-limbo`: 11 correctness tests (built-in vs reference compiler output comparison)
-- [x] 155/159 Inferno programs compile with both built-in and reference compilers (100% reference coverage)
+- [x] `import` declarations: `a, b: import m;` binds module members unqualified, for both a module variable and a module interface name. Constants
+  fold (including in constant expressions), functions lower to the same cross-module call as the qualified spelling
+- [x] `implement X` brings X's own interface into unqualified scope, with real ADT field layouts
+- [x] Cross-module calls through any module handle (previously only `sys->f()` worked; every other handle emitted nothing)
+- [x] Per-type descriptors for `new`/`newa`, with MSB-first pointer maps, so the collector traces compiled programs at the right offsets
+- [x] Tuple values: literals, `.tN` read and write, whole-tuple copies, tuple arguments, returns and messages, and `((a, b) := <-c).t0`
+- [x] Tuple channels via `Newcm`/`Newcmp` with a real block descriptor
+- [x] Module-level data initialisers in a module with no `init`, written to the data section as the reference does
+- [x] `alt` statement codegen: send, receive and wildcard arms, `or`-joined guards sharing one body, tuple receives, and blocking via `Alt`/`Nbalt`
+- [x] `pick` statement codegen: tagged-ADT layout (tag at 0, then common fields, variants overlaid), `ref Adt.Variant(...)` construction, and `tagof`
+- [x] 356/945 programs under `external/inferno-os/appl` compile, measured with `-I external/inferno-os/module`
 - [ ] Full type checker (validation, not just inference)
-- [ ] Alt statement codegen
+- [ ] ADT function member calls whose receiver the compiler cannot type -- e.g. through `hd list` (199 corpus files, the largest remaining gap)
 - [ ] Exception handler block codegen
-- [ ] Pick types and cyclic ADT references
+- [ ] Cyclic ADT references
+- [ ] Array-of-channels `alt` guards (the VM's alt table cannot express them)
 
 ### Documentation
 
@@ -282,6 +293,18 @@ This document outlines the features implemented in RiceVM and the future goals f
 - `$Sys` stubs that require Plan 9 namespace semantics: `bind`, `mount`, `unmount`, `export`, `fauth`, and `file2chan` (no host OS equivalent)
 - ~240 pre-compiled programs fail: ~100 need command-line arguments (working correctly), ~50 need Plan 9 namespace/device features, ~30 need crypto
   modules beyond the current `$Keyring` stub, and ~60 have other environment dependencies
+
+#### Measuring built-in compiler coverage
+
+A compile-success count only means something if unresolved names are errors. Before the built-in compiler reported them, an unknown identifier
+lowered to `Movw $0`, an `alt` statement emitted no code at all, and a call through any module handle other than `sys` emitted nothing -- so almost
+every program "compiled" and a coverage number could not distinguish working output from silently wrong output. An earlier claim of 155/159 came
+from that regime, as did a measured 856/945 over `external/inferno-os/appl`.
+
+Those paths are now diagnostics, so the count reflects programs the compiler can actually lower: **356/945**. Measure with
+`-I external/inferno-os/module`; without it no `.m` interface resolves and the number is meaningless. Remaining causes, largest first: 199 ADT
+function member calls, 97 calls to undefined functions, 54 undefined identifiers, 35 interface members this compiler cannot yet represent, 40
+missing interfaces, and a long tail. No input makes the compiler panic.
 
 #### Incomplete Modules
 

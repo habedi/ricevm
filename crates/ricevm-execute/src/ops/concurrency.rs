@@ -28,6 +28,9 @@ struct AltEntry {
 enum AltOutcome {
     Selected(usize),
     NoneReady,
+    /// The table was malformed and an exception was raised; `dst` must be left
+    /// alone, since the thread either resumes in a handler or faults.
+    Raised,
 }
 
 /// spawn src, dst:create a new thread in the current module.
@@ -462,12 +465,29 @@ fn parse_alt_table(
 fn execute_alt(vm: &mut VmState<'_>, blocking: bool) -> Result<AltOutcome, ExecError> {
     let (base, _nsend, _nrecv, entries) = parse_alt_table(vm)?;
 
+    // `altrdy` validates the whole table before selecting, and raises even when
+    // some other entry was ready: a nil channel is exNilref, and a send and a
+    // receive on one channel is exAlt (libinterp/alt.c:88-130).
+    let fault = if entries.iter().any(|e| e.channel_id == heap::NIL) {
+        Some("nil dereference")
+    } else if entries.iter().any(|s| {
+        s.is_send
+            && entries
+                .iter()
+                .any(|r| !r.is_send && r.channel_id == s.channel_id)
+    }) {
+        Some("alt send/recv on same chan")
+    } else {
+        None
+    };
+    if let Some(msg) = fault {
+        vm.raise_exception(msg)?;
+        return Ok(AltOutcome::Raised);
+    }
+
     // Collect ready indices first, then pick one (reference picks randomly,
     // we pick the first ready one for determinism in our cooperative model).
     for (idx, entry) in entries.iter().copied().enumerate() {
-        if entry.channel_id == heap::NIL {
-            continue; // skip nil channels (reference skips them in altrdy)
-        }
         let (elem_size, pending) = channel_ref(vm, entry.channel_id)?;
         let ready = if entry.is_send {
             pending.is_none()
@@ -567,7 +587,7 @@ pub(crate) fn op_recv(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 pub(crate) fn op_alt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     match execute_alt(vm, true)? {
         AltOutcome::Selected(idx) => vm.set_dst_word(idx as i32),
-        AltOutcome::NoneReady => Ok(()),
+        AltOutcome::NoneReady | AltOutcome::Raised => Ok(()),
     }
 }
 
@@ -582,6 +602,7 @@ pub(crate) fn op_nbalt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     match execute_alt(vm, false)? {
         AltOutcome::Selected(idx) => vm.set_dst_word(idx as i32),
         AltOutcome::NoneReady => vm.set_dst_word(count as i32),
+        AltOutcome::Raised => Ok(()),
     }
 }
 
@@ -780,6 +801,71 @@ mod tests {
 
         assert_eq!(memory::read_word(&vm.frames.data, fp_base), 1);
         assert_eq!(memory::read_word(&vm.frames.data, fp_base + 44), 77);
+    }
+
+    #[test]
+    fn alt_with_a_nil_channel_raises_even_when_another_entry_is_ready() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let ready = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: Some(77_i32.to_ne_bytes().to_vec()),
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        memory::write_word(&mut vm.frames.data, table_off, 0); // nsend = 0
+        memory::write_word(&mut vm.frames.data, table_off + 4, 2); // nrecv = 2
+        // Entry 0 (recv): nil channel
+        memory::write_word(&mut vm.frames.data, table_off + 8, heap::NIL as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+        // Entry 1 (recv): a channel that is ready
+        memory::write_word(&mut vm.frames.data, table_off + 16, ready as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 20, (fp_base + 44) as i32);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+
+        // `altrdy` records exNilref and raises after scanning the whole table,
+        // even though entry 1 was ready (libinterp/alt.c:88-130).
+        assert!(op_nbalt(&mut vm).is_err(), "a nil channel must fault");
+    }
+
+    #[test]
+    fn alt_sending_and_receiving_on_one_channel_raises() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let chan = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        memory::write_word(&mut vm.frames.data, table_off, 1); // nsend = 1
+        memory::write_word(&mut vm.frames.data, table_off + 4, 1); // nrecv = 1
+        // The send entry is ready (empty slot), so without the check the alt
+        // would happily select it.
+        memory::write_word(&mut vm.frames.data, table_off + 8, chan as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 16, chan as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 20, (fp_base + 44) as i32);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+
+        // Reference raises exAlt for a send and a receive on one channel
+        // (libinterp/alt.c:117-120).
+        assert!(
+            op_nbalt(&mut vm).is_err(),
+            "send and recv on one channel must fault"
+        );
     }
 
     #[test]

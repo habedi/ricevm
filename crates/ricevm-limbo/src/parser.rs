@@ -51,6 +51,16 @@ impl Parser {
         std::mem::discriminant(self.peek()) == std::mem::discriminant(kind)
     }
 
+    /// Is the token `n` places ahead of the cursor of this kind?
+    fn at_offset(&self, n: usize, kind: &TokenKind) -> bool {
+        let ahead = self
+            .tokens
+            .get(self.pos + n)
+            .map(|t| &t.kind)
+            .unwrap_or(&TokenKind::Eof);
+        std::mem::discriminant(ahead) == std::mem::discriminant(kind)
+    }
+
     fn advance(&mut self) -> &Token {
         let tok = &self.tokens[self.pos];
         if self.pos < self.tokens.len() - 1 {
@@ -1547,7 +1557,8 @@ impl Parser {
                 // Guard list: `expr [or expr]* =>`. Every guard gets its own
                 // entry in the alt table and they all share this arm's body,
                 // so all of them are kept.
-                let mut guards = vec![self.classify_alt_guard(self.parse_expr()?)?];
+                let first = self.parse_expr()?;
+                let mut guards = vec![self.classify_alt_guard(first)?];
                 while self.at(&TokenKind::Or) {
                     self.advance();
                     let expr = self.parse_expr()?;
@@ -1563,10 +1574,30 @@ impl Parser {
             {
                 body.push(self.parse_stmt()?);
             }
-            arms.push(AltArm { guard, body });
+            arms.push(AltArm { guards, body });
         }
         self.expect(&TokenKind::RBrace)?;
         Ok(Stmt::Alt(AltStmt { arms, span }))
+    }
+
+    /// Turn a parsed `alt` guard expression into the send/receive form
+    /// codegen needs. A guard that is neither is rejected here rather than
+    /// carried along as a receive that isn't one.
+    fn classify_alt_guard(&self, expr: Expr) -> Result<AltGuard, ParseError> {
+        // Peel the binding off a receive guard: the destination is whatever
+        // the `<-c` was assigned or declared into.
+        let (dest, comm) = match expr {
+            Expr::DeclAssign(names, rhs, _) => (Some(AltDest::Decl(names)), *rhs),
+            Expr::TupleDeclAssign(names, rhs, _) => (Some(AltDest::TupleDecl(names)), *rhs),
+            Expr::Assign(lhs, rhs, _) => (Some(AltDest::Assign(*lhs)), *rhs),
+            other => (None, other),
+        };
+        match (dest, comm) {
+            (None, Expr::Send(chan, val, _)) => Ok(AltGuard::Send(*chan, *val)),
+            (dest, Expr::Recv(chan, _)) => Ok(AltGuard::Recv(dest, *chan)),
+            _ => Err(self
+                .err("an `alt` guard must be a channel send (`c <-= v`) or receive (`x := <-c`)")),
+        }
     }
 
     fn is_alt_guard_start(&self) -> bool {
@@ -1715,10 +1746,19 @@ impl Parser {
                 continue;
             }
 
-            // Channel send: expr <-= expr
-            if self.at(&TokenKind::ChanSend) {
+            // Channel send: `expr <-= expr`. The reference lexes `<-` as a
+            // single token (`Lcomm`) and its grammar spells the send as
+            // `exp Lcomm '=' exp` (lex.c:1041-1047, limbo.y:1127-1134), so
+            // whitespace between the arrow and the `=` is legal and the
+            // spaced form has to be accepted here too.
+            if self.at(&TokenKind::ChanSend)
+                || (self.at(&TokenKind::ChanRecv) && self.at_offset(1, &TokenKind::Assign))
+            {
                 if 1 < min_bp {
                     break;
+                }
+                if self.at(&TokenKind::ChanRecv) {
+                    self.advance();
                 }
                 self.advance();
                 let rhs = self.parse_expr_bp(1)?;

@@ -1597,3 +1597,926 @@ init(nil: ref Draw->Context, nil: list of string)
     );
     assert_raises(out, "v=2922");
 }
+
+// ── Tuple values ────────────────────────────────────────────────
+
+/// The simplest tuple value: a literal destructured straight into locals.
+#[test]
+fn tuple_literal_binds_every_field() {
+    let out = run_body(
+        r#"
+    (a, b) := (7, 9);
+    raise "a=" + string a + " b=" + string b;
+"#,
+    );
+    assert_raises(out, "a=7 b=9");
+}
+
+/// `string` must choose its conversion from the operand's width. Every operand
+/// went through `Cvtwc`, which reads only the low four bytes, so a `big` came
+/// back truncated and a `real` came back as 0.
+#[test]
+fn string_conversion_matches_the_operand_width() {
+    let out = run_body(
+        r#"
+    b := 5000000000;
+    r := 2.5;
+    i := 42;
+    raise "b=" + string b + " r=" + string r + " i=" + string i;
+"#,
+    );
+    assert_raises(out, "b=5000000000 r=2.5 i=42");
+}
+
+/// A tuple held in a local, read back through `.t0`/`.t1`.
+#[test]
+fn tuple_local_is_read_through_numbered_fields() {
+    let out = run_body(
+        r#"
+    t := (7, 9);
+    raise "t=" + string t.t0 + "," + string t.t1;
+"#,
+    );
+    assert_raises(out, "t=7,9");
+}
+
+/// A whole tuple copied from one local to another: the copy has to move
+/// every field, not just the first word.
+#[test]
+fn tuple_local_copies_all_of_its_fields() {
+    let out = run_body(
+        r#"
+    t := (7, 9);
+    u := t;
+    raise "u=" + string u.t0 + "," + string u.t1;
+"#,
+    );
+    assert_raises(out, "u=7,9");
+}
+
+/// A `big` field is 8 bytes wide. Laid out as 4, the 8-byte store of `a`
+/// runs over `b`, and `b`'s own store runs back over the top half of `a` —
+/// so this catches the width even without a value that needs all 64 bits.
+/// (`big` *literals* above 2^31 truncate for an unrelated reason; see the
+/// note in the report.)
+#[test]
+fn tuple_with_a_big_field_keeps_its_full_width() {
+    let out = run_body(
+        r#"
+    (a, b) := (big 5, 9);
+    raise "a=" + string a + " b=" + string b;
+"#,
+    );
+    assert_raises(out, "a=5 b=9");
+}
+
+/// A pointer field has to be moved as a pointer, and survive to be read.
+#[test]
+fn tuple_with_a_string_field_keeps_the_string() {
+    let out = run_body(
+        r#"
+    (n, s) := (7, "hi");
+    raise "n=" + string n + " s=" + s;
+"#,
+    );
+    assert_raises(out, "n=7 s=hi");
+}
+
+/// `nil` names a field that is received but not bound; the fields after it
+/// must still land in the right locals.
+#[test]
+fn tuple_decl_with_nil_field_still_binds_the_rest() {
+    let out = run_body(
+        r#"
+    (nil, b) := (7, 9);
+    raise "b=" + string b;
+"#,
+    );
+    assert_raises(out, "b=9");
+}
+
+/// A tuple literal passed as an argument — `regex->executese(re, s, (0, len
+/// s-1), 1, 1)` is the corpus shape.
+#[test]
+fn tuple_literal_passes_as_a_call_argument() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+	f(1, (7, 9), 2);
+}
+f(x: int, t: (int, int), y: int)
+{
+	raise "x=" + string x + " t=" + string t.t0 + "," + string t.t1 + " y=" + string y;
+}
+"#,
+    );
+    assert_raises(out, "x=1 t=7,9 y=2");
+}
+
+/// `for ((i, j) := (0, 5); ...)` — a tuple declaration in a `for` initialiser.
+#[test]
+fn tuple_declaration_works_in_a_for_initialiser() {
+    let out = run_body(
+        r#"
+    s := 0;
+    for ((i, j) := (0, 5); i < 3; i++)
+        s += i + j;
+    raise "s=" + string s;
+"#,
+    );
+    assert_raises(out, "s=18");
+}
+
+// ── Tuple channels (element size) ───────────────────────────────
+
+/// `chan of (int, int)` carries 8 bytes, not 4. With `Newcw`'s fixed
+/// `elem_size` of 4 the second field arrived as zero — the channel compiled
+/// and ran, and delivered a wrong value.
+#[test]
+fn tuple_channel_delivers_every_field() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c := chan of (int, int);
+	spawn producer(c);
+	(a, b) := <-c;
+	raise "a=" + string a + " b=" + string b;
+}
+producer(c: chan of (int, int))
+{
+	c <-= (7, 9);
+}
+"#,
+    );
+    assert_raises(out, "a=7 b=9");
+}
+
+/// The same channel read into a tuple local rather than destructured.
+#[test]
+fn tuple_channel_receives_into_a_tuple_local() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c := chan of (int, int);
+	spawn producer(c);
+	t := <-c;
+	raise "t=" + string t.t0 + "," + string t.t1;
+}
+producer(c: chan of (int, int))
+{
+	c <-= (7, 9);
+}
+"#,
+    );
+    assert_raises(out, "t=7,9");
+}
+
+/// A tuple channel whose fields are of different widths: the channel's
+/// element size is the tuple's real size, including alignment padding.
+#[test]
+fn tuple_channel_carries_mixed_width_fields() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c := chan of (int, big, string);
+	spawn producer(c);
+	(a, b, s) := <-c;
+	raise "a=" + string a + " b=" + string b + " s=" + s;
+}
+producer(c: chan of (int, big, string))
+{
+	c <-= (7, big 5, "hi");
+}
+"#,
+    );
+    assert_raises(out, "a=7 b=5 s=hi");
+}
+
+/// `((d, reply) := <-c).t0` — a tuple-valued declaration used as an
+/// expression and then field-selected. The declaration still binds.
+#[test]
+fn tuple_declaration_is_usable_as_an_expression() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c := chan of (int, int);
+	spawn producer(c);
+	x := ((a, b) := <-c).t0;
+	raise "x=" + string x + " a=" + string a + " b=" + string b;
+}
+producer(c: chan of (int, int))
+{
+	c <-= (7, 9);
+}
+"#,
+    );
+    assert_raises(out, "x=7 a=7 b=9");
+}
+
+/// Isolates the channel element-size bug from tuple *literals*: this program
+/// compiled cleanly even before tuple values were supported, because the
+/// message comes from a tuple-returning call — and it reported `b=0`. The
+/// second word of every message was dropped on the floor by `Newcw`'s fixed
+/// 4-byte element size.
+#[test]
+fn tuple_channel_does_not_truncate_a_call_result() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c := chan of (int, int);
+	spawn producer(c);
+	(a, b) := <-c;
+	raise "a=" + string a + " b=" + string b;
+}
+mk(): (int, int)
+{
+	return (7, 9);
+}
+producer(c: chan of (int, int))
+{
+	c <-= mk();
+}
+"#,
+    );
+    assert_raises(out, "a=7 b=9");
+}
+
+/// `(a, b) = (b, a)` assigns to existing variables. It used to fall through
+/// to a branch that evaluated the right-hand side into a scratch temp and
+/// threw it away, so the swap simply did not happen.
+#[test]
+fn tuple_assignment_to_existing_variables_takes_effect() {
+    let out = run_body(
+        r#"
+    a := 1;
+    b := 2;
+    (a, b) = (b, a);
+    raise "a=" + string a + " b=" + string b;
+"#,
+    );
+    assert_raises(out, "a=2 b=1");
+}
+
+/// A tuple field that is itself a tuple is more than one word wide. Sized as
+/// one, the inner tuple's later fields would run over the outer tuple's.
+#[test]
+fn nested_tuple_keeps_every_field() {
+    let out = run_body(
+        r#"
+    (p, n) := ((7, 9), 3);
+    raise "p=" + string p.t0 + "," + string p.t1 + " n=" + string n;
+"#,
+    );
+    assert_raises(out, "p=7,9 n=3");
+}
+
+/// `(date, tm.mday) = datenum(date)` — a tuple assignment whose targets are
+/// not plain variables. Every target has to be written, whatever kind of
+/// lvalue it is.
+#[test]
+fn tuple_assignment_writes_through_complex_lvalues() {
+    let out = run_src(
+        r#"implement T;
+T: module {
+    P: adt { n: int; };
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	p := ref P(0);
+	a := array[2] of int;
+	s := 0;
+	(p.n, a[1], nil) = (7, 9, 5);
+	raise "n=" + string p.n + " a1=" + string a[1] + " s=" + string s;
+}
+"#,
+    );
+    assert_raises(out, "n=7 a1=9 s=0");
+}
+
+// ── `alt` ───────────────────────────────────────────────────────
+//
+// An `alt` compiles to a table of `{channel, value address}` entries plus a
+// `{nsend, nrecv}` header, and the `alt`/`nbalt` instruction answers with the
+// index of the entry it selected. Every test below asserts the value the
+// selected arm computed, because the failure mode being guarded against is a
+// statement that emits no code at all: a program that merely compiles proves
+// nothing about which arm ran.
+
+/// No guard is ready, so the `*` arm runs. `nbalt` reports "nothing ready" as
+/// the index `nsend + nrecv`, one past the last entry, so that is the index
+/// the wildcard arm has to answer to.
+#[test]
+fn alt_wildcard_arm_runs_when_no_guard_is_ready() {
+    let out = run_body(
+        r#"
+    c := chan of int;
+    n := 0;
+    alt {
+    x := <-c =>
+        n = x;
+    * =>
+        n = 5;
+    }
+    raise "n=" + string n;
+"#,
+    );
+    assert_raises(out, "n=5");
+}
+
+/// A send guard on an empty single-slot channel is ready, so its arm runs and
+/// the value reaches the channel. The value has to be evaluated into its slot
+/// before the `alt` executes, because the instruction itself performs the
+/// transfer out of that slot.
+#[test]
+fn alt_ready_send_arm_transfers_its_value() {
+    let out = run_body(
+        r#"
+    c := chan of int;
+    n := 0;
+    alt {
+    c <-= 7 =>
+        n = 1;
+    * =>
+        n = 2;
+    }
+    v := <-c;
+    raise "n=" + string n + " v=" + string v;
+"#,
+    );
+    assert_raises(out, "n=1 v=7");
+}
+
+/// A receive guard on a full channel is ready, and the received value is
+/// visible in the arm body under the name the guard declared.
+#[test]
+fn alt_ready_recv_arm_binds_the_received_value() {
+    let out = run_body(
+        r#"
+    c := chan of int;
+    c <-= 7;
+    n := 0;
+    alt {
+    x := <-c =>
+        n = x;
+    * =>
+        n = 2;
+    }
+    raise "n=" + string n;
+"#,
+    );
+    assert_raises(out, "n=7");
+}
+
+/// An `alt` with no `*` arm blocks. The VM parks the thread and re-executes
+/// the same instruction when it wakes, so the table (and the addresses in it)
+/// must still be valid after the suspension.
+#[test]
+fn alt_blocks_until_a_spawned_producer_sends() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c := chan of int;
+	spawn producer(c);
+	alt {
+	x := <-c =>
+		raise "x=" + string x;
+	}
+}
+producer(c: chan of int)
+{
+	c <-= 77;
+}
+"#,
+    );
+    assert_raises(out, "x=77");
+}
+
+/// The same blocking path with a pointer-valued element: the received string
+/// is written into the arm's slot through the address in the table.
+#[test]
+fn alt_receives_a_string_message() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c := chan of string;
+	spawn producer(c);
+	alt {
+	s := <-c =>
+		raise "s=" + s;
+	}
+}
+producer(c: chan of string)
+{
+	c <-= "hi";
+}
+"#,
+    );
+    assert_raises(out, "s=hi");
+}
+
+/// Two receive guards, and the producer feeds the second channel. The arm
+/// that runs is the one whose guard was ready, which is what proves the
+/// selected index is mapped back to the right arm.
+#[test]
+fn alt_runs_the_arm_whose_channel_became_ready() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c1 := chan of int;
+	c2 := chan of int;
+	spawn producer(c2);
+	alt {
+	x := <-c1 =>
+		raise "first x=" + string x;
+	y := <-c2 =>
+		raise "second y=" + string y;
+	}
+}
+producer(c: chan of int)
+{
+	c <-= 88;
+}
+"#,
+    );
+    assert_raises(out, "second y=88");
+}
+
+/// A mixed table: the send guard comes first in the source but its channel is
+/// full, so the receive guard is the ready one. Send entries occupy indices
+/// `0..nsend` and receive entries `nsend..nsend+nrecv`, so a receive numbered
+/// from zero instead of from `nsend` would dispatch this to the wrong arm (or
+/// to no arm at all).
+#[test]
+fn alt_mixed_table_indexes_receives_after_sends() {
+    let out = run_body(
+        r#"
+    c1 := chan of int;
+    c2 := chan of int;
+    c1 <-= 1;
+    c2 <-= 2;
+    n := 0;
+    alt {
+    c1 <-= 9 =>
+        n = 100;
+    y := <-c2 =>
+        n = y;
+    }
+    raise "n=" + string n;
+"#,
+    );
+    assert_raises(out, "n=2");
+}
+
+/// An `alt` guard may assign to an existing variable rather than declare a
+/// new one; the arm body then sees the received value in that variable.
+#[test]
+fn alt_recv_guard_assigns_to_an_existing_variable() {
+    let out = run_body(
+        r#"
+    c := chan of int;
+    c <-= 6;
+    x := 0;
+    alt {
+    x = <-c =>
+        x = x + 1;
+    * =>
+        x = 99;
+    }
+    raise "x=" + string x;
+"#,
+    );
+    assert_raises(out, "x=7");
+}
+
+/// A guard with no destination receives and discards the value. The arm still
+/// has to run.
+#[test]
+fn alt_bare_receive_guard_discards_the_value() {
+    let out = run_body(
+        r#"
+    c := chan of int;
+    c <-= 4;
+    n := 0;
+    alt {
+    <-c =>
+        n = 1;
+    * =>
+        n = 2;
+    }
+    raise "n=" + string n;
+"#,
+    );
+    assert_raises(out, "n=1");
+}
+
+/// `or`-joined guards share one body. Each is a separate table entry, so an
+/// implementation that kept only the first would listen on `c1` alone and take
+/// the `*` arm here.
+#[test]
+fn alt_or_joined_guards_share_one_body() {
+    let out = run_body(
+        r#"
+    c1 := chan of int;
+    c2 := chan of int;
+    c2 <-= 5;
+    n := 0;
+    alt {
+    x := <-c1 or x = <-c2 =>
+        n = x;
+    * =>
+        n = 99;
+    }
+    raise "n=" + string n;
+"#,
+    );
+    assert_raises(out, "n=5");
+}
+
+/// A tuple-valued channel delivers its whole message into a tuple guard, and
+/// every declared name binds.
+#[test]
+fn alt_tuple_receive_guard_binds_every_field() {
+    let out = run_body(
+        r#"
+    c := chan of (int, int);
+    c <-= (3, 4);
+    alt {
+    (a, b) := <-c =>
+        raise "a=" + string a + " b=" + string b;
+    * =>
+        raise "none";
+    }
+"#,
+    );
+    assert_raises(out, "a=3 b=4");
+}
+
+/// `break` in an arm leaves the `alt`, not the enclosing loop: the reference
+/// compiler pushes a break scope for `alt` with no continue target
+/// (`limbo/com.c:579-605`). The loop body after the `alt` therefore still
+/// runs, three times over.
+#[test]
+fn break_inside_an_alt_arm_leaves_only_the_alt() {
+    let out = run_body(
+        r#"
+    c := chan of int;
+    n := 0;
+    for(i := 0; i < 3; i++) {
+        alt {
+        x := <-c =>
+            n = n + x;
+        * =>
+            n = n + 1;
+            break;
+        }
+        n = n + 10;
+    }
+    raise "n=" + string n;
+"#,
+    );
+    assert_raises(out, "n=33");
+}
+
+// ── `pick` and tagged ADTs ──────────────────────────────────────
+//
+// A tagged (`pick`) ADT is laid out with its tag in word 0, the ADT's own
+// fields after it, and each variant's fields overlaid on one another after
+// those. `tagof` reads word 0 and `pick` dispatches on it, so every test here
+// asserts a value that a wrong tag, a wrong union base, or a constructor that
+// emitted no code would get wrong.
+
+/// The gate test for `tagof`: tags are dense from zero in declaration order,
+/// so `Square` is 1. A `Circle`-only test would pass even against the old
+/// lowering, which compiled every `tagof` to a literal zero.
+#[test]
+fn tagof_reports_the_variant_a_value_was_built_with() {
+    let out = run_src(
+        r#"implement T;
+Shape: adt {
+	pick {
+	Circle =>
+		r: int;
+	Square =>
+		s: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c := ref Shape.Circle(5);
+	q := ref Shape.Square(3);
+	ct := tagof c;
+	qt := tagof q;
+	raise "c=" + string ct + " q=" + string qt;
+}
+"#,
+    );
+    assert_raises(out, "c=0 q=1");
+}
+
+/// `tagof Shape.Square` names a variant rather than a value, and folds to that
+/// variant's tag.
+#[test]
+fn tagof_a_variant_name_folds_to_its_tag() {
+    let out = run_src(
+        r#"implement T;
+Shape: adt {
+	pick {
+	Circle =>
+		r: int;
+	Square =>
+		s: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	t := tagof Shape.Square;
+	raise "t=" + string t;
+}
+"#,
+    );
+    assert_raises(out, "t=1");
+}
+
+/// `pick` runs the arm naming the variant the value was built with.
+#[test]
+fn pick_dispatches_on_the_tag() {
+    let out = run_src(
+        r#"implement T;
+Shape: adt {
+	pick {
+	Circle =>
+		r: int;
+	Square =>
+		s: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	sh := ref Shape.Square(3);
+	n := 0;
+	pick x := sh {
+	Circle =>
+		n = 1;
+	Square =>
+		n = 2;
+	}
+	raise "n=" + string n;
+}
+"#,
+    );
+    assert_raises(out, "n=2");
+}
+
+/// Inside an arm, the bound name has the arm's variant type, so the variant's
+/// own fields resolve. Both variants place their field at the same offset, so
+/// a wrong union base reads the tag or runs off the record instead.
+#[test]
+fn pick_arm_reads_the_variant_fields() {
+    let out = run_src(
+        r#"implement T;
+Shape: adt {
+	pick {
+	Circle =>
+		r: int;
+	Square =>
+		s: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	sh := ref Shape.Square(7);
+	n := 0;
+	pick x := sh {
+	Circle =>
+		n = x.r;
+	Square =>
+		n = x.s;
+	}
+	raise "n=" + string n;
+}
+"#,
+    );
+    assert_raises(out, "n=7");
+}
+
+/// The ADT's own fields sit between the tag and the variant fields, and are
+/// readable in every arm. This is what fixes tag at 0, common at 4, and the
+/// first variant field at 8.
+#[test]
+fn pick_arm_reads_the_common_fields_too() {
+    let out = run_src(
+        r#"implement T;
+Shape: adt {
+	name: string;
+	pick {
+	Circle =>
+		r: int;
+	Square =>
+		s: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	sh := ref Shape.Circle("circ", 5);
+	pick x := sh {
+	Circle =>
+		raise "name=" + x.name + " r=" + string x.r;
+	Square =>
+		raise "square";
+	}
+}
+"#,
+    );
+    assert_raises(out, "name=circ r=5");
+}
+
+/// A `*` arm answers for every tag no arm names.
+#[test]
+fn pick_wildcard_arm_catches_the_other_variants() {
+    let out = run_src(
+        r#"implement T;
+Shape: adt {
+	pick {
+	Circle =>
+		r: int;
+	Square =>
+		s: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	sh := ref Shape.Square(3);
+	n := 0;
+	pick x := sh {
+	Circle =>
+		n = 1;
+	* =>
+		n = 9;
+	}
+	raise "n=" + string n;
+}
+"#,
+    );
+    assert_raises(out, "n=9");
+}
+
+/// `A or B` in a pick clause gives each name its own tag while they share one
+/// field layout, and an arm may name several tags.
+#[test]
+fn pick_arm_may_name_several_tags() {
+    let out = run_src(
+        r#"implement T;
+Shape: adt {
+	pick {
+	Circle =>
+		r: int;
+	Square or Rect =>
+		w: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	sh := ref Shape.Rect(4);
+	t := tagof sh;
+	n := 0;
+	pick x := sh {
+	Circle =>
+		n = 1;
+	Square or Rect =>
+		n = x.w;
+	}
+	raise "t=" + string t + " n=" + string n;
+}
+"#,
+    );
+    assert_raises(out, "t=2 n=4");
+}
+
+/// A `pick` that names neither every variant nor `*` simply falls through when
+/// nothing matches: the single-arm downcast idiom depends on the statement
+/// after it still running.
+#[test]
+fn non_exhaustive_pick_falls_through_to_the_next_statement() {
+    let out = run_src(
+        r#"implement T;
+Shape: adt {
+	pick {
+	Circle =>
+		r: int;
+	Square =>
+		s: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	sh := ref Shape.Square(3);
+	n := 5;
+	pick x := sh {
+	Circle =>
+		n = 1;
+	}
+	n = n + 1;
+	raise "n=" + string n;
+}
+"#,
+    );
+    assert_raises(out, "n=6");
+}
+
+/// `break` in a `pick` arm leaves the `pick`, not the enclosing loop: the
+/// reference compiler pushes a break scope for `pick` with no continue target
+/// (`limbo/com.c:579-605`).
+#[test]
+fn break_inside_a_pick_arm_leaves_only_the_pick() {
+    let out = run_src(
+        r#"implement T;
+Shape: adt {
+	pick {
+	Circle =>
+		r: int;
+	Square =>
+		s: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	sh := ref Shape.Circle(1);
+	n := 0;
+	for(i := 0; i < 3; i++) {
+		pick x := sh {
+		Circle =>
+			n = n + 1;
+			break;
+		}
+		n = n + 10;
+	}
+	raise "n=" + string n;
+}
+"#,
+    );
+    assert_raises(out, "n=33");
+}
+
+/// `pick m := <-c` picks over the message a channel just delivered, so the
+/// tags have to be resolved from the channel's element type. Eight corpus
+/// files open with exactly this line.
+#[test]
+fn pick_resolves_the_tags_of_a_received_message() {
+    let out = run_src(
+        r#"implement T;
+Msg: adt {
+	pick {
+	Ping =>
+		a: int;
+	Pong =>
+		b: int;
+	}
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+	c := chan of ref Msg;
+	c <-= ref Msg.Pong(7);
+	n := 0;
+	pick m := <-c {
+	Ping =>
+		n = m.a;
+	Pong =>
+		n = m.b;
+	}
+	raise "n=" + string n;
+}
+"#,
+    );
+    assert_raises(out, "n=7");
+}
+
+/// A channel that arrives through another variable keeps its element type.
+/// `r := dummy; ... alt { (a, b) := <-r => }` is the shape six corpus files
+/// use to switch a guard between two channels, and a channel whose element
+/// type went missing moves four bytes per message instead of the message.
+#[test]
+fn a_channel_alias_keeps_its_element_type() {
+    let out = run_body(
+        r#"
+    c := chan of (int, int);
+    r := c;
+    c <-= (3, 4);
+    alt {
+    (a, b) := <-r =>
+        raise "a=" + string a + " b=" + string b;
+    * =>
+        raise "none";
+    }
+"#,
+    );
+    assert_raises(out, "a=3 b=4");
+}

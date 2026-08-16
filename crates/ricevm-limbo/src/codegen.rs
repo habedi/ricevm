@@ -2380,9 +2380,10 @@ impl CodeGen {
                 // A tuple parameter occupies its whole width in the frame,
                 // and the caller packs it at exactly these offsets.
                 let (param_width, param_align) = match &param.ty {
-                    Type::Tuple(fields) => {
-                        (compute_tuple_layout(fields).size, type_size_align(&param.ty).1)
-                    }
+                    Type::Tuple(fields) => (
+                        compute_tuple_layout(fields).size,
+                        type_size_align(&param.ty).1,
+                    ),
                     _ => (kind.byte_size(), kind.byte_size()),
                 };
                 // The caller pads to the same boundary before storing, so both
@@ -4721,12 +4722,7 @@ impl CodeGen {
                                 }
                                 NumKind::Word => {
                                     self.gen_expr_to(inner, dst)?;
-                                    self.emit(
-                                        Opcode::Cvtwc,
-                                        op_fp(dst),
-                                        mid_unused(),
-                                        op_fp(dst),
-                                    );
+                                    self.emit(Opcode::Cvtwc, op_fp(dst), mid_unused(), op_fp(dst));
                                 }
                             }
                         }

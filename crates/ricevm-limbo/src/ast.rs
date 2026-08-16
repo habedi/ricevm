@@ -335,8 +335,9 @@ pub enum Expr {
     Load(Box<Type>, Box<Expr>, Span),
     /// `array[size] of type`
     ArrayAlloc(Box<Expr>, Box<Type>, Span),
-    /// `array of { elements }`
-    ArrayLit(Vec<Expr>, Option<Box<Type>>, Span),
+    /// `array[size] of { elements }` — `size` is absent for `array[] of {..}`
+    /// and `array of {..}`, where the length follows from the elements.
+    ArrayLit(Option<Box<Expr>>, Vec<ArrayElem>, Option<Box<Type>>, Span),
     /// `chan of type`
     ChanAlloc(Box<Type>, Span),
     /// `list of { elements }`
@@ -365,6 +366,25 @@ pub enum Expr {
     PostInc(Box<Expr>, Span),
     /// Postfix decrement: `expr--`
     PostDec(Box<Expr>, Span),
+}
+
+/// One element of an array literal. Limbo lets an element name the index it
+/// initialises, so dropping the selector silently shifts every value.
+#[derive(Debug, Clone)]
+pub struct ArrayElem {
+    /// `None` for a positional element.
+    pub index: Option<ArrayIndex>,
+    pub value: Expr,
+}
+
+/// The index selector of an array-literal element.
+#[derive(Debug, Clone)]
+pub enum ArrayIndex {
+    /// One or more selectors joined by `or`, each a single index or a `lo to
+    /// hi` range: `'a' to 'z' or 'A' to 'Z' or '_' => v`.
+    Selectors(Vec<(Expr, Option<Expr>)>),
+    /// `* => v`: every index not named by another element.
+    Wildcard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

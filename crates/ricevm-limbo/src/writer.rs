@@ -245,12 +245,17 @@ fn write_data_item(buf: &mut Vec<u8>, item: &DataItem) -> Result<(), WriteError>
             buf.extend_from_slice(&element_type.to_be_bytes());
             buf.extend_from_slice(&length.to_be_bytes());
         }
-        DataItem::SetArray { offset: _, index } => {
+        // Every data item carries an offset operand after its header, this one
+        // included: the reader consumes it unconditionally, so omitting it here
+        // desynchronised the whole data section.
+        DataItem::SetArray { offset, index } => {
             buf.push((6 << 4) | 1);
+            write_op(buf, *offset)?;
             buf.extend_from_slice(&index.to_be_bytes());
         }
         DataItem::RestoreBase => {
-            buf.push(7 << 4);
+            buf.push((7 << 4) | 1);
+            write_op(buf, 0)?;
         }
         DataItem::Bigs { offset, values } => {
             write_data_header(buf, 8, values.len() as i32, *offset)?;

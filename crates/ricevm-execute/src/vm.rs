@@ -32,10 +32,13 @@ pub(crate) struct VmState<'m> {
     /// Whether the mark-and-sweep pass runs (`--no-gc` / `RICEVM_NO_GC` clears it).
     ///
     /// Debug use only. `Heap::dec_ref` deliberately does not cascade into record,
-    /// array or ADT buffers, because it cannot tell a pointer slot from a
-    /// coincidental byte pattern (see `Heap::child_refs`), so the collector is the
-    /// only thing that reclaims what those buffers own. With it off, a program
-    /// that builds such structures leaks without bound.
+    /// array or ADT buffers: a pointer map says which words *may* hold pointers,
+    /// not that a reference was taken when one was stored, and the block-write
+    /// paths take none (see `Heap::child_refs`). The collector is therefore
+    /// still the only thing that reclaims what those buffers own, and with it
+    /// off a program that builds such structures leaks without bound. What the
+    /// pointer maps did change is the other direction: the collector no longer
+    /// retains an object because a byte or `real` word happened to equal its id.
     pub gc_enabled: bool,
     pub(crate) gc_counter: usize,
     /// Index of the currently executing loaded module (None = main module).
@@ -511,14 +514,52 @@ impl<'m> VmState<'m> {
 
     /// Get the type descriptor size for the currently executing module.
     pub(crate) fn current_type_size(&self, type_idx: usize) -> Option<usize> {
+        self.current_type(type_idx).map(|td| td.size as usize)
+    }
+
+    /// Get a type descriptor of the currently executing module.
+    fn current_type(&self, type_idx: usize) -> Option<&ricevm_core::TypeDescriptor> {
         if let Some(lm_idx) = self.current_loaded_module {
             self.loaded_modules
                 .get(lm_idx)
                 .and_then(|lm| lm.module.types.get(type_idx))
-                .map(|td| td.size as usize)
         } else {
-            self.module.types.get(type_idx).map(|td| td.size as usize)
+            self.module.types.get(type_idx)
         }
+    }
+
+    /// The pointer map of a type of the currently executing module.
+    ///
+    /// A `HeapObject`'s type index cannot be resolved after the fact -- index 3
+    /// means one thing in the main module and another in each loaded one -- so
+    /// an allocation resolves its descriptor here, while the module is still
+    /// known, and carries the resulting map. Maps are interned per
+    /// `(module, type)` so the many objects of one type share one.
+    pub(crate) fn trace_map_for_type(
+        &mut self,
+        type_idx: usize,
+    ) -> Option<std::sync::Arc<heap::TraceMap>> {
+        let key = (self.current_module_virt_idx(), type_idx as u32);
+        if let Some(map) = self.heap.trace_map(key) {
+            return Some(map);
+        }
+        let td = self.current_type(type_idx)?;
+        let map = heap::TraceMap::new(&td.pointer_map.bytes, td.size as usize);
+        Some(self.heap.intern_trace_map(key, map))
+    }
+
+    /// Run a mark-and-sweep pass over this thread's and every suspended
+    /// thread's roots.
+    pub(crate) fn collect_garbage(&mut self) {
+        crate::gc::collect(
+            &mut self.heap,
+            &self.frames,
+            &self.mp,
+            &self.loaded_modules,
+            &self.thread_queue,
+            &self.caller_mp_stack,
+            &self.heap_refs,
+        );
     }
 
     /// Check if a type (by index) contains any pointer fields.
@@ -612,15 +653,7 @@ impl<'m> VmState<'m> {
                 self.gc_counter += 1;
                 if self.gc_counter >= GC_INTERVAL {
                     self.gc_counter = 0;
-                    crate::gc::collect(
-                        &mut self.heap,
-                        &self.frames,
-                        &self.mp,
-                        &self.loaded_modules,
-                        &self.thread_queue,
-                        &self.caller_mp_stack,
-                        &self.heap_refs,
-                    );
+                    self.collect_garbage();
                 }
             }
         }

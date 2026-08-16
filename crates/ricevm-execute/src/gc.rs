@@ -83,6 +83,11 @@ fn scan_heap_refs(refs: &[(HeapId, usize)], heap: &Heap, marked: &mut HashSet<He
 }
 
 /// Push every word-aligned value in `buf` that names a live heap object.
+///
+/// The conservative scan: used for roots (frames, MPs, module data), which are
+/// untyped as far as the collector is concerned, and for heap objects whose
+/// layout is unknown. It cannot tell a pointer from an `int` that happens to
+/// equal a live id, so it errs towards retaining.
 fn collect_ids(buf: &[u8], heap: &Heap, out: &mut Vec<HeapId>) {
     let mut offset = 0;
     while offset + 4 <= buf.len() {
@@ -91,6 +96,21 @@ fn collect_ids(buf: &[u8], heap: &Heap, out: &mut Vec<HeapId>) {
             out.push(word);
         }
         offset += 4;
+    }
+}
+
+/// Push the ids held in the words `map` marks as pointers.
+///
+/// The precise scan: only reachable for objects allocated against a type
+/// descriptor, where the module states which words are pointers. `contains` is
+/// still checked, because a pointer slot may hold a stale id -- pointers are
+/// not cleared when their object goes away.
+fn collect_mapped_ids(buf: &[u8], map: &crate::heap::TraceMap, heap: &Heap, out: &mut Vec<HeapId>) {
+    for offset in map.pointer_offsets(buf.len()) {
+        let word = memory::read_word(buf, offset) as u32;
+        if word != NIL && heap.contains(word) {
+            out.push(word);
+        }
     }
 }
 
@@ -108,7 +128,14 @@ fn mark_all(mut worklist: Vec<HeapId>, heap: &Heap, marked: &mut HashSet<HeapId>
         let Some(obj) = heap.get(id) else { continue };
         match &obj.data {
             HeapData::Record(data) | HeapData::Array { data, .. } | HeapData::Adt { data, .. } => {
-                collect_ids(data, heap, &mut worklist);
+                // `new`/`newa` resolve the allocating module's type descriptor
+                // and hang the pointer map on the object; everything else --
+                // the records the runtime builds for itself, module data
+                // arrays -- has no map and keeps the conservative scan.
+                match &obj.trace {
+                    Some(map) => collect_mapped_ids(data, map, heap, &mut worklist),
+                    None => collect_ids(data, heap, &mut worklist),
+                }
             }
             HeapData::List { head, tail } => {
                 collect_ids(head, heap, &mut worklist);
@@ -477,6 +504,157 @@ mod tests {
             .expect("spawn marking thread")
             .join()
             .expect("marking a long list must not overflow the stack");
+    }
+
+    /// Root `id` in a fresh frame stack and collect.
+    fn collect_with_root(heap: &mut Heap, id: HeapId) {
+        let mut frames = FrameStack::new();
+        frames.push_entry(16, -1);
+        let off = frames.current_data_offset();
+        memory::write_word(&mut frames.data, off, id as i32);
+        collect(
+            heap,
+            &frames,
+            &[],
+            &[],
+            &std::collections::VecDeque::new(),
+            &[],
+            &[],
+        );
+    }
+
+    /// `sys->read` fills an `array of byte` with whatever the file holds, and
+    /// four of those bytes can spell out a live id by pure coincidence. The
+    /// element type says the array has no pointers, so nothing in it is one.
+    #[test]
+    fn gc_does_not_retain_a_data_word_that_only_looks_like_an_id() {
+        let mut heap = Heap::new();
+        let victim = heap.alloc(0, HeapData::Str("not referenced by anyone".to_string()));
+        let mut data = vec![0u8; 8];
+        memory::write_word(&mut data, 0, victim as i32);
+        let buf = heap.alloc_typed(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 1,
+                data,
+                length: 8,
+            },
+            // `array of byte`: element size 1, no pointer map.
+            Some(std::sync::Arc::new(crate::heap::TraceMap::new(&[], 1))),
+        );
+
+        collect_with_root(&mut heap, buf);
+
+        assert!(heap.contains(buf), "the rooted array must survive");
+        assert!(
+            !heap.contains(victim),
+            "a byte pattern in a pointerless array is data, not a reference"
+        );
+    }
+
+    #[test]
+    fn gc_retains_an_id_in_a_mapped_pointer_slot() {
+        let mut heap = Heap::new();
+        let field = heap.alloc(0, HeapData::Str("the record's ref field".to_string()));
+        let coincidence = heap.alloc(0, HeapData::Str("an int that looks like an id".to_string()));
+        let mut data = vec![0u8; 8];
+        memory::write_word(&mut data, 0, coincidence as i32);
+        memory::write_word(&mut data, 4, field as i32);
+        // A record of two words whose second word is the only pointer.
+        let record = heap.alloc_typed(
+            0,
+            HeapData::Record(data),
+            Some(std::sync::Arc::new(crate::heap::TraceMap::new(&[0x40], 8))),
+        );
+
+        collect_with_root(&mut heap, record);
+
+        assert!(
+            heap.contains(field),
+            "an id in a mapped pointer slot must keep its object alive"
+        );
+        assert!(
+            !heap.contains(coincidence),
+            "an id-shaped value in a non-pointer slot must not retain anything"
+        );
+    }
+
+    #[test]
+    fn gc_traces_the_mapped_slot_of_every_array_element() {
+        let mut heap = Heap::new();
+        // `array of ref R` where R's word 0 is a pointer and word 1 is not.
+        let mut data = vec![0u8; 24];
+        let mut fields = Vec::new();
+        for element in 0..3usize {
+            let field = heap.alloc(0, HeapData::Str(format!("element {element}")));
+            let junk = heap.alloc(0, HeapData::Str(format!("junk {element}")));
+            memory::write_word(&mut data, element * 8, field as i32);
+            memory::write_word(&mut data, element * 8 + 4, junk as i32);
+            fields.push((field, junk));
+        }
+        let array = heap.alloc_typed(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 8,
+                data,
+                length: 3,
+            },
+            Some(std::sync::Arc::new(crate::heap::TraceMap::new(&[0x80], 8))),
+        );
+
+        collect_with_root(&mut heap, array);
+
+        for (element, (field, junk)) in fields.into_iter().enumerate() {
+            assert!(
+                heap.contains(field),
+                "element {element}'s pointer slot must be traced"
+            );
+            assert!(
+                !heap.contains(junk),
+                "element {element}'s data slot must not be traced"
+            );
+        }
+    }
+
+    /// Precision must not lose reachability: a chain that runs through mapped
+    /// slots of several objects has to be marked to the end.
+    #[test]
+    fn gc_follows_a_chain_of_mapped_objects() {
+        let mut heap = Heap::new();
+        let map = std::sync::Arc::new(crate::heap::TraceMap::new(&[0x80], 4));
+        let leaf = heap.alloc(0, HeapData::Str("leaf".to_string()));
+        let mut middle_data = vec![0u8; 4];
+        memory::write_word(&mut middle_data, 0, leaf as i32);
+        let middle = heap.alloc_typed(0, HeapData::Record(middle_data), Some(map.clone()));
+        let mut root_data = vec![0u8; 4];
+        memory::write_word(&mut root_data, 0, middle as i32);
+        let root = heap.alloc_typed(0, HeapData::Record(root_data), Some(map));
+
+        collect_with_root(&mut heap, root);
+
+        assert!(heap.contains(middle), "the middle record must survive");
+        assert!(heap.contains(leaf), "the leaf must survive");
+    }
+
+    /// Objects allocated without a descriptor -- strings, list nodes, channels,
+    /// the records the runtime builds for itself -- keep the conservative scan.
+    /// Freeing more than the old collector did is only safe where a map says so.
+    #[test]
+    fn gc_scans_a_buffer_with_no_map_conservatively() {
+        let mut heap = Heap::new();
+        let child = heap.alloc(0, HeapData::Str("reached only by a raw word".to_string()));
+        let mut data = vec![0u8; 8];
+        memory::write_word(&mut data, 4, child as i32);
+        let record = heap.alloc(0, HeapData::Record(data));
+
+        collect_with_root(&mut heap, record);
+
+        assert!(
+            heap.contains(child),
+            "without a map every word is a candidate pointer"
+        );
     }
 
     #[test]

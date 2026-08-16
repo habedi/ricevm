@@ -717,3 +717,883 @@ init(nil: ref Draw->Context, nil: list of string)
     );
     assert_raises(out, "v=42");
 }
+
+// ── module-level initialisers in a module with no `init` ────────
+
+/// A module-level array initialiser is a *constant* in Limbo: the reference
+/// compiler accepts it (`initable`, nodes.c:168-186), writes it into the `.dis`
+/// data section (`disvar`/`disdatum`, dis.c:138) and the loader materialises it
+/// when it builds the module's MP — no code runs. So it needs no `init`
+/// function, and reading it back must give the written elements.
+#[test]
+fn module_level_array_literal_is_materialised_from_the_data_section() {
+    let out = run_src(
+        r#"implement T;
+tab := array[] of {11, 22, 33};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string tab[0] + "," + string tab[2] + " n=" + string len tab;
+}
+"#,
+    );
+    assert_raises(out, "v=11,33 n=3");
+}
+
+/// A sized allocation with no elements is initable too, and its elements read
+/// back as zero.
+#[test]
+fn module_level_sized_array_needs_no_init_function() {
+    let out = run_src(
+        r#"implement T;
+Cache: module {
+    lookup: fn(): int;
+};
+tab := array[4] of int;
+lookup(): int
+{
+    return len tab + tab[3];
+}
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string lookup();
+}
+"#,
+    );
+    assert_raises(out, "v=4");
+}
+
+/// An array of strings lands in the data section as well.
+#[test]
+fn module_level_string_array_is_materialised_from_the_data_section() {
+    let out = run_src(
+        r#"implement T;
+names := array[] of {"concat", "join"};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + names[1] + names[0];
+}
+"#,
+    );
+    assert_raises(out, "v=joinconcat");
+}
+
+/// The module in the corpus that motivated this has *no* `init` at all, which
+/// used to be rejected outright. It must now compile.
+#[test]
+fn module_without_init_accepts_a_constant_array_initialiser() {
+    let module = ricevm_limbo::compile(
+        r#"implement GenCP;
+GenCP: module {
+    cstab: array of int;
+};
+cstab := array[] of {16r00, 16r01, 16r02};
+"#,
+        "test.b",
+    )
+    .expect("a constant array initialiser needs no init function");
+    assert!(
+        module
+            .data
+            .iter()
+            .any(|d| matches!(d, ricevm_core::DataItem::Array { length: 3, .. })),
+        "the initialiser must be emitted into the data section"
+    );
+}
+
+/// A genuinely non-constant initialiser in a module with no `init` stays a
+/// hard error — the reference rejects it too ("x's initializer, f(), is not a
+/// constant expression", nodes.c:196).
+#[test]
+fn module_without_init_still_rejects_a_computed_initialiser() {
+    let err = ricevm_limbo::compile(
+        r#"implement T;
+T: module {
+    f: fn(): int;
+};
+x := f();
+f(): int
+{
+    return 1;
+}
+"#,
+        "test.b",
+    )
+    .unwrap_err();
+    assert!(err.contains("init"), "unexpected error: {err}");
+}
+
+/// `array[n] of {..}` has length `n`, not the number of elements written. The
+/// parser used to throw the declared size away.
+#[test]
+fn sized_array_literal_keeps_its_declared_length() {
+    let out = run_src(
+        r#"implement T;
+u := array[6] of {byte 3, byte 4};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "n=" + string len u + " u1=" + string int u[1] + " u5=" + string int u[5];
+}
+"#,
+    );
+    assert_raises(out, "n=6 u1=4 u5=0");
+}
+
+/// Array-literal elements may name the index they initialise, including a
+/// `* => v` default for everything else. Dropping the selectors packed the
+/// values in declaration order — silently the wrong table.
+#[test]
+fn indexed_array_literal_places_elements_at_their_index() {
+    let out = run_src(
+        r#"implement T;
+Naughty: con 9;
+t := array[8] of {'a' - 'a' + 1 => byte 1, 3 => byte 2, * => byte Naughty};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "n=" + string len t + " " + string int t[0] + string int t[1]
+        + string int t[2] + string int t[3];
+}
+"#,
+    );
+    assert_raises(out, "n=8 9192");
+}
+
+/// `lo to hi => v` fills the whole range.
+#[test]
+fn ranged_array_literal_fills_the_range() {
+    let out = run_src(
+        r#"implement T;
+t := array[5] of {1 to 3 => 7};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string t[0] + string t[1] + string t[3] + string t[4];
+}
+"#,
+    );
+    assert_raises(out, "v=0770");
+}
+
+// ── qualified constants in constant expressions ─────────────────
+
+/// `Udphdrsize: con IP->Udphdrlen + 8;` — a `Mod->NAME` reference has to fold
+/// inside another constant's expression, not just at ordinary use sites.
+#[test]
+fn qualified_constant_folds_inside_a_constant_expression() {
+    let out = run_src(
+        r#"implement T;
+IP: module {
+    Udphdrlen: con 12;
+};
+Udphdrsize: con IP->Udphdrlen + 8;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string Udphdrsize;
+}
+"#,
+    );
+    assert_raises(out, "v=20");
+}
+
+/// `len` of a constant string is itself a constant, so it may appear in a
+/// `con` declaration (appl/cmd/auth/aescbc.b does exactly this).
+#[test]
+fn len_of_a_constant_string_folds() {
+    let out = run_src(
+        r#"implement T;
+Checkpat: con "AESCBC";
+Checklen: con len Checkpat;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string Checklen;
+}
+"#,
+    );
+    assert_raises(out, "v=6");
+}
+
+/// An imported constant whose value the compiler cannot represent (an
+/// ADT- or tuple-valued `con`) must say so at the use site. It must not be
+/// reported as a missing member — the module does declare it — and above all
+/// it must not quietly become zero.
+#[test]
+fn imported_unrepresentable_constant_is_reported_at_its_use_site() {
+    let err = ricevm_limbo::compile(
+        r#"implement T;
+Fs: module {
+    Nilentry: con (nil, nil, 0);
+};
+fs: Fs;
+Nilentry: import fs;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := Nilentry;
+}
+"#,
+        "test.b",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("Nilentry") && !err.contains("not a member"),
+        "unexpected error: {err}"
+    );
+}
+
+// ── cross-module calls through any module handle ────────────────
+
+/// A call through a module handle that is not spelled `sys` must actually
+/// reach the module. Before the fix only the literal name `sys` was routed to
+/// the cross-module call path; every other handle fell through to `Movw $0`,
+/// so this program silently saw `0` instead of the module's answer.
+#[test]
+fn call_through_a_non_sys_module_handle_reaches_the_module() {
+    let out = run_src(
+        r#"implement T;
+Sys: module {
+    PATH: con "$Sys";
+    print: fn(s: string, *): int;
+};
+s: Sys;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    s = load Sys Sys->PATH;
+    n := s->print("hi\n");
+    raise "n=" + string n;
+}
+"#,
+    );
+    assert_raises(out, "n=3");
+}
+
+/// The unqualified spelling of the same call — `import` routes it through the
+/// very same path, so a handle that is not `sys` must work there too.
+#[test]
+fn imported_call_through_a_non_sys_handle_reaches_the_module() {
+    let out = run_src(
+        r#"implement T;
+Sys: module {
+    PATH: con "$Sys";
+    print: fn(s: string, *): int;
+};
+s: Sys;
+print: import s;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    s = load Sys Sys->PATH;
+    n := print("hi\n");
+    raise "n=" + string n;
+}
+"#,
+    );
+    assert_raises(out, "n=3");
+}
+
+/// A call through a name that is not a module variable must fail loudly. The
+/// old code emitted nothing at all for it, so the program ran on with a zero
+/// where the module's answer belonged.
+#[test]
+fn call_through_an_unknown_module_handle_is_an_error() {
+    let err = ricevm_limbo::compile(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    bufio->open("x", 0);
+}
+"#,
+        "test.b",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("bufio"),
+        "the error must name the unresolved handle: {err}"
+    );
+}
+
+/// Calling a function through an interface *name* has no module reference to
+/// call through; the reference compiler rejects it (typecheck.c:1459).
+#[test]
+fn call_through_an_interface_name_is_an_error() {
+    let err = ricevm_limbo::compile(
+        r#"implement T;
+Bufio: module {
+    open: fn(name: string, mode: int): int;
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    Bufio->open("x", 0);
+}
+"#,
+        "test.b",
+    )
+    .unwrap_err();
+    assert!(err.contains("module interface"), "unexpected error: {err}");
+}
+
+/// `Mod->NAME` for a name the interface does not declare used to become
+/// `Movw $0`. A wrong constant is worse than no program.
+#[test]
+fn unknown_qualified_name_is_an_error_not_a_zero() {
+    let err = ricevm_limbo::compile(
+        r#"implement T;
+Fs: module {
+    Real: con 7;
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := Fs->Imaginary;
+    raise "x=" + string x;
+}
+"#,
+        "test.b",
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("Imaginary"),
+        "the error must name the missing member: {err}"
+    );
+}
+
+/// `Mod->PATH` must be the module's declared `PATH`, not a `$Mod` guess. A
+/// `load` of the wrong path silently yields nil, and every call through the
+/// handle then faults far from the cause.
+#[test]
+fn qualified_path_uses_the_declared_constant() {
+    let module = ricevm_limbo::compile(
+        r#"implement T;
+Bufio: module {
+    PATH: con "/dis/lib/bufio.dis";
+};
+b: Bufio;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    b = load Bufio Bufio->PATH;
+}
+"#,
+        "test.b",
+    )
+    .expect("should compile");
+    let strings: Vec<&str> = module
+        .data
+        .iter()
+        .filter_map(|d| match d {
+            ricevm_core::DataItem::String { value, .. } => Some(value.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        strings.contains(&"/dis/lib/bufio.dis"),
+        "the declared PATH must reach the data section, got {strings:?}"
+    );
+}
+
+// ── `implement X` brings X's own interface into scope ────────────
+
+/// Compile `src` with `interfaces` written into a temporary include
+/// directory, then run it. `implement X; include "x.m";` is the shape every
+/// real Limbo program has, so testing that scope rule needs a real `.m`.
+fn run_with_includes(src: &str, interfaces: &[(&str, &str)]) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "ricevm-limbo-inc-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    for (name, body) in interfaces {
+        std::fs::write(dir.join(name), body).map_err(|e| e.to_string())?;
+    }
+    let opts = ricevm_limbo::CompileOptions {
+        include_paths: vec![dir.to_string_lossy().into_owned()],
+    };
+    let module = ricevm_limbo::compile_with_options(src, "test.b", &opts)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    match ricevm_execute::execute(&module) {
+        Ok(()) => Err("program exited without raising a result".to_string()),
+        Err(e) => Ok(e.to_string()),
+    }
+}
+
+/// A constant declared in the interface this file implements is in scope
+/// unqualified. Before the fix it was reported as an undefined identifier,
+/// which is why `STATFIXLEN` and friends failed across the corpus.
+#[test]
+fn implement_brings_its_own_interface_constants_into_scope() {
+    let out = run_with_includes(
+        r#"implement Styx;
+include "styx.m";
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string STATFIXLEN;
+}
+"#,
+        &[(
+            "styx.m",
+            r#"Styx: module {
+    STATFIXLEN: con 49;
+    init: fn(ctxt: ref Draw->Context, argv: list of string);
+};
+"#,
+        )],
+    );
+    assert_raises(out, "v=49");
+}
+
+/// An ADT declared in the implemented interface is in scope unqualified, and
+/// its *layout* comes across too — a record built from a guessed layout reads
+/// its own fields back wrong.
+#[test]
+fn implement_brings_its_own_interface_adts_into_scope() {
+    let out = run_with_includes(
+        r#"implement Styxservers;
+include "styxservers.m";
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := ref Xfid(7, 9);
+    raise "v=" + string (x.fid + x.mode);
+}
+"#,
+        &[(
+            "styxservers.m",
+            r#"Styxservers: module {
+    Xfid: adt {
+        fid: int;
+        mode: int;
+    };
+    init: fn(ctxt: ref Draw->Context, argv: list of string);
+};
+"#,
+        )],
+    );
+    assert_raises(out, "v=16");
+}
+
+/// An ADT reached through another module's interface must use that module's
+/// real field layout, not a positional guess.
+#[test]
+fn qualified_interface_adt_has_a_real_layout() {
+    let out = run_with_includes(
+        r#"implement T;
+include "bufio.m";
+init(nil: ref Draw->Context, nil: list of string)
+{
+    b := ref Bufio->Iobuf(3, 5, 11);
+    raise "v=" + string (b.fid + b.size + b.mode);
+}
+"#,
+        &[(
+            "bufio.m",
+            r#"Bufio: module {
+    Iobuf: adt {
+        fid: int;
+        size: int;
+        mode: int;
+    };
+};
+"#,
+        )],
+    );
+    assert_raises(out, "v=19");
+}
+
+/// Calling a function that is not declared anywhere used to emit nothing at
+/// all, so the program ran on as if the call had happened.
+#[test]
+fn calling_an_undefined_function_is_an_error() {
+    let err = ricevm_limbo::compile(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    nosuchfunction(1, 2);
+}
+"#,
+        "test.b",
+    )
+    .unwrap_err();
+    assert!(err.contains("nosuchfunction"), "unexpected error: {err}");
+}
+
+// ── type descriptors ────────────────────────────────────────────
+
+/// Read back the type descriptor an instruction refers to.
+fn descriptor_of(module: &ricevm_core::Module, idx: i32) -> &ricevm_core::TypeDescriptor {
+    module
+        .types
+        .get(idx as usize)
+        .unwrap_or_else(|| panic!("type index {idx} is outside the descriptor table"))
+}
+
+/// `new` used to hardcode type index 1 — the 48-byte sys call frame — so any
+/// ADT bigger than 48 bytes was silently truncated, and the collector traced
+/// every record at the frame's pointer offsets instead of the record's own.
+#[test]
+fn record_allocation_uses_the_adts_own_descriptor() {
+    let module = ricevm_limbo::compile(
+        r#"implement T;
+Big: adt {
+    a: string;
+    b: int;
+    c: string;
+    d: int;
+    e: int;
+    f: int;
+    g: int;
+    h: int;
+    i: int;
+    j: int;
+    k: int;
+    l: int;
+    m: int;
+    n: int;
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := ref Big;
+}
+"#,
+        "test.b",
+    )
+    .expect("should compile");
+    let new = module
+        .code
+        .iter()
+        .find(|i| i.opcode == ricevm_core::Opcode::New)
+        .expect("a `ref Adt` must allocate a record");
+    let td = descriptor_of(&module, new.source.register1);
+    // 14 four-byte fields.
+    assert_eq!(td.size, 56, "descriptor must be the ADT's own size");
+    // Pointers at byte offsets 0 and 8 -> words 0 and 2 -> MSB-first bits
+    // 0x80 and 0x20 in the first map byte.
+    assert_eq!(
+        td.pointer_map.bytes,
+        vec![0xA0, 0x00],
+        "pointer map must mark the string fields, MSB first"
+    );
+    assert_eq!(td.pointer_count, 2);
+}
+
+/// A record's fields must survive a round trip through the heap. With the
+/// 48-byte descriptor, field 13 of this ADT lived past the end of the object.
+#[test]
+fn record_larger_than_the_old_fixed_size_keeps_its_fields() {
+    let out = run_src(
+        r#"implement T;
+Big: adt {
+    a, b, c, d, e, f, g, h, i, j, k, l, m, n: int;
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := ref Big;
+    x.a = 1;
+    x.n = 42;
+    raise "v=" + string x.n + "," + string x.a;
+}
+"#,
+    );
+    assert_raises(out, "v=42,1");
+}
+
+/// `newa` used type descriptor 0 — 16-byte elements with a pointer at offset
+/// 0 — for every runtime array. A `byte` array was four times too big and the
+/// collector read a "pointer" out of every fourth element.
+#[test]
+fn array_allocation_uses_an_element_sized_descriptor() {
+    let module = ricevm_limbo::compile(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    b := array[4] of byte;
+    w := array[4] of int;
+    s := array[4] of string;
+}
+"#,
+        "test.b",
+    )
+    .expect("should compile");
+    let newas: Vec<_> = module
+        .code
+        .iter()
+        .filter(|i| i.opcode == ricevm_core::Opcode::Newa)
+        .collect();
+    assert_eq!(newas.len(), 3, "one Newa per array");
+    let sizes: Vec<i32> = newas
+        .iter()
+        .map(|i| descriptor_of(&module, i.middle.register1).size)
+        .collect();
+    assert_eq!(sizes, vec![1, 4, 4], "byte/int/string element widths");
+    let byte_td = descriptor_of(&module, newas[0].middle.register1);
+    assert_eq!(byte_td.pointer_count, 0, "bytes are not pointers");
+    let str_td = descriptor_of(&module, newas[2].middle.register1);
+    assert_eq!(str_td.pointer_count, 1, "string elements are pointers");
+    assert_eq!(str_td.pointer_map.bytes, vec![0x80]);
+}
+
+/// A byte array must hold `len` bytes, not `len` 16-byte slots, and index by
+/// one byte per element.
+#[test]
+fn runtime_byte_array_indexes_by_one_byte() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    b := array[4] of byte;
+    b[0] = byte 7;
+    b[3] = byte 9;
+    raise "v=" + string int b[0] + "," + string int b[3] + ",n=" + string len b;
+}
+"#,
+    );
+    assert_raises(out, "v=7,9,n=4");
+}
+
+/// Pointer-map bits are most-significant-bit first, as `types.c` in the
+/// reference compiler writes them: word `n` of the record is bit
+/// `1 << (7 - n % 8)` of byte `n / 8`. A pointer past the eighth word is what
+/// tells the two bit orders apart.
+#[test]
+fn pointer_map_bits_are_most_significant_bit_first() {
+    let module = ricevm_limbo::compile(
+        r#"implement T;
+Wide: adt {
+    a, b, c, d, e, f, g, h, i: int;
+    p: string;
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := ref Wide;
+}
+"#,
+        "test.b",
+    )
+    .expect("should compile");
+    let new = module
+        .code
+        .iter()
+        .find(|i| i.opcode == ricevm_core::Opcode::New)
+        .expect("a `ref Adt` must allocate a record");
+    let td = descriptor_of(&module, new.source.register1);
+    assert_eq!(td.size, 40);
+    // The pointer is word 9: byte 1, bit 1 << (7 - 1) = 0x40.
+    assert_eq!(
+        td.pointer_map.bytes,
+        vec![0x00, 0x40],
+        "LSB-first would have produced 0x02 in byte 1"
+    );
+    assert_eq!(td.pointer_count, 1);
+}
+
+/// A `big` field is 8-byte aligned, so it occupies two map words and pushes
+/// the fields after it along. The descriptor has to agree with the offsets
+/// the field writes use, or the collector reads pointers out of halves of a
+/// 64-bit integer.
+#[test]
+fn descriptor_agrees_with_eight_byte_field_alignment() {
+    let module = ricevm_limbo::compile(
+        r#"implement T;
+Mixed: adt {
+    n: int;
+    v: big;
+    s: string;
+};
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := ref Mixed;
+}
+"#,
+        "test.b",
+    )
+    .expect("should compile");
+    let new = module
+        .code
+        .iter()
+        .find(|i| i.opcode == ricevm_core::Opcode::New)
+        .expect("a `ref Adt` must allocate a record");
+    let td = descriptor_of(&module, new.source.register1);
+    // n at 0, v at 8 (aligned), s at 16.
+    assert_eq!(td.size, 20);
+    assert_eq!(td.pointer_map.bytes, vec![0x08], "the string is word 4");
+    assert_eq!(td.pointer_count, 1);
+}
+
+// ── ADT function members ────────────────────────────────────────
+
+/// `p.sum(5)` on an ADT this module declares is a call to `Point.sum` with
+/// `p` supplied as the `self` parameter. It used to compile to nothing at
+/// all in statement position, and to a zero in value position.
+#[test]
+fn adt_function_member_is_called_with_self() {
+    let out = run_src(
+        r#"implement T;
+Point: adt {
+    x, y: int;
+    sum: fn(p: self ref Point, k: int): int;
+};
+Point.sum(p: self ref Point, k: int): int
+{
+    return p.x + p.y + k;
+}
+init(nil: ref Draw->Context, nil: list of string)
+{
+    p := ref Point(3, 4);
+    raise "v=" + string p.sum(5);
+}
+"#,
+    );
+    assert_raises(out, "v=12");
+}
+
+/// A function member declared without `self` is called through the ADT name.
+#[test]
+fn adt_function_member_without_self_is_called_through_the_type() {
+    let out = run_src(
+        r#"implement T;
+Point: adt {
+    x, y: int;
+    make: fn(k: int): int;
+};
+Point.make(k: int): int
+{
+    return k * 3;
+}
+init(nil: ref Draw->Context, nil: list of string)
+{
+    raise "v=" + string Point.make(7);
+}
+"#,
+    );
+    assert_raises(out, "v=21");
+}
+
+/// An ADT that belongs to another module is implemented by that module, so
+/// its function members are reached by a cross-module call. The .dis export
+/// for one is named `Adt.method`, which is what the import entry has to say.
+#[test]
+fn foreign_adt_function_member_is_a_cross_module_call() {
+    let module = ricevm_limbo::compile(
+        r#"implement T;
+Bufio: module {
+    PATH: con "/dis/lib/bufio.dis";
+    Iobuf: adt {
+        fd: int;
+        gets: fn(b: self ref Iobuf, sep: int): string;
+    };
+    open: fn(name: string, mode: int): ref Iobuf;
+};
+bufio: Bufio;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    bufio = load Bufio Bufio->PATH;
+    b := bufio->open("x", 0);
+    s := b.gets('\n');
+}
+"#,
+        "test.b",
+    )
+    .expect("should compile");
+    let names: Vec<&str> = module
+        .imports
+        .iter()
+        .flat_map(|m| m.functions.iter().map(|f| f.name.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"Iobuf.gets"),
+        "the import entry must name the ADT method as the .dis export does, got {names:?}"
+    );
+    assert!(
+        module
+            .code
+            .iter()
+            .filter(|i| i.opcode == ricevm_core::Opcode::Mcall)
+            .count()
+            >= 2,
+        "both `bufio->open` and `b.gets` must be cross-module calls"
+    );
+}
+
+/// `b: self ref Iobuf` declares one parameter of type `ref Iobuf`, not a
+/// double reference. Getting that wrong loses the ADT the method belongs to.
+#[test]
+fn self_parameter_keeps_its_declared_type() {
+    let out = run_src(
+        r#"implement T;
+Point: adt {
+    x: int;
+    get: fn(p: self ref Point): int;
+};
+Point.get(p: self ref Point): int
+{
+    return p.x;
+}
+init(nil: ref Draw->Context, nil: list of string)
+{
+    p := ref Point(11);
+    raise "v=" + string p.get();
+}
+"#,
+    );
+    assert_raises(out, "v=11");
+}
+
+// ── array literals outside a declaration ────────────────────────
+
+/// `a := array[] of {1, 2, 3}` inside a function used to compile to `Movw $0`
+/// — the local silently became nil, and every element read faulted or
+/// answered zero.
+#[test]
+fn array_literal_in_an_expression_builds_a_real_array() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    a := array[] of {1, 2, 3};
+    raise "v=" + string a[0] + string a[1] + string a[2] + ",n=" + string len a;
+}
+"#,
+    );
+    assert_raises(out, "v=123,n=3");
+}
+
+/// A declared length wins over the number of elements, and an element may
+/// name the index it initialises.
+#[test]
+fn array_literal_honours_its_length_and_indices() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    b := array[4] of {2 => 7, 0 => 5};
+    raise "v=" + string b[0] + string b[1] + string b[2] + ",n=" + string len b;
+}
+"#,
+    );
+    assert_raises(out, "v=507,n=4");
+}
+
+/// String elements are heap pointers and must be stored with the
+/// ref-counting move, not a raw word copy.
+#[test]
+fn array_literal_of_strings_holds_its_strings() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    a := array[] of {"ab", "cd"};
+    raise "v=" + a[0] + a[1];
+}
+"#,
+    );
+    assert_raises(out, "v=abcd");
+}
+
+/// `* => v` fills every slot the other elements do not name, including in a
+/// literal built at run time.
+#[test]
+fn array_literal_wildcard_default_fills_the_rest() {
+    let out = run_src(
+        r#"implement T;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    n := 4;
+    a := array[n] of {1 => 9, * => 2};
+    raise "v=" + string a[0] + string a[1] + string a[2] + string a[3];
+}
+"#,
+    );
+    assert_raises(out, "v=2922");
+}

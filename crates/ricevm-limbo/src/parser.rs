@@ -745,13 +745,6 @@ impl Parser {
         }
 
         loop {
-            let is_self = if self.at(&TokenKind::Self_) {
-                self.advance();
-                true
-            } else {
-                false
-            };
-
             // Check for varargs: *, in param list
             if self.at(&TokenKind::Star) {
                 self.advance();
@@ -777,8 +770,14 @@ impl Parser {
                 }
             }
 
-            // Expect : type
+            // Expect : type. The receiver of an ADT function member is
+            // spelled `b: self ref Iobuf` — `self` sits between the colon and
+            // the type, marking the parameter without changing it.
             self.expect(&TokenKind::Colon)?;
+            let is_self = self.at(&TokenKind::Self_);
+            if is_self {
+                self.advance();
+            }
             let ty = self.parse_type()?;
 
             params.push(Param {
@@ -926,10 +925,12 @@ impl Parser {
                     })
                 }
             }
+            // `self` only marks a parameter as the receiver; the type that
+            // follows is the parameter's own. Wrapping it in another `ref`
+            // made `b: self ref Iobuf` a `ref ref Iobuf`, which named no ADT.
             TokenKind::Self_ => {
                 self.advance();
-                let inner = self.parse_type()?;
-                Type::Ref(Box::new(inner)) // self Type is sugar for ref Type
+                self.parse_type()?
             }
             _ => {
                 return Err(self.err(format!("expected type, got {:?}", self.peek())));
@@ -1857,9 +1858,9 @@ impl Parser {
                         self.expect(&TokenKind::Of)?;
                         if self.at(&TokenKind::LBrace) {
                             self.advance();
-                            let elems = self.parse_expr_list()?;
+                            let elems = self.parse_array_elem_list()?;
                             self.expect(&TokenKind::RBrace)?;
-                            Ok(Expr::ArrayLit(elems, None, span))
+                            Ok(Expr::ArrayLit(None, elems, None, span))
                         } else {
                             let ty = self.parse_type()?;
                             Ok(Expr::ArrayAlloc(
@@ -1874,9 +1875,11 @@ impl Parser {
                         self.expect(&TokenKind::Of)?;
                         if self.at(&TokenKind::LBrace) {
                             self.advance();
-                            let elems = self.parse_expr_list()?;
+                            let elems = self.parse_array_elem_list()?;
                             self.expect(&TokenKind::RBrace)?;
-                            Ok(Expr::ArrayLit(elems, None, span))
+                            // The declared size is the array's length; the
+                            // elements only say what goes where inside it.
+                            Ok(Expr::ArrayLit(Some(Box::new(size)), elems, None, span))
                         } else {
                             let ty = self.parse_type()?;
                             Ok(Expr::ArrayAlloc(Box::new(size), Box::new(ty), span))
@@ -1987,6 +1990,66 @@ impl Parser {
             }
             _ => Err(self.err(format!("unexpected token in expression: {:?}", self.peek()))),
         }
+    }
+
+    /// Parse the element list of an array literal.
+    fn parse_array_elem_list(&mut self) -> Result<Vec<ArrayElem>, ParseError> {
+        let mut elems = Vec::new();
+        if self.at(&TokenKind::RBrace) {
+            return Ok(elems);
+        }
+        elems.push(self.parse_array_elem()?);
+        while self.at(&TokenKind::Comma) {
+            self.advance();
+            if self.at(&TokenKind::RBrace) {
+                break;
+            }
+            elems.push(self.parse_array_elem()?);
+        }
+        Ok(elems)
+    }
+
+    /// Parse one array-literal element: `expr`, `k => expr`, `k1 or k2 =>
+    /// expr`, `lo to hi => expr`, or `* => expr`. The index selector is part of
+    /// the element's meaning, so it is kept rather than discarded.
+    fn parse_array_elem(&mut self) -> Result<ArrayElem, ParseError> {
+        if self.at(&TokenKind::Star) {
+            self.advance();
+            self.expect(&TokenKind::FatArrow)?;
+            return Ok(ArrayElem {
+                index: Some(ArrayIndex::Wildcard),
+                value: self.parse_expr()?,
+            });
+        }
+        let first = self.parse_expr()?;
+        if !self.at(&TokenKind::To) && !self.at(&TokenKind::Or) && !self.at(&TokenKind::FatArrow) {
+            return Ok(ArrayElem {
+                index: None,
+                value: first,
+            });
+        }
+        // A selector list: single indices and `lo to hi` ranges joined by `or`.
+        let mut selectors = Vec::new();
+        let mut lo = first;
+        loop {
+            let hi = if self.at(&TokenKind::To) {
+                self.advance();
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            selectors.push((lo, hi));
+            if !self.at(&TokenKind::Or) {
+                break;
+            }
+            self.advance();
+            lo = self.parse_expr()?;
+        }
+        self.expect(&TokenKind::FatArrow)?;
+        Ok(ArrayElem {
+            index: Some(ArrayIndex::Selectors(selectors)),
+            value: self.parse_expr()?,
+        })
     }
 
     /// Parse an expression that may be a qualified initializer:

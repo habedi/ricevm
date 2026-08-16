@@ -4,9 +4,77 @@
 //! Pointers in frames are stored as `Word` (i32) and cast to `HeapId` via `as u32`.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Handle to a heap-allocated object. 0 = nil.
 pub(crate) type HeapId = u32;
+
+/// Identifies a type descriptor: `(module virtual index, type index)`.
+///
+/// A bare type index is ambiguous -- index 3 of the main module and index 3 of
+/// a loaded module describe different types -- so interned maps are keyed by
+/// the module that supplied them. See `VmState::current_module_virt_idx`.
+pub(crate) type TypeKey = (usize, u32);
+
+/// Which words of a heap object's buffer hold traced pointers.
+///
+/// Built once per type from the allocating module's `TypeDescriptor`, then
+/// shared (`Arc`) by every object of that type. The bit order is the one the
+/// .dis format uses: the Limbo compiler sets
+/// `map[offset / 32] |= 1 << (7 - (offset / 4) % 8)` (`limbo/types.c`,
+/// `tdescmap`), and the reference collector reads it back the same way
+/// (`markheap` and `freeptrs` in `libinterp`). Checked against the 160 Inferno
+/// modules under `external/`: of 19,825 set bits, every one names a word
+/// inside its type when read most-significant-bit first, while reading it
+/// least-significant-bit first puts 3,279 of them outside the type entirely.
+#[derive(Debug)]
+pub(crate) struct TraceMap {
+    /// Byte offsets, within one element, of the words that hold pointers.
+    offsets: Vec<usize>,
+    /// Byte size of one element. A record has a single element; an array
+    /// repeats the map every `stride` bytes.
+    stride: usize,
+}
+
+impl TraceMap {
+    /// Build a map from a type descriptor's pointer map and element size.
+    pub fn new(map_bytes: &[u8], stride: usize) -> Self {
+        let mut offsets = Vec::new();
+        for (byte_idx, &map_byte) in map_bytes.iter().enumerate() {
+            for bit in 0..8usize {
+                if map_byte & (0x80 >> bit) == 0 {
+                    continue;
+                }
+                let offset = (byte_idx * 8 + bit) * 4;
+                // A bit past the end of the element describes nothing; it must
+                // not be projected onto the following element.
+                if offset + 4 <= stride {
+                    offsets.push(offset);
+                }
+            }
+        }
+        Self { offsets, stride }
+    }
+
+    /// Byte offsets of the pointer words in a buffer of `buf_len` bytes.
+    pub fn pointer_offsets(&self, buf_len: usize) -> impl Iterator<Item = usize> + '_ {
+        // `div_ceil` rather than `/`: a buffer that does not divide evenly into
+        // elements still has pointer slots in its last, partial element, and
+        // every offset is bounds-checked below anyway.
+        let elements = if self.stride == 0 {
+            0
+        } else {
+            buf_len.div_ceil(self.stride)
+        };
+        (0..elements).flat_map(move |element| {
+            let base = element * self.stride;
+            self.offsets
+                .iter()
+                .map(move |offset| base + offset)
+                .filter(move |offset| offset + 4 <= buf_len)
+        })
+    }
+}
 
 /// The nil heap pointer.
 pub(crate) const NIL: HeapId = 0;
@@ -80,6 +148,12 @@ pub(crate) enum HeapData {
 pub(crate) struct HeapObject {
     pub ref_count: u32,
     pub type_id: u32,
+    /// Which words of this object's buffer hold pointers, resolved from the
+    /// allocating module's type descriptor at allocation time -- the only
+    /// moment at which both the type index and the module are known.
+    /// `None` means the layout is unknown and the buffer is scanned
+    /// conservatively (`gc::mark_all`).
+    pub trace: Option<Arc<TraceMap>>,
     pub data: HeapData,
 }
 
@@ -87,6 +161,8 @@ pub(crate) struct HeapObject {
 pub(crate) struct Heap {
     objects: HashMap<HeapId, HeapObject>,
     next_id: HeapId,
+    /// One `TraceMap` per type, shared by every object of that type.
+    trace_maps: HashMap<TypeKey, Arc<TraceMap>>,
 }
 
 impl Heap {
@@ -94,11 +170,22 @@ impl Heap {
         Self {
             objects: HashMap::new(),
             next_id: HEAP_ID_BASE,
+            trace_maps: HashMap::new(),
         }
     }
 
-    /// Allocate a new heap object. Returns its HeapId.
+    /// Allocate a new heap object with no known layout. Returns its HeapId.
     pub fn alloc(&mut self, type_id: u32, data: HeapData) -> HeapId {
+        self.alloc_typed(type_id, data, None)
+    }
+
+    /// Allocate a new heap object, recording which of its words are pointers.
+    pub fn alloc_typed(
+        &mut self,
+        type_id: u32,
+        data: HeapData,
+        trace: Option<Arc<TraceMap>>,
+    ) -> HeapId {
         let id = self.next_id;
         self.next_id += 1;
         self.objects.insert(
@@ -106,10 +193,24 @@ impl Heap {
             HeapObject {
                 ref_count: 1,
                 type_id,
+                trace,
                 data,
             },
         );
         id
+    }
+
+    /// The interned map for a type, if one has been built already.
+    pub fn trace_map(&self, key: TypeKey) -> Option<Arc<TraceMap>> {
+        self.trace_maps.get(&key).cloned()
+    }
+
+    /// Intern a type's map so every object of that type can share it.
+    pub fn intern_trace_map(&mut self, key: TypeKey, map: TraceMap) -> Arc<TraceMap> {
+        self.trace_maps
+            .entry(key)
+            .or_insert_with(|| Arc::new(map))
+            .clone()
     }
 
     /// Get a reference to a heap object. Returns None for NIL or freed objects.
@@ -161,25 +262,29 @@ impl Heap {
     /// - `List::tail` — every cons op inc_refs the tail (ops/list.rs).
     /// - `ArraySlice::parent_id` — `slicea` inc_refs the parent (ops/pointer.rs).
     ///
-    /// *Not* cascaded: the raw byte buffers of `List` heads, records, arrays,
-    /// ADTs and channel payloads. Those are untyped memory, and a word inside
-    /// them that happens to name a live object is not evidence of a reference:
+    /// *Not* cascaded: the byte buffers of `List` heads, records, arrays, ADTs
+    /// and channel payloads -- including the slots a `TraceMap` marks as
+    /// pointers. The map is a statement about *layout*, not about ownership:
+    /// it says a word may hold a pointer, not that a reference was taken when
+    /// one was stored there. Nothing on the block-write paths counts:
     /// - `cons_bytes` copies the head block verbatim and inc_refs only the
     ///   tail, so `l = rec :: l` puts `rec`'s pointer fields in the head with
     ///   no reference taken on them.
     /// - `heap_write`/`array_write`/`movm` fill records and arrays with bytes
-    ///   that were never ref counted -- a `sys->read` into an `array of byte`
-    ///   can spell out a live id by pure coincidence.
-    /// - an array of `real` would be scanned as two ids per element.
+    ///   that were never ref counted -- `sys->pipe` writes two FD records
+    ///   straight into the guest's `array of ref Sys->FD` this way.
+    /// - the reverse direction is uncounted too: `movm` and `headm` copy a
+    ///   block *out* of an object into a frame, duplicating any pointer in it,
+    ///   and `op_ret` does not release a frame's pointers (ops/control.rs), so
+    ///   there is no balancing release to pair a cascade with.
     ///
-    /// Distinguishing genuine pointer slots needs the module's type descriptor
-    /// pointer maps, which the heap cannot reach: `HeapObject::type_id` is a
-    /// bare per-module type index (`op_new` records it without any module
-    /// identity) and list nodes carry no descriptor at all. The pointers that
-    /// buffers do own -- those stored by `movp` or by `movmp`'s pointer-map
-    /// walk -- therefore leak here; the mark-and-sweep pass in `gc.rs` is the
-    /// backstop that reclaims them, and a leak the collector can clean up is
-    /// strictly safer than a reference released twice.
+    /// Making this precise means ref counting every one of those paths in both
+    /// directions; until then the pointers a buffer owns -- those stored by
+    /// `movp`, or by `movmp`'s pointer-map walk -- are reclaimed by the
+    /// mark-and-sweep pass in `gc.rs` instead, which since it traces mapped
+    /// objects precisely no longer keeps them alive on a coincidence. A leak
+    /// the collector can clean up is strictly safer than a reference released
+    /// twice.
     fn child_refs(&self, data: &HeapData, out: &mut Vec<HeapId>) {
         match data {
             HeapData::List { tail, .. } => {
@@ -1029,6 +1134,64 @@ mod tests {
         assert_eq!(heap.get(victim).unwrap().ref_count, 1);
     }
 
+    /// Tracing is precise; releasing still is not, and the two are deliberately
+    /// asymmetric. A pointer map says which words *may* hold a pointer, not
+    /// that a reference was taken when one was stored there: `heap_write`,
+    /// `array_write`, `movm` and `cons_bytes` all copy bytes without counting
+    /// anything. Cascading here on the strength of the map alone would release
+    /// references that were never acquired.
+    #[test]
+    fn dec_ref_does_not_cascade_through_a_mapped_pointer_slot() {
+        let mut heap = Heap::new();
+        let child = heap.alloc(0, HeapData::Str("named by a pointer slot".to_string()));
+        let mut data = vec![0u8; 4];
+        crate::memory::write_word(&mut data, 0, child as i32);
+        let record = heap.alloc_typed(
+            0,
+            HeapData::Record(data),
+            Some(Arc::new(TraceMap::new(&[0x80], 4))),
+        );
+
+        heap.dec_ref(record);
+
+        assert!(!heap.contains(record));
+        assert_eq!(
+            heap.get(child).map(|obj| obj.ref_count),
+            Some(1),
+            "a mapped slot is not proof that this object owns the reference"
+        );
+    }
+
+    /// `sys->pipe` writes two FD records straight into the guest's
+    /// `array of ref Sys->FD` with `array_write`, taking no reference on
+    /// either. The slots are mapped -- the collector traces them -- but the
+    /// array does not own them.
+    #[test]
+    fn dec_ref_does_not_cascade_through_a_mapped_array_element() {
+        let mut heap = Heap::new();
+        let fd = heap.alloc(0, HeapData::Record(vec![0; 4]));
+        let mut data = vec![0u8; 8];
+        crate::memory::write_word(&mut data, 0, fd as i32);
+        let fds = heap.alloc_typed(
+            0,
+            HeapData::Array {
+                elem_type: 0,
+                elem_size: 4,
+                data,
+                length: 2,
+            },
+            Some(Arc::new(TraceMap::new(&[0x80], 4))),
+        );
+
+        heap.dec_ref(fds);
+
+        assert!(!heap.contains(fds));
+        assert!(
+            heap.contains(fd),
+            "an uncounted store must not become a counted release"
+        );
+    }
+
     #[test]
     fn dec_ref_keeps_shared_children_alive() {
         let mut heap = Heap::new();
@@ -1065,6 +1228,98 @@ mod tests {
             "a child with remaining references must stay alive"
         );
         assert_eq!(heap.get(shared_tail).unwrap().ref_count, 2);
+    }
+
+    /// The .dis type descriptor map is most-significant-bit first: the Limbo
+    /// compiler sets `map[offset/32] |= 1 << (7 - (offset/4) % 8)`
+    /// (`limbo/types.c`), and the reference collector reads it back the same
+    /// way (`markheap`, `freeptrs` in `libinterp`). Reading it the other way
+    /// round names slots that are not pointers, which is the difference
+    /// between freeing garbage and freeing a live object.
+    #[test]
+    fn trace_map_reads_the_pointer_map_most_significant_bit_first() {
+        let map = TraceMap::new(&[0x80], 16);
+        assert_eq!(map.pointer_offsets(16).collect::<Vec<_>>(), vec![0]);
+
+        let map = TraceMap::new(&[0x40], 16);
+        assert_eq!(map.pointer_offsets(16).collect::<Vec<_>>(), vec![4]);
+
+        let map = TraceMap::new(&[0x01], 32);
+        assert_eq!(map.pointer_offsets(32).collect::<Vec<_>>(), vec![28]);
+
+        let map = TraceMap::new(&[0x00, 0x80], 40);
+        assert_eq!(map.pointer_offsets(40).collect::<Vec<_>>(), vec![32]);
+    }
+
+    #[test]
+    fn trace_map_without_pointers_names_no_slots() {
+        // An `array of byte` element type: size 1, no map at all.
+        let map = TraceMap::new(&[], 1);
+        assert!(map.pointer_offsets(64).next().is_none());
+    }
+
+    #[test]
+    fn trace_map_repeats_once_per_array_element() {
+        // Three elements of a type whose word 0 is a pointer and word 1 is not.
+        let map = TraceMap::new(&[0x80], 8);
+        assert_eq!(map.pointer_offsets(24).collect::<Vec<_>>(), vec![0, 8, 16]);
+    }
+
+    #[test]
+    fn trace_map_ignores_slots_outside_the_buffer() {
+        // A partial trailing element must not name a slot past the buffer.
+        let map = TraceMap::new(&[0xC0], 8);
+        assert_eq!(map.pointer_offsets(12).collect::<Vec<_>>(), vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn trace_map_ignores_map_bits_past_the_element() {
+        // A bit for word 3 of a 8-byte element describes no slot of that
+        // element and must not be projected onto the next one.
+        let map = TraceMap::new(&[0x90], 8);
+        assert_eq!(map.pointer_offsets(16).collect::<Vec<_>>(), vec![0, 8]);
+    }
+
+    #[test]
+    fn trace_map_with_zero_stride_names_no_slots() {
+        // A zero-sized element type would otherwise loop forever.
+        let map = TraceMap::new(&[0x80], 0);
+        assert!(map.pointer_offsets(64).next().is_none());
+    }
+
+    #[test]
+    fn alloc_records_no_trace_map_by_default() {
+        let mut heap = Heap::new();
+        let id = heap.alloc(0, HeapData::Record(vec![0; 16]));
+        assert!(
+            heap.get(id).unwrap().trace.is_none(),
+            "an allocation with no known descriptor stays conservatively scanned"
+        );
+    }
+
+    #[test]
+    fn alloc_typed_keeps_the_trace_map_on_the_object() {
+        let mut heap = Heap::new();
+        let map = std::sync::Arc::new(TraceMap::new(&[0x40], 8));
+        let id = heap.alloc_typed(0, HeapData::Record(vec![0; 8]), Some(map));
+        let trace = heap.get(id).unwrap().trace.as_ref().expect("map kept");
+        assert_eq!(trace.pointer_offsets(8).collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn interned_trace_maps_are_shared_between_objects() {
+        let mut heap = Heap::new();
+        assert!(heap.trace_map((0, 7)).is_none());
+        let first = heap.intern_trace_map((0, 7), TraceMap::new(&[0x80], 4));
+        let second = heap.trace_map((0, 7)).expect("cached after interning");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "objects of one type must share a single map, not copy a Vec each"
+        );
+        assert!(
+            heap.trace_map((1, 7)).is_none(),
+            "type index 7 of another module is a different type"
+        );
     }
 
     #[test]

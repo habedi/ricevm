@@ -8,7 +8,7 @@ use ricevm_core::{
 };
 
 use crate::ast::*;
-use crate::symtab::{ConstValue, Symbol, SymbolTable};
+use crate::symtab::{ConstValue, ResolvedType, Symbol, SymbolTable};
 use crate::token::Span;
 
 /// Value type tracking for selecting correct Dis opcodes.
@@ -114,7 +114,7 @@ fn decl_array_elem_type(v: &VarDecl) -> Option<Type> {
         return Some((**elem).clone());
     }
     match v.init.as_ref()? {
-        Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) => Some((**ty).clone()),
+        Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, _, Some(ty), _) => Some((**ty).clone()),
         Expr::Cast(ty, _, _) => match ty.as_ref() {
             Type::Array(elem) => Some((**elem).clone()),
             _ => None,
@@ -170,7 +170,7 @@ fn compute_adt_layout(adt: &AdtDecl) -> Vec<(String, Type, i32)> {
             };
             let (size, align) = type_size_align(&ty);
             // Round `off` up to alignment.
-            off = (off + align - 1) & !(align - 1);
+            off = align_up(off, align);
             for name in &v.names {
                 fields.push((name.clone(), ty.clone(), off));
                 off += size;
@@ -178,6 +178,46 @@ fn compute_adt_layout(adt: &AdtDecl) -> Vec<(String, Type, i32)> {
         }
     }
     fields
+}
+
+/// The storage shape of a record built from an ADT declaration.
+///
+/// `pick` variants are laid out after the common fields, and the record has to
+/// be big enough for the largest of them — a record sized for the common
+/// fields alone would have its variant fields written past its end. The
+/// variants' pointer slots are all marked, which over-approximates for any one
+/// variant and is the safe direction for tracing.
+fn compute_adt_shape(adt: &AdtDecl) -> RecordShape {
+    let common = compute_adt_layout(adt);
+    let mut ptr_offsets: Vec<i32> = Vec::new();
+    let mut end = 0i32;
+    for (_, ty, off) in &common {
+        end = end.max(off + type_size_align(ty).0);
+        if type_is_ptr(ty) {
+            ptr_offsets.push(*off);
+        }
+    }
+    let base = align_up(end, 8);
+    let mut size = end;
+    for case in adt.pick.iter().flatten() {
+        let mut off = base;
+        for field in &case.fields {
+            let Some(ty) = &field.ty else { continue };
+            let (fsize, align) = type_size_align(ty);
+            off = align_up(off, align);
+            for _ in &field.names {
+                if type_is_ptr(ty) {
+                    ptr_offsets.push(off);
+                }
+                off += fsize;
+            }
+        }
+        size = size.max(off);
+    }
+    RecordShape {
+        size: align_up(size, 4),
+        ptr_offsets,
+    }
 }
 
 /// Pick the Newc* opcode for a channel of the given element BasicType.
@@ -197,6 +237,73 @@ fn sys_return_kind(name: &str) -> NumKind {
         // big-returning sys builtins (per sys.m signatures)
         "seek" => NumKind::Big,
         _ => NumKind::Word,
+    }
+}
+
+/// Fallback shape of a `$Sys` function's return value, used only when the
+/// interface behind the handle could not be read.
+fn sys_return_val_type(name: &str) -> ValType {
+    match name {
+        "fildes" | "open" | "create" | "fstat" | "stat" | "dirread" | "dial" | "announce"
+        | "listen" => ValType::Ptr,
+        _ => ValType::Word,
+    }
+}
+
+/// Name the expression form that has no lowering, so the diagnostic points at
+/// the missing feature rather than merely at the file.
+fn describe_expr_kind(expr: &Expr) -> &'static str {
+    match expr {
+        Expr::ArrayLit(_, _, _, _) => "an array literal outside a declaration",
+        Expr::Tuple(_, _) => "a tuple value",
+        Expr::TupleDeclAssign(_, _, _) => "a tuple `:=` used as an expression",
+        Expr::Tagof(_, _) => "`tagof`",
+        Expr::Slice(_, _, _, _) => "slicing",
+        _ => "this expression",
+    }
+}
+
+/// Name what could not be lowered about a call, so the reader knows which
+/// feature is missing rather than only that "something" is.
+fn unsupported_call_target(callee: &Expr) -> String {
+    match callee {
+        Expr::Dot(_, method, _) => {
+            format!("calling the ADT function member `{method}` is not supported yet")
+        }
+        Expr::Index(_, _, _) => {
+            "calling a function held in an array element is not supported yet".to_string()
+        }
+        _ => "unsupported call target".to_string(),
+    }
+}
+
+/// The ADT a resolved interface type names, peeling `ref`, `array of` and
+/// `list of` wrappers the way `adt_name_for_type` peels their AST forms.
+fn resolved_adt_name(ty: &ResolvedType) -> Option<String> {
+    match ty {
+        ResolvedType::Adt(name) => Some(name.rsplit('.').next().unwrap_or(name).to_string()),
+        ResolvedType::Ref(inner) | ResolvedType::Array(inner) | ResolvedType::List(inner) => {
+            resolved_adt_name(inner)
+        }
+        _ => None,
+    }
+}
+
+/// Slot width of a resolved interface type.
+fn resolved_num_kind(ty: &ResolvedType) -> NumKind {
+    match ty {
+        ResolvedType::Big => NumKind::Big,
+        ResolvedType::Real => NumKind::Real,
+        _ => NumKind::Word,
+    }
+}
+
+/// Storage shape of a resolved interface type.
+fn resolved_val_type(ty: &ResolvedType) -> ValType {
+    match ty {
+        ResolvedType::Array(_) => ValType::Array,
+        _ if ty.is_ptr() => ValType::Ptr,
+        _ => ValType::Word,
     }
 }
 
@@ -319,6 +426,171 @@ pub(crate) fn fold_const_binary(
     }
 }
 
+/// The storage class of an array element, which fixes both the element width
+/// and whether the collector has to trace it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ElemKind {
+    Byte,
+    Word,
+    Big,
+    Real,
+    Ptr,
+}
+
+impl ElemKind {
+    fn of(ty: &Type) -> Self {
+        match ty {
+            Type::Basic(BasicType::Byte) => ElemKind::Byte,
+            Type::Basic(BasicType::Int) => ElemKind::Word,
+            Type::Basic(BasicType::Big) => ElemKind::Big,
+            Type::Basic(BasicType::Real) => ElemKind::Real,
+            Type::Basic(BasicType::String) => ElemKind::Ptr,
+            _ => ElemKind::Ptr,
+        }
+    }
+
+    /// Element kind implied by the literal's values when no type was written.
+    fn of_values(values: &[ConstVal]) -> Self {
+        if values.iter().any(|v| matches!(v, ConstVal::Str(_))) {
+            ElemKind::Ptr
+        } else if values.iter().any(|v| matches!(v, ConstVal::Real(_))) {
+            ElemKind::Real
+        } else {
+            ElemKind::Word
+        }
+    }
+
+    fn byte_size(self) -> i32 {
+        match self {
+            ElemKind::Byte => 1,
+            ElemKind::Big | ElemKind::Real => 8,
+            _ => 4,
+        }
+    }
+
+    fn is_ptr(self) -> bool {
+        self == ElemKind::Ptr
+    }
+
+    /// The Limbo basic type an element of this width reads back as.
+    fn basic(self) -> BasicType {
+        match self {
+            ElemKind::Byte => BasicType::Byte,
+            ElemKind::Word => BasicType::Int,
+            ElemKind::Big => BasicType::Big,
+            ElemKind::Real => BasicType::Real,
+            ElemKind::Ptr => BasicType::String,
+        }
+    }
+}
+
+/// A type the module needs a descriptor for.
+///
+/// Descriptor indices are only settled once every function's frame descriptor
+/// exists, which is after all code has been emitted — so instructions that
+/// name a descriptor are emitted with a placeholder and patched from this key.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum TypeKey {
+    /// A record laid out by an ADT declaration.
+    Adt(String),
+    /// One element of an array of primitives or pointers.
+    Elem(ElemKind),
+    /// A record whose layout is not known. Traced conservatively.
+    OpaqueRecord,
+}
+
+/// Which operand of an instruction carries a type index.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypeOperand {
+    Source,
+    Middle,
+}
+
+/// A record's storage shape: total size in bytes and the byte offsets of the
+/// words that hold heap pointers.
+#[derive(Clone, Debug, Default)]
+struct RecordShape {
+    size: i32,
+    ptr_offsets: Vec<i32>,
+}
+
+/// Does a field of this type hold a heap pointer?
+///
+/// The classification has to match the moves the field writes use: a slot
+/// written with `movp` holds an id the collector must follow, and a slot the
+/// map claims is a pointer but which holds an `int` is merely retained (the
+/// collector checks the id is live), so erring towards "pointer" is safe.
+fn type_is_ptr(ty: &Type) -> bool {
+    !matches!(
+        ty,
+        Type::Basic(BasicType::Int)
+            | Type::Basic(BasicType::Byte)
+            | Type::Basic(BasicType::Big)
+            | Type::Basic(BasicType::Real)
+    )
+}
+
+/// Round `off` up to a multiple of `align`.
+fn align_up(off: i32, align: i32) -> i32 {
+    (off + align - 1) & !(align - 1)
+}
+
+/// A pointer map over `size` bytes with the given pointer offsets, written
+/// most-significant-bit first: word `n` is bit `1 << (7 - n % 8)` of byte
+/// `n / 8`. This is the order `types.c` in the reference compiler emits and
+/// the order the VM's `TraceMap` reads.
+fn pointer_map_for(size: i32, offsets: &[i32]) -> PointerMap {
+    let words = (size.max(0) as usize).div_ceil(4);
+    let mut bytes = vec![0u8; words.div_ceil(8)];
+    for &off in offsets {
+        if off < 0 || off + 4 > size {
+            continue;
+        }
+        let word = (off / 4) as usize;
+        bytes[word / 8] |= 1 << (7 - word % 8);
+    }
+    PointerMap { bytes }
+}
+
+/// A module-level array initialiser folded to a data-section image.
+struct ConstArray {
+    elem: ElemKind,
+    len: i32,
+    values: Vec<ConstVal>,
+}
+
+fn is_byte_cast(e: &Expr) -> bool {
+    matches!(e, Expr::Cast(ty, _, _) if matches!(ty.as_ref(), Type::Basic(BasicType::Byte)))
+}
+
+fn const_word(v: &ConstVal) -> i32 {
+    match v {
+        ConstVal::Int(n) => *n as i32,
+        ConstVal::Real(n) => *n as i32,
+        ConstVal::Str(_) => 0,
+    }
+}
+
+fn const_byte(v: &ConstVal) -> u8 {
+    const_word(v) as u8
+}
+
+fn const_big(v: &ConstVal) -> i64 {
+    match v {
+        ConstVal::Int(n) => *n,
+        ConstVal::Real(n) => *n as i64,
+        ConstVal::Str(_) => 0,
+    }
+}
+
+fn const_real(v: &ConstVal) -> f64 {
+    match v {
+        ConstVal::Int(n) => *n as f64,
+        ConstVal::Real(n) => *n,
+        ConstVal::Str(_) => 0.0,
+    }
+}
+
 /// A name an `import` declaration put into unqualified scope.
 ///
 /// Limbo's `NAMES: import m;` takes either a module *variable* (`sys: Sys;
@@ -339,6 +611,21 @@ struct Imported {
     from_variable: bool,
 }
 
+/// One cross-module import block: the functions this module calls through a
+/// particular module *interface*.
+///
+/// The Dis import section has one block per imported module type; `load`
+/// names the block in its middle operand and `mframe`/`mcall` index into it,
+/// so both spellings have to agree on the same index. Keying by interface
+/// name (rather than by the handle variable, of which there may be several)
+/// is what makes them agree.
+struct ModuleImport {
+    /// Index of this block in `CodeGen::imports`.
+    index: usize,
+    /// Imported function name -> index within the block.
+    funcs: Vec<(String, usize)>,
+}
+
 /// Code generation context.
 pub struct CodeGen {
     code: Vec<Instruction>,
@@ -349,8 +636,16 @@ pub struct CodeGen {
     module_name: String,
     exports: Vec<ExportEntry>,
     imports: Vec<ImportModule>,
-    sys_path_mp: i32,
-    sys_mp_ref: i32,
+    /// Import blocks by module interface name, in allocation order.
+    module_imports: Vec<(String, ModuleImport)>,
+    /// Module-handle variables: variable name -> module interface name. A
+    /// call `h->f()` is a cross-module call through `h`'s storage slot, so
+    /// this is what tells `h->f()` apart from an undefined identifier.
+    module_handle_type: std::collections::HashMap<String, String>,
+    /// Names of `Mod: module { ... }` declarations in this file. Together
+    /// with the symbol table this distinguishes "interface name used where a
+    /// module variable is needed" from "undefined identifier".
+    module_decls: std::collections::HashSet<String>,
     /// Local variable table: name -> (fp offset, ValType, NumKind).
     /// NumKind is Word for non-numeric locals (strings, arrays, refs); only
     /// big/real locals carry a widened kind that sizes the slot and picks
@@ -358,7 +653,6 @@ pub struct CodeGen {
     locals: Vec<(String, i32, ValType, NumKind)>,
     next_local: i32,
     frame_size: i32,
-    sys_funcs: Vec<(String, usize)>,
     /// Local function table: name -> (pc, frame_size, return NumKind).
     /// The return kind picks the right Mov/Cvt opcode when copying the
     /// callee's return value into the caller's slot.
@@ -386,11 +680,32 @@ pub struct CodeGen {
     /// Built once from the AST so Dot/Arrow accesses can pick a kind-aware
     /// Mov opcode and the correct field offset instead of a heuristic.
     adt_layouts: std::collections::HashMap<String, Vec<(String, Type, i32)>>,
+    /// Storage shapes for the same ADTs: the size and pointer offsets each
+    /// record's type descriptor has to state.
+    adt_shapes: std::collections::HashMap<String, RecordShape>,
+    /// Function members declared by each ADT: ADT name -> method name ->
+    /// signature. The signature says whether the method takes a `self`
+    /// receiver and what it returns.
+    adt_methods: std::collections::HashMap<String, std::collections::HashMap<String, FuncSig>>,
+    /// The interface each ADT belongs to, for ADTs that come from one. A
+    /// method of a foreign ADT is implemented by that module, so calling it
+    /// is a cross-module call through a handle for that interface.
+    adt_owner: std::collections::HashMap<String, String>,
+    /// Declared return type of each function this file defines, so a local
+    /// whose value comes from a call knows which ADT it holds.
+    func_ret_types: std::collections::HashMap<String, Type>,
+    /// Type descriptors some instruction or data item needs, in first-use
+    /// order. Their indices are assigned by `build_types`.
+    needed_types: Vec<TypeKey>,
+    /// Instructions whose type-index operand is patched once the descriptor
+    /// table is laid out: `(code index, which operand, type)`.
+    pending_type_fixups: Vec<(usize, TypeOperand, TypeKey)>,
     /// Sidecar map for ADT-typed locals: local name -> ADT name. Lets Dot
     /// access resolve `local.field` to the right ADT layout.
     local_adt_type: std::collections::HashMap<String, String>,
-    /// Frame sizes for each compiled function, in order.
-    func_frames: Vec<i32>,
+    /// Frame shape for each compiled function, in order: `(size, byte
+    /// offsets of the slots known to hold pointers)`.
+    func_frames: Vec<(i32, Vec<i32>)>,
     /// Exception handlers for the module.
     handlers: Vec<ricevm_core::Handler>,
     /// Module-level variables: name -> (MP offset, ValType, NumKind). These
@@ -412,6 +727,11 @@ pub struct CodeGen {
     /// function compiles to the same cross-module call its qualified spelling
     /// `mod->f(...)` would produce.
     imported: std::collections::HashMap<String, Imported>,
+    /// Data items of kind `Array` whose element type descriptor is still to be
+    /// allocated: `(index into self.data, element kind)`. The descriptor table
+    /// is only laid out once every function's frame descriptor is known, so the
+    /// index is patched in at that point.
+    pending_array_elem_types: Vec<(usize, ElemKind)>,
     /// Module-level initialisers that are not compile-time constants. They
     /// are emitted at the top of the entry function, which runs before any
     /// other code in the module.
@@ -440,18 +760,24 @@ impl CodeGen {
             module_name: String::new(),
             exports: Vec::new(),
             imports: Vec::new(),
-            sys_path_mp: -1,
-            sys_mp_ref: -1,
+            module_imports: Vec::new(),
+            module_handle_type: std::collections::HashMap::new(),
+            module_decls: std::collections::HashSet::new(),
             locals: Vec::new(),
             next_local: 40,
             frame_size: 80,
-            sys_funcs: Vec::new(),
             func_table: Vec::new(),
             func_frames: Vec::new(),
             local_array_elem: std::collections::HashMap::new(),
             local_chan_elem: std::collections::HashMap::new(),
             pending_call_fixups: Vec::new(),
             adt_layouts: std::collections::HashMap::new(),
+            adt_shapes: std::collections::HashMap::new(),
+            adt_methods: std::collections::HashMap::new(),
+            adt_owner: std::collections::HashMap::new(),
+            func_ret_types: std::collections::HashMap::new(),
+            needed_types: Vec::new(),
+            pending_type_fixups: Vec::new(),
             local_adt_type: std::collections::HashMap::new(),
             func_tuple_ret: std::collections::HashMap::new(),
             handlers: Vec::new(),
@@ -460,6 +786,7 @@ impl CodeGen {
             qualified_consts: std::collections::HashMap::new(),
             symtab: None,
             imported: std::collections::HashMap::new(),
+            pending_array_elem_types: Vec::new(),
             pending_global_inits: Vec::new(),
             loop_stack: Vec::new(),
             pending_label: None,
@@ -480,19 +807,19 @@ impl CodeGen {
             .cloned()
             .unwrap_or_else(|| "Unknown".to_string());
 
-        self.sys_path_mp = self.intern_string("$Sys");
-        self.sys_mp_ref = self.alloc_mp(4);
         self.collect_strings(file);
         self.collect_adts(file);
         // `import` runs before constant folding: an imported constant has to
         // be usable inside another module-level constant expression.
         self.collect_imports(file)?;
+        // ... and `implement X` puts X's own interface in scope the same way,
+        // after explicit imports so an explicit one wins.
+        self.bind_implement_scope(file);
         // Module-level `con` values are folded once, up front, so use sites
         // can resolve them to literals; module-level variables get real MP
         // storage so every function sees the same slot.
         self.collect_consts(file);
         self.collect_globals(file)?;
-        self.imports.push(ImportModule { functions: vec![] });
 
         // Pre-scan to count functions and allocate type indices
         let funcs: Vec<&FuncDecl> = file
@@ -520,6 +847,9 @@ impl CodeGen {
             if let Some(Type::Tuple(fields)) = &func.sig.ret {
                 self.func_tuple_ret
                     .insert(full_name.clone(), fields.clone());
+            }
+            if let Some(ret) = &func.sig.ret {
+                self.func_ret_types.insert(full_name.clone(), ret.clone());
             }
             // PC = -1 placeholder, frame_size = 0 placeholder.
             self.func_table.push((full_name, -1, 0, ret_kind));
@@ -567,23 +897,31 @@ impl CodeGen {
         }
 
         self.build_types();
+        // The header always claims HAS_IMPORT, and the on-disk import section
+        // is only well formed (it ends with a null byte) when it holds at
+        // least one block. A module that calls out to nobody still gets an
+        // empty one.
+        if self.imports.is_empty() {
+            self.imports.push(ImportModule { functions: vec![] });
+        }
         // The entry frame must be described by the *entry function's* type
         // descriptor. Using the last generated function's descriptor only
         // happened to work while every frame was sized to the cumulative
         // maximum; with per-function frame sizes it would under- or
         // over-allocate the entry frame.
-        let entry_pc = self.exports.first().map(|e| e.pc).unwrap_or(0);
-        let entry_type = match self.exports.first() {
-            Some(e) => e.frame_type,
-            // No `init`: entry_pc falls back to 0, which is the first
-            // generated function, so use that function's descriptor.
-            None if !self.func_frames.is_empty() => 2,
-            None => 0,
+        // A module with no `init` has no entry point: the reference writes
+        // `-1, -1` for it (dis.c:110-120) and the loader accepts that for
+        // library modules. Pointing the entry at the first function instead
+        // named a function that was never meant to be the entry, and for a
+        // module that is nothing but data it named code that does not exist.
+        let (entry_pc, entry_type) = match self.exports.first() {
+            Some(e) => (e.pc, e.frame_type),
+            None => (-1, -1),
         };
         let max_frame = self
             .func_frames
             .iter()
-            .copied()
+            .map(|(size, _)| *size)
             .max()
             .unwrap_or(self.frame_size);
 
@@ -692,16 +1030,46 @@ impl CodeGen {
         }
     }
 
-    fn ensure_sys_func(&mut self, name: &str) -> usize {
-        if let Some((_, idx)) = self.sys_funcs.iter().find(|(n, _)| n == name) {
+    /// The import block for a module interface, creating it on first use.
+    ///
+    /// Returns the block's index, which is what `load` puts in its middle
+    /// operand so the runtime can map this module's function indices onto the
+    /// loaded module's exports.
+    fn ensure_module_import(&mut self, interface: &str) -> usize {
+        if let Some((_, imp)) = self.module_imports.iter().find(|(n, _)| n == interface) {
+            return imp.index;
+        }
+        let index = self.imports.len();
+        self.imports.push(ImportModule { functions: vec![] });
+        self.module_imports.push((
+            interface.to_string(),
+            ModuleImport {
+                index,
+                funcs: Vec::new(),
+            },
+        ));
+        index
+    }
+
+    /// The index of `name` within `interface`'s import block, adding it on
+    /// first use. `mframe`/`mcall` carry this index.
+    fn ensure_module_func(&mut self, interface: &str, name: &str) -> usize {
+        let block = self.ensure_module_import(interface);
+        let entry = self
+            .module_imports
+            .iter_mut()
+            .find(|(n, _)| n == interface)
+            .map(|(_, imp)| imp)
+            .expect("ensure_module_import just created the block");
+        if let Some((_, idx)) = entry.funcs.iter().find(|(n, _)| n == name) {
             return *idx;
         }
-        let idx = self.imports[0].functions.len();
-        self.imports[0].functions.push(ImportEntry {
+        let idx = entry.funcs.len();
+        entry.funcs.push((name.to_string(), idx));
+        self.imports[block].functions.push(ImportEntry {
             signature: 0,
             name: name.to_string(),
         });
-        self.sys_funcs.push((name.to_string(), idx));
         idx
     }
 
@@ -721,21 +1089,167 @@ impl CodeGen {
     fn collect_adts(&mut self, file: &SourceFile) {
         for decl in &file.decls {
             match decl {
-                Decl::Adt(adt) => {
-                    self.adt_layouts
-                        .insert(adt.name.clone(), compute_adt_layout(adt));
-                }
+                Decl::Adt(adt) => self.record_adt(adt, None, true),
                 Decl::Module(m) => {
+                    self.module_decls.insert(m.name.clone());
                     for member in &m.members {
                         if let ModuleMember::Adt(adt) = member {
-                            self.adt_layouts
-                                .insert(adt.name.clone(), compute_adt_layout(adt));
+                            self.record_adt(adt, Some(&m.name.clone()), true);
                         }
                     }
                 }
                 _ => {}
             }
         }
+        self.collect_interface_adts(file);
+    }
+
+    /// Remember one ADT's field layout and its storage shape. `overwrite`
+    /// distinguishes a declaration in this file, which is authoritative, from
+    /// an interface's, which only fills a name in if it is still free.
+    fn record_adt(&mut self, adt: &AdtDecl, owner: Option<&str>, overwrite: bool) {
+        if !overwrite && self.adt_layouts.contains_key(&adt.name) {
+            return;
+        }
+        self.adt_layouts
+            .insert(adt.name.clone(), compute_adt_layout(adt));
+        self.adt_shapes
+            .insert(adt.name.clone(), compute_adt_shape(adt));
+        let methods: std::collections::HashMap<String, FuncSig> = adt
+            .members
+            .iter()
+            .filter_map(|m| match m {
+                AdtMember::Func(sig) => Some((sig.name.clone(), sig.clone())),
+                _ => None,
+            })
+            .collect();
+        self.adt_methods.insert(adt.name.clone(), methods);
+        match owner {
+            Some(owner) => {
+                self.adt_owner.insert(adt.name.clone(), owner.to_string());
+            }
+            None => {
+                self.adt_owner.remove(&adt.name);
+            }
+        }
+    }
+
+    /// Take the field layouts of every ADT declared in an interface this file
+    /// can see.
+    ///
+    /// The module this file implements goes first, so its own names win: its
+    /// ADTs are the ones in unqualified scope. Other interfaces then fill in
+    /// the names still free, which is what makes `ref Bufio->Iobuf(...)` and
+    /// field access through it use the declared offsets rather than a
+    /// positional guess. A declaration in this file always wins over both.
+    fn collect_interface_adts(&mut self, file: &SourceFile) {
+        let Some(symtab) = self.symtab.as_ref() else {
+            return;
+        };
+        let implemented = file.implement.first().cloned();
+        let mut ordered: Vec<(&String, &std::collections::HashMap<String, AdtDecl>)> =
+            symtab.adt_decls.iter().collect();
+        // Deterministic order, with the implemented module ahead of the rest.
+        ordered.sort_by_key(|(name, _)| (implemented.as_ref() != Some(*name), (*name).clone()));
+        let decls: Vec<(String, AdtDecl)> = ordered
+            .into_iter()
+            .flat_map(|(module, adts)| {
+                let mut named: Vec<(&String, &AdtDecl)> = adts.iter().collect();
+                named.sort_by_key(|(n, _)| (*n).clone());
+                named
+                    .into_iter()
+                    .map(|(_, adt)| (module.clone(), adt.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for (module, adt) in &decls {
+            // The implemented module's own ADTs are compiled here, so they
+            // are not foreign: their methods are local functions.
+            let owner = (implemented.as_ref() != Some(module)).then_some(module.as_str());
+            self.record_adt(adt, owner, false);
+        }
+    }
+
+    /// Bind the members of the interface this file implements into
+    /// unqualified scope.
+    ///
+    /// Limbo makes a module's own interface visible without qualification
+    /// inside its implementation, which is why `STATFIXLEN`, `Rawimage` and
+    /// friends are legal bare names there. The binding reuses `import`'s
+    /// machinery, so a member resolves at its use site exactly as an imported
+    /// one does — including saying why an unrepresentable one cannot be used.
+    ///
+    /// Functions are deliberately left out: the implementation defines them,
+    /// so they resolve as local functions, and one it fails to define should
+    /// be reported as missing rather than as an uncallable import.
+    /// An explicit `import` wins, since it was written on purpose.
+    fn bind_implement_scope(&mut self, file: &SourceFile) {
+        let Some(module) = file.implement.first().cloned() else {
+            return;
+        };
+        let Some(symtab) = self.symtab.as_ref() else {
+            return;
+        };
+        let Some(members) = symtab.modules.get(&module) else {
+            return;
+        };
+        let names: Vec<String> = members
+            .iter()
+            .filter(|(_, sym)| !matches!(sym, Symbol::Func { .. }))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            self.imported.entry(name).or_insert_with(|| Imported {
+                module: module.clone(),
+                module_type: Some(module.clone()),
+                from_variable: false,
+            });
+        }
+    }
+
+    /// Is `name` the name of a module interface (as opposed to an ADT, a type
+    /// alias or nothing at all)?
+    ///
+    /// When the interface was never found — an `include` that is not on the
+    /// search path — there is no evidence either way, and the permissive
+    /// answer is the useful one: `sys: Sys;` still names a module handle even
+    /// if `sys.m` could not be read.
+    fn is_module_interface_name(&self, name: &str) -> bool {
+        if self.adt_layouts.contains_key(name) {
+            return false;
+        }
+        if self.module_decls.contains(name) {
+            return true;
+        }
+        match self.symtab.as_ref() {
+            Some(st) if st.modules.contains_key(name) => true,
+            Some(st) => !matches!(st.lookup(name), Some(Symbol::Type { .. })),
+            None => true,
+        }
+    }
+
+    /// Record `name` as a module handle when its declaration says so, either
+    /// through an explicit module type (`sys: Sys;`) or through the interface
+    /// a `load` names (`sys := load Sys Sys->PATH;`).
+    fn note_module_handle(&mut self, name: &str, ty: Option<&Type>, init: Option<&Expr>) {
+        let interface = match (ty, init) {
+            (Some(Type::Named(qn)), _) if qn.qualifier.is_none() => qn.name.clone(),
+            (_, Some(Expr::Load(load_ty, _, _))) => match load_ty.as_ref() {
+                Type::Named(qn) => qn.name.clone(),
+                _ => return,
+            },
+            _ => return,
+        };
+        if self.is_module_interface_name(&interface) {
+            self.module_handle_type.insert(name.to_string(), interface);
+        }
+    }
+
+    /// The interface member `handle->member` names, when the handle's
+    /// interface is known and was found.
+    fn handle_member(&self, handle: &str, member: &str) -> Option<&Symbol> {
+        let interface = self.module_handle_type.get(handle)?;
+        self.module_member(interface, member)
     }
 
     /// Resolve every `import` declaration, binding the imported names in
@@ -794,10 +1308,7 @@ impl CodeGen {
             if let Some(ty) = &module_type
                 && self.module_member(ty, name).is_none()
             {
-                return Err(format!(
-                    "`{name}` is not a member of module `{}`",
-                    imp.module
-                ));
+                return Err(self.not_a_member(name, &imp.module, ty));
             }
             self.imported.insert(
                 name.clone(),
@@ -831,6 +1342,16 @@ impl CodeGen {
     /// Look up a member of a module interface by interface name.
     fn module_member(&self, module_type: &str, member: &str) -> Option<&Symbol> {
         self.symtab.as_ref()?.lookup_qualified(module_type, member)
+    }
+
+    /// "X is not a member of m", naming the interface too when the operand was
+    /// a variable, so the reader knows which declaration to look at.
+    fn not_a_member(&self, member: &str, module: &str, module_type: &str) -> String {
+        if module == module_type {
+            format!("`{member}` is not a member of module `{module}`")
+        } else {
+            format!("`{member}` is not a member of module `{module}` (interface `{module_type}`)")
+        }
     }
 
     /// Fold every module-level `con` declaration into a literal value.
@@ -922,6 +1443,12 @@ impl CodeGen {
                 let r = self.fold_const(rhs, iota)?;
                 fold_const_binary(&l, *op, &r)
             }
+            // `len` of a constant string is a constant. Limbo counts
+            // characters, not bytes.
+            Expr::Len(inner, _) => match self.fold_const(inner, iota)? {
+                ConstVal::Str(s) => Ok(ConstVal::Int(s.chars().count() as i64)),
+                _ => Err("`len` of a non-constant".to_string()),
+            },
             _ => Err("not a constant expression".to_string()),
         }
     }
@@ -959,6 +1486,10 @@ impl CodeGen {
             );
         };
         match self.module_member(module_type, name) {
+            Some(Symbol::Opaque { reason }) => format!(
+                "`{name}`, imported from `{}`, cannot be used here: {reason}",
+                imp.module
+            ),
             Some(Symbol::Type { .. }) => format!("`{name}` is a type, not a value"),
             Some(Symbol::Func { .. }) => {
                 format!("`{name}` is a function; it can only be called, not used as a value")
@@ -968,7 +1499,7 @@ impl CodeGen {
                  variables is not supported yet",
                 imp.module
             ),
-            _ => format!("`{name}` is not a member of module `{}`", imp.module),
+            _ => self.not_a_member(name, &imp.module, module_type),
         }
     }
 
@@ -1020,11 +1551,21 @@ impl CodeGen {
             None => None,
         };
         for name in &v.names {
-            if name == "nil" || self.globals.iter().any(|(n, _, _, _)| n == name) {
+            if name == "nil" {
                 continue;
             }
-            let off = self.alloc_mp(kind.byte_size());
-            self.globals.push((name.clone(), off, ty, kind));
+            // A module's interface may declare the variable and the body then
+            // supply its value, so a repeated name keeps its existing slot
+            // instead of being skipped outright — skipping dropped the
+            // initialiser with it.
+            let off = match self.lookup_global(name) {
+                Some(off) => off,
+                None => {
+                    let off = self.alloc_mp(kind.byte_size());
+                    self.globals.push((name.clone(), off, ty, kind));
+                    off
+                }
+            };
             if let Some(t) = &elem_type {
                 self.local_array_elem.insert(name.clone(), t.clone());
             }
@@ -1034,10 +1575,26 @@ impl CodeGen {
             if let Some(a) = &adt_name {
                 self.local_adt_type.insert(name.clone(), a.clone());
             }
+            self.note_module_handle(name, v.ty.as_ref(), v.init.as_ref());
             if init.is_none()
                 && let Some(expr) = &v.init
             {
-                self.pending_global_inits.push((name.clone(), expr.clone()));
+                // An array of constants is itself a constant in Limbo, so it
+                // belongs in the data section rather than in code — that is
+                // what lets a module with no `init` have one at all.
+                match self.const_array(expr, elem_type.as_ref())? {
+                    Some(array) => {
+                        // The image fixes the element width, so record it:
+                        // reading a byte-packed array with word loads would
+                        // return neighbouring elements' bytes.
+                        if elem_type.is_none() {
+                            self.local_array_elem
+                                .insert(name.clone(), Type::Basic(array.elem.basic()));
+                        }
+                        self.emit_const_array(off, &array);
+                    }
+                    None => self.pending_global_inits.push((name.clone(), expr.clone())),
+                }
             }
             if let Some(value) = &init {
                 let item = match (value, kind) {
@@ -1062,6 +1619,181 @@ impl CodeGen {
             }
         }
         Ok(())
+    }
+
+    fn lookup_global(&self, name: &str) -> Option<i32> {
+        self.globals
+            .iter()
+            .find(|(n, _, _, _)| n == name)
+            .map(|(_, off, _, _)| *off)
+    }
+
+    /// Fold a module-level array initialiser into a data-section image.
+    ///
+    /// `array[n] of T` and `array[] of {constants}` are constant expressions in
+    /// Limbo (`initable`, nodes.c:168-186); the reference writes them into the
+    /// data section and the loader builds them when it creates the module's MP.
+    /// Returns `None` for anything else, which the caller then defers to the
+    /// entry function as before.
+    fn const_array(
+        &self,
+        expr: &Expr,
+        declared_elem: Option<&Type>,
+    ) -> Result<Option<ConstArray>, String> {
+        match expr {
+            Expr::ArrayAlloc(size, ty, _) => {
+                let Ok(ConstVal::Int(len)) = self.fold_const(size, 0) else {
+                    return Ok(None);
+                };
+                let len =
+                    i32::try_from(len).map_err(|_| "array size is out of range".to_string())?;
+                if len < 0 {
+                    return Err("array size is negative".to_string());
+                }
+                Ok(Some(ConstArray {
+                    elem: ElemKind::of(declared_elem.unwrap_or(ty)),
+                    len,
+                    values: Vec::new(),
+                }))
+            }
+            Expr::ArrayLit(size, elems, ty, _) => {
+                // Place each element at the index it names. A positional
+                // element takes the next free slot, a keyed or ranged one the
+                // slots it names, and `* => v` every slot left over.
+                let mut placed: Vec<(usize, ConstVal)> = Vec::new();
+                let mut default: Option<ConstVal> = None;
+                let mut next = 0usize;
+                let mut high = 0usize;
+                for e in elems {
+                    let Ok(value) = self.fold_const(&e.value, 0) else {
+                        // Not a constant image; leave it to the entry function
+                        // rather than emitting a half-built array.
+                        return Ok(None);
+                    };
+                    // The indices this element initialises.
+                    let indices: Vec<i64> = match &e.index {
+                        None => vec![next as i64],
+                        Some(ArrayIndex::Selectors(sels)) => {
+                            let mut out = Vec::with_capacity(sels.len());
+                            for (lo, hi) in sels {
+                                let Ok(ConstVal::Int(lo)) = self.fold_const(lo, 0) else {
+                                    return Ok(None);
+                                };
+                                match hi {
+                                    None => out.push(lo),
+                                    Some(hi) => {
+                                        let Ok(ConstVal::Int(hi)) = self.fold_const(hi, 0) else {
+                                            return Ok(None);
+                                        };
+                                        out.extend(lo..=hi);
+                                    }
+                                }
+                            }
+                            out
+                        }
+                        Some(ArrayIndex::Wildcard) => {
+                            default = Some(value);
+                            continue;
+                        }
+                    };
+                    for i in indices {
+                        let Ok(i) = usize::try_from(i) else {
+                            return Ok(None);
+                        };
+                        placed.push((i, value.clone()));
+                        next = i + 1;
+                        high = high.max(i + 1);
+                    }
+                }
+                // `array[n] of {..}` has length n; `array[] of {..}` is exactly
+                // as long as the indices its elements reach.
+                let len = match size {
+                    Some(e) => match self.fold_const(e, 0) {
+                        Ok(ConstVal::Int(n)) if n >= 0 => n as usize,
+                        _ => return Ok(None),
+                    },
+                    None => high,
+                };
+                if placed.iter().any(|(i, _)| *i >= len) {
+                    return Err("array initialiser index is outside the array".to_string());
+                }
+                let filler = default.unwrap_or(ConstVal::Int(0));
+                let mut values = vec![filler; len];
+                for (i, v) in placed {
+                    values[i] = v;
+                }
+                let elem = match declared_elem.or(ty.as_deref()) {
+                    Some(t) => ElemKind::of(t),
+                    // No declared element type: `array[] of {byte 0, byte 1}`
+                    // is an array of byte, a list of strings an array of
+                    // string, and everything else follows the folded values.
+                    None if !elems.is_empty() && elems.iter().all(|e| is_byte_cast(&e.value)) => {
+                        ElemKind::Byte
+                    }
+                    None => ElemKind::of_values(&values),
+                };
+                Ok(Some(ConstArray {
+                    elem,
+                    len: len as i32,
+                    values,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Write a folded array into the data section at MP offset `off`.
+    ///
+    /// The element type index is filled in later by `build_types`, which is the
+    /// only point at which the descriptor table's length is settled.
+    fn emit_const_array(&mut self, off: i32, array: &ConstArray) {
+        let item = self.data.len();
+        self.data.push(DataItem::Array {
+            offset: off,
+            element_type: 0,
+            length: array.len,
+        });
+        self.pending_array_elem_types.push((item, array.elem));
+        if array.values.is_empty() {
+            return;
+        }
+        // Inside an array context the data offsets address the array's own
+        // storage, so one item covers every element from index 0.
+        self.data.push(DataItem::SetArray {
+            offset: off,
+            index: 0,
+        });
+        match array.elem {
+            ElemKind::Byte => self.data.push(DataItem::Bytes {
+                offset: 0,
+                values: array.values.iter().map(const_byte).collect(),
+            }),
+            ElemKind::Word => self.data.push(DataItem::Words {
+                offset: 0,
+                values: array.values.iter().map(const_word).collect(),
+            }),
+            ElemKind::Big => self.data.push(DataItem::Bigs {
+                offset: 0,
+                values: array.values.iter().map(const_big).collect(),
+            }),
+            ElemKind::Real => self.data.push(DataItem::Reals {
+                offset: 0,
+                values: array.values.iter().map(const_real).collect(),
+            }),
+            // Pointer elements each hold a heap id, so they need one item per
+            // element at that element's own offset.
+            ElemKind::Ptr => {
+                for (i, v) in array.values.iter().enumerate() {
+                    if let ConstVal::Str(s) = v {
+                        self.data.push(DataItem::String {
+                            offset: (i as i32) * 4,
+                            value: s.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        self.data.push(DataItem::RestoreBase);
     }
 
     /// Resolve a name to its storage slot, preferring function locals over
@@ -1152,6 +1884,36 @@ impl CodeGen {
                 let (_, ty) = self.adt_field_info(&outer, field)?;
                 Self::adt_name_for_type(&ty)
             }
+            // An element of an `array of ref Adt` is that ADT.
+            Expr::Index(arr, _, _) => Self::adt_name_for_type(&self.array_elem_type_for_expr(arr)?),
+            Expr::Call(_, _, _) => self.adt_name_from_call(expr),
+            _ => None,
+        }
+    }
+
+    /// The ADT a call's declared return type names, when it has one.
+    ///
+    /// Without this, `b := bufio->open(...)` leaves `b` untyped, and every
+    /// `b.field` and `b.method()` after it has nothing to resolve against.
+    fn adt_name_from_call(&self, expr: &Expr) -> Option<String> {
+        let Expr::Call(callee, _, _) = expr else {
+            return None;
+        };
+        match callee.as_ref() {
+            Expr::ModQual(module, name, _) => {
+                let Expr::Ident(handle, _) = module.as_ref() else {
+                    return None;
+                };
+                match self.handle_member(handle, name) {
+                    Some(Symbol::Func { ty }) => resolved_adt_name(ty.ret.as_deref()?),
+                    _ => None,
+                }
+            }
+            Expr::Dot(obj, method, _) => {
+                let (adt, _) = self.adt_method_target(obj, method)?;
+                Self::adt_name_for_type(self.adt_method_sig(&adt, method)?.ret.as_ref()?)
+            }
+            Expr::Ident(name, _) => Self::adt_name_for_type(self.func_ret_types.get(name)?),
             _ => None,
         }
     }
@@ -1246,7 +2008,7 @@ impl CodeGen {
                     self.scan_expr_strings(h);
                 }
             }
-            Expr::Tuple(es, _) | Expr::ArrayLit(es, _, _) | Expr::ListLit(es, _) => {
+            Expr::Tuple(es, _) | Expr::ListLit(es, _) => {
                 for e in es {
                     self.scan_expr_strings(e);
                 }
@@ -1255,36 +2017,110 @@ impl CodeGen {
         }
     }
 
+    /// Note that the instruction at `at` names the descriptor for `key`, and
+    /// that the module therefore needs one. The index is patched in by
+    /// `build_types`, which is the first point at which the table's layout —
+    /// and so every index in it — is settled.
+    fn need_type(&mut self, at: usize, operand: TypeOperand, key: TypeKey) {
+        if !self.needed_types.contains(&key) {
+            self.needed_types.push(key.clone());
+        }
+        self.pending_type_fixups.push((at, operand, key));
+    }
+
+    /// The descriptor for one needed type.
+    fn descriptor_for(&self, id: u32, key: &TypeKey) -> TypeDescriptor {
+        let (size, offsets) = match key {
+            TypeKey::Adt(name) => {
+                let shape = self.adt_shapes.get(name).cloned().unwrap_or_default();
+                (shape.size.max(4), shape.ptr_offsets)
+            }
+            TypeKey::Elem(kind) => (
+                kind.byte_size(),
+                if kind.is_ptr() { vec![0] } else { vec![] },
+            ),
+            // No layout to describe. Every slot is marked so the collector
+            // follows all of them: a slot that turns out to hold an `int` is
+            // merely retained, whereas an unmarked pointer slot would let a
+            // live object be swept.
+            TypeKey::OpaqueRecord => (48, (0..12).map(|w| w * 4).collect()),
+        };
+        let pointer_map = pointer_map_for(size, &offsets);
+        let pointer_count = pointer_map
+            .bytes
+            .iter()
+            .map(|b| b.count_ones())
+            .sum::<u32>();
+        TypeDescriptor {
+            id,
+            size,
+            pointer_map,
+            pointer_count,
+        }
+    }
+
     fn build_types(&mut self) {
-        // Type 0: small/generic frame
-        self.types.push(TypeDescriptor {
-            id: 0,
-            size: 16,
-            pointer_map: PointerMap { bytes: vec![0x80] },
-            pointer_count: 1,
-        });
-        // Type 1: sys call frame (48 bytes, ptrs at 32,36)
-        self.types.push(TypeDescriptor {
-            id: 1,
-            size: 48,
-            pointer_map: PointerMap {
-                bytes: vec![0x00, 0x30],
-            },
-            pointer_count: 2,
-        });
-        // Types 2+: one per compiled function with its actual frame size
-        for (i, &fsize) in self.func_frames.iter().enumerate() {
-            let map_bytes = (fsize as usize).div_ceil(32).max(1);
-            let mut pmap = vec![0u8; map_bytes];
-            if pmap.len() > 4 {
-                pmap[4] = 0x03;
-            } // ptrs at 32, 36
+        // Types 0 and 1 are reserved: function frame descriptors start at 2,
+        // and that base is baked into `Frame`/`Spawn` operands and export
+        // entries. Nothing allocates against them any more, but a stale
+        // reference must still find a descriptor that traces conservatively
+        // rather than one that claims the object holds no pointers at all.
+        for id in 0..2u32 {
+            self.types
+                .push(self.descriptor_for(id, &TypeKey::OpaqueRecord));
+        }
+        // Types 2+: one per compiled function with its actual frame size and
+        // the frame slots we know hold pointers. Frames are also scanned
+        // conservatively by the collector, so an omission here costs nothing;
+        // a false claim of "no pointers" would not be so harmless.
+        for (i, (fsize, ptrs)) in self.func_frames.clone().iter().enumerate() {
+            let pointer_map = pointer_map_for(*fsize, ptrs);
+            let pointer_count = pointer_map
+                .bytes
+                .iter()
+                .map(|b| b.count_ones())
+                .sum::<u32>();
             self.types.push(TypeDescriptor {
                 id: (2 + i) as u32,
-                size: fsize,
-                pointer_map: PointerMap { bytes: pmap },
-                pointer_count: 2,
+                size: *fsize,
+                pointer_map,
+                pointer_count,
             });
+        }
+        // Element descriptors for arrays built in the data section join the
+        // same table, so an image and a runtime allocation of the same element
+        // kind share one descriptor.
+        let pending = std::mem::take(&mut self.pending_array_elem_types);
+        for (_, elem) in &pending {
+            let key = TypeKey::Elem(*elem);
+            if !self.needed_types.contains(&key) {
+                self.needed_types.push(key);
+            }
+        }
+        let base = self.types.len() as i32;
+        for (i, key) in self.needed_types.clone().iter().enumerate() {
+            let td = self.descriptor_for((base + i as i32) as u32, key);
+            self.types.push(td);
+        }
+        let index_of = |key: &TypeKey| -> i32 {
+            base + self
+                .needed_types
+                .iter()
+                .position(|k| k == key)
+                .expect("every needed type was allocated") as i32
+        };
+        for (item, elem) in &pending {
+            let id = index_of(&TypeKey::Elem(*elem));
+            if let DataItem::Array { element_type, .. } = &mut self.data[*item] {
+                *element_type = id;
+            }
+        }
+        for (at, operand, key) in std::mem::take(&mut self.pending_type_fixups) {
+            let id = index_of(&key);
+            match operand {
+                TypeOperand::Source => self.code[at].source = op_imm(id),
+                TypeOperand::Middle => self.code[at].middle = mid_imm(id),
+            }
         }
     }
 
@@ -1323,6 +2159,9 @@ impl CodeGen {
                     if let Some(adt) = Self::adt_name_for_type(&param.ty) {
                         self.local_adt_type.insert(name.clone(), adt);
                     }
+                    // A module-typed param is a module handle: `f(b: Bufio)`
+                    // can call `b->open(...)`.
+                    self.note_module_handle(name, Some(&param.ty), None);
                 }
                 // Frame param slots are 4-byte aligned in the reference ABI;
                 // big/real params occupy two adjacent slots. This keeps the
@@ -1371,7 +2210,18 @@ impl CodeGen {
             entry.1 = entry_pc as i32;
             entry.2 = self.frame_size;
         }
-        self.func_frames.push(self.frame_size);
+        // Parameters and named locals whose type is a pointer. Temps are not
+        // tracked, so the map is a subset of the frame's real pointers —
+        // which is the safe direction: frames are scanned conservatively by
+        // the collector, and the reference VM's `freeptrs` would merely leak
+        // rather than release something twice.
+        let frame_ptrs: Vec<i32> = self
+            .locals
+            .iter()
+            .filter(|(_, _, ty, kind)| *ty != ValType::Word && *kind == NumKind::Word)
+            .map(|(_, off, _, _)| *off)
+            .collect();
+        self.func_frames.push((self.frame_size, frame_ptrs));
 
         let func_idx = self.func_frames.len() as i32 - 1;
         let type_idx = 2 + func_idx; // types 0,1 are reserved, func types start at 2
@@ -1469,6 +2319,7 @@ impl CodeGen {
                     if let Some(a) = &adt_name {
                         self.local_adt_type.insert(name.clone(), a.clone());
                     }
+                    self.note_module_handle(name, v.ty.as_ref(), v.init.as_ref());
                 }
                 if let Some(init) = &v.init {
                     let name = v.names.first().map(|s| s.as_str()).unwrap_or("");
@@ -1613,6 +2464,9 @@ impl CodeGen {
                 Ok(())
             }
             Stmt::Empty => Ok(()),
+            // Already bound by `collect_imports`; declares no storage and
+            // emits no code.
+            Stmt::Import(_) => Ok(()),
             // Unsupported constructs are hard errors: emitting nothing at all
             // would silently drop the statement's behavior.
             Stmt::Alt(_) => Err("`alt` statements are not supported yet".to_string()),
@@ -1764,8 +2618,16 @@ impl CodeGen {
                         .find(|(n, _, _, _)| n == name)
                         .map(|(_, _, _, k)| *k)
                         .unwrap_or(NumKind::Word)
-                } else if let Expr::ModQual(_, name, _) = callee.as_ref() {
-                    sys_return_kind(name)
+                } else if let Expr::ModQual(module, name, _) = callee.as_ref() {
+                    match module.as_ref() {
+                        Expr::Ident(handle, _) => self.module_call_num_kind(handle, name),
+                        _ => NumKind::Word,
+                    }
+                } else if let Expr::Dot(obj, method, _) = callee.as_ref() {
+                    match self.adt_method_target(obj, method) {
+                        Some((adt, _)) => self.adt_method_num_kind(&adt, method),
+                        None => NumKind::Word,
+                    }
                 } else {
                     NumKind::Word
                 }
@@ -1892,19 +2754,32 @@ impl CodeGen {
             }
             Expr::Load(_, _, _) => ValType::Ptr,
             Expr::Call(callee, _, _) => {
-                // Infer return type from callee name
-                if let Expr::ModQual(_, name, _) = callee.as_ref() {
-                    match name.as_str() {
-                        "fildes" | "open" | "create" | "fstat" | "stat" | "dirread" | "dial"
-                        | "announce" | "listen" => ValType::Ptr,
+                // Infer the return shape from the callee's interface when it
+                // is known, falling back to what we know about `$Sys`.
+                if let Expr::ModQual(module, name, _) = callee.as_ref() {
+                    match module.as_ref() {
+                        Expr::Ident(handle, _) => self.module_call_val_type(handle, name),
                         _ => ValType::Word,
+                    }
+                } else if let Expr::Dot(obj, method, _) = callee.as_ref() {
+                    match self
+                        .adt_method_target(obj, method)
+                        .and_then(|(adt, _)| self.adt_method_sig(&adt, method))
+                        .and_then(|sig| sig.ret.as_ref())
+                    {
+                        Some(Type::Basic(
+                            BasicType::Int | BasicType::Byte | BasicType::Big | BasicType::Real,
+                        )) => ValType::Word,
+                        Some(Type::Array(_)) => ValType::Array,
+                        Some(_) => ValType::Ptr,
+                        None => ValType::Word,
                     }
                 } else {
                     ValType::Word
                 }
             }
             Expr::Cons(_, _, _) => ValType::Ptr,
-            Expr::ArrayAlloc(_, _, _) | Expr::ArrayLit(_, _, _) => ValType::Array,
+            Expr::ArrayAlloc(_, _, _) | Expr::ArrayLit(_, _, _, _) => ValType::Array,
             Expr::ChanAlloc(_, _) | Expr::ListLit(_, _) => ValType::Ptr,
             Expr::Cast(ty, _, _) => match ty.as_ref() {
                 // Numeric casts produce a numeric value; the slot is sized
@@ -2325,9 +3200,20 @@ impl CodeGen {
                 let off = self.alloc_local(name, ty, kind);
                 // Capture array element type when the rhs is `array[N] of T`
                 // so subsequent indexing picks the right opcode pair.
-                if let Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, Some(ty), _) = rhs.as_ref() {
-                    self.local_array_elem
-                        .insert(name.to_string(), (**ty).clone());
+                match rhs.as_ref() {
+                    Expr::ArrayAlloc(_, ty, _) | Expr::ArrayLit(_, _, Some(ty), _) => {
+                        self.local_array_elem
+                            .insert(name.to_string(), (**ty).clone());
+                    }
+                    // An untyped literal still fixes an element width; reading
+                    // a byte-packed array with word loads returns its
+                    // neighbours' bytes.
+                    Expr::ArrayLit(_, elems, None, _) => {
+                        let kind = self.array_lit_elem_kind(elems, None);
+                        self.local_array_elem
+                            .insert(name.to_string(), Type::Basic(kind.basic()));
+                    }
+                    _ => {}
                 }
                 // Same for `chan of T` so Send/Recv can pick the right width.
                 if let Expr::ChanAlloc(ty, _) = rhs.as_ref()
@@ -2340,21 +3226,20 @@ impl CodeGen {
                 // both shapes so DeclAssign records the ADT name.
                 let adt_from_rhs = match rhs.as_ref() {
                     Expr::RefAlloc(ty, _, _) => Self::adt_name_for_type(ty),
-                    Expr::Unary(UnaryOp::Ref, inner, _) => {
-                        if let Expr::Call(callee, _, _) = inner.as_ref()
-                            && let Expr::Ident(n, _) = callee.as_ref()
-                            && self.adt_layouts.contains_key(n)
-                        {
-                            Some(n.clone())
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
+                    // `ref Adt(...)`, `ref Mod->Adt(...)` and the bare
+                    // `ref Adt` form all name the ADT the local holds.
+                    Expr::Unary(UnaryOp::Ref, inner, _) => match inner.as_ref() {
+                        Expr::Call(callee, _, _) => self.adt_ctor_name(callee),
+                        other => self.adt_ctor_name(other),
+                    },
+                    // A call's declared return type names the ADT too.
+                    other => self.adt_name_from_call(other),
                 };
                 if let Some(a) = adt_from_rhs {
                     self.local_adt_type.insert(name.to_string(), a);
                 }
+                // `b := load Bufio Bufio->PATH;` declares a module handle.
+                self.note_module_handle(name, None, Some(rhs));
                 self.gen_expr_to(rhs, off)
             }
             Expr::TupleDeclAssign(names, rhs, _) => {
@@ -2634,69 +3519,31 @@ impl CodeGen {
                 Ok(())
             }
             Expr::Load(ty, path, _) => {
-                // load ModuleName path_expr
-                // Determine module path from the expression
+                // `load Mod path_expr` — the middle operand names the import
+                // block for `Mod`, which is the same block `Mod`'s calls index
+                // into. The runtime uses it to map our function indices onto
+                // the loaded module's exports.
+                let Type::Named(qn) = ty.as_ref() else {
+                    return Err("`load` needs a module name".to_string());
+                };
+                let import_idx = self.ensure_module_import(&qn.name) as i32;
                 let path_tmp = self.alloc_temp();
                 self.gen_expr_to(path, path_tmp)?;
-
-                // For $Sys, reuse existing module ref
-                let module_name = if let Type::Named(qn) = ty.as_ref() {
-                    qn.name.clone()
-                } else {
-                    "Unknown".to_string()
-                };
-
-                if module_name == "Sys" {
-                    self.emit(
-                        Opcode::Load,
-                        op_mp(self.sys_path_mp),
-                        mid_imm(0),
-                        op_mp(self.sys_mp_ref),
-                    );
-                    self.emit(
-                        Opcode::Movp,
-                        op_mp(self.sys_mp_ref),
-                        mid_unused(),
-                        op_fp(dst),
-                    );
-                } else {
-                    // Generic module: intern path, allocate MP ref, emit Load
-                    let import_idx = self.imports.len() as i32;
-                    self.imports.push(ImportModule { functions: vec![] });
-                    let path_mp = self.alloc_mp(4);
-                    // The path string should come from the expression (e.g., Bufio->PATH)
-                    // For now, use the path_tmp which was already evaluated
-                    let ref_mp = self.alloc_mp(4);
-                    self.emit(Opcode::Movp, op_fp(path_tmp), mid_unused(), op_mp(path_mp));
-                    self.emit(
-                        Opcode::Load,
-                        op_mp(path_mp),
-                        mid_imm(import_idx),
-                        op_mp(ref_mp),
-                    );
-                    self.emit(Opcode::Movp, op_mp(ref_mp), mid_unused(), op_fp(dst));
-                }
+                self.emit(
+                    Opcode::Load,
+                    op_fp(path_tmp),
+                    mid_imm(import_idx),
+                    op_fp(dst),
+                );
                 Ok(())
             }
             Expr::ModQual(module, member, _) => {
-                // Module->member: for Sys->PATH, return the string "$Sys"
-                if let Expr::Ident(mod_name, _) = module.as_ref()
-                    && member == "PATH"
-                {
-                    let path = format!("${mod_name}");
-                    let mp = self.intern_string(&path);
-                    self.emit(Opcode::Movp, op_mp(mp), mid_unused(), op_fp(dst));
-                    return Ok(());
-                }
-                // Constants declared in a module interface resolve to their
-                // folded value.
-                if let Expr::Ident(mod_name, _) = module.as_ref()
-                    && let Some(Ok(value)) = self.qualified_const_value(mod_name, member)
-                {
-                    return self.gen_const_to(&value, dst);
-                }
-                self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
-                Ok(())
+                let Expr::Ident(name, _) = module.as_ref() else {
+                    return Err(format!(
+                        "`->{member}` must be applied to a module name or module variable"
+                    ));
+                };
+                self.gen_mod_qual_value(name, member, dst)
             }
             Expr::Call(callee, args, _) => self.gen_call_with_result(callee, args, dst),
             Expr::DeclAssign(names, _, _) => {
@@ -2804,49 +3651,24 @@ impl CodeGen {
                 }
                 Ok(())
             }
-            Expr::ArrayAlloc(size, _, _) => {
+            Expr::ArrayAlloc(size, elem, _) => {
                 let sz_tmp = self.alloc_temp();
                 self.gen_expr_to(size, sz_tmp)?;
+                let at = self.code.len();
                 self.emit(Opcode::Newa, op_fp(sz_tmp), mid_imm(0), op_fp(dst));
+                // The element descriptor fixes both the element width and
+                // which of its words the collector follows. Type 0 — a
+                // 16-byte cell with a pointer at offset 0 — described none
+                // of them.
+                self.need_type(at, TypeOperand::Middle, TypeKey::Elem(ElemKind::of(elem)));
                 Ok(())
             }
+            Expr::ArrayLit(size, elems, ty, _) => {
+                self.gen_array_literal(size.as_deref(), elems, ty.as_deref(), dst)
+            }
             Expr::RefAlloc(ty, args, _) => {
-                // ref Adt(arg1, arg2, ...) → New $type, dst; then fill fields
-                // at the ADT's actual layout offsets with kind-aware Mov so
-                // big/real fields land in 8-byte slots. When the ADT layout
-                // is unknown (or the type is non-Named), fall back to the
-                // historical i*4 / Movw layout.
-                self.emit(Opcode::New, op_imm(1), mid_unused(), op_fp(dst));
-                let layout =
-                    Self::adt_name_for_type(ty).and_then(|a| self.adt_layouts.get(&a).cloned());
-                for (i, arg) in args.iter().enumerate() {
-                    let (field_off, field_ty) = match layout.as_ref().and_then(|l| l.get(i)) {
-                        Some((_, t, off)) => (*off, Some(t.clone())),
-                        None => ((i as i32) * 4, None),
-                    };
-                    let kind = field_ty
-                        .as_ref()
-                        .map(type_num_kind)
-                        .unwrap_or(NumKind::Word);
-                    let arg_tmp = self.alloc_temp_for(kind);
-                    self.gen_expr_to_kind(arg, arg_tmp, kind)?;
-                    let op = match field_ty.as_ref() {
-                        Some(Type::Basic(BasicType::Big)) => Opcode::Movl,
-                        Some(Type::Basic(BasicType::Real)) => Opcode::Movf,
-                        Some(Type::Basic(_)) => Opcode::Movw,
-                        Some(_) => Opcode::Movp,
-                        None => {
-                            // Heuristic fallback when the ADT layout is unknown.
-                            if self.infer_expr_type(arg) != ValType::Word {
-                                Opcode::Movp
-                            } else {
-                                Opcode::Movw
-                            }
-                        }
-                    };
-                    self.emit(op, op_fp(arg_tmp), mid_unused(), op_fp_ind(dst, field_off));
-                }
-                Ok(())
+                let name = Self::adt_name_for_type(ty).unwrap_or_default();
+                self.gen_record_alloc(&name, args, dst)
             }
             Expr::Dot(inner, field, _) => {
                 // expr.field → read through the ref pointer using the ADT
@@ -2926,10 +3748,12 @@ impl CodeGen {
                 }
                 self.gen_expr_to(rhs, dst)
             }
-            _ => {
-                self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
-                Ok(())
-            }
+            // No lowering for this shape. Storing a zero would let the
+            // program run on with a value that never came from the source.
+            other => Err(format!(
+                "{} is not supported yet",
+                describe_expr_kind(other)
+            )),
         }
     }
 
@@ -3308,43 +4132,13 @@ impl CodeGen {
                 // record allocation: New + per-field init at the ADT's
                 // actual layout offsets with kind-aware Mov.
                 if let Expr::Call(callee, args, _) = inner
-                    && let Expr::Ident(name, _) = callee.as_ref()
-                    && self.adt_layouts.contains_key(name)
+                    && let Some(name) = self.adt_ctor_name(callee)
                 {
-                    self.emit(Opcode::New, op_imm(1), mid_unused(), op_fp(dst));
-                    let layout = self.adt_layouts.get(name).cloned();
-                    for (i, arg) in args.iter().enumerate() {
-                        let (field_off, field_ty) = match layout.as_ref().and_then(|l| l.get(i)) {
-                            Some((_, t, off)) => (*off, Some(t.clone())),
-                            None => ((i as i32) * 4, None),
-                        };
-                        let kind = field_ty
-                            .as_ref()
-                            .map(type_num_kind)
-                            .unwrap_or(NumKind::Word);
-                        let arg_tmp = self.alloc_temp_for(kind);
-                        self.gen_expr_to_kind(arg, arg_tmp, kind)?;
-                        let op = match field_ty.as_ref() {
-                            Some(Type::Basic(BasicType::Big)) => Opcode::Movl,
-                            Some(Type::Basic(BasicType::Real)) => Opcode::Movf,
-                            Some(Type::Basic(_)) => Opcode::Movw,
-                            Some(_) => Opcode::Movp,
-                            None => {
-                                if self.infer_expr_type(arg) != ValType::Word {
-                                    Opcode::Movp
-                                } else {
-                                    Opcode::Movw
-                                }
-                            }
-                        };
-                        self.emit(op, op_fp(arg_tmp), mid_unused(), op_fp_ind(dst, field_off));
-                    }
-                } else if let Expr::Ident(name, _) = inner
-                    && self.adt_layouts.contains_key(name)
-                {
+                    self.gen_record_alloc(&name, args, dst)?;
+                } else if let Some(name) = self.adt_ctor_name(inner) {
                     // `ref Adt` with no initialiser list: allocate the record
                     // and leave its fields zeroed.
-                    self.emit(Opcode::New, op_imm(1), mid_unused(), op_fp(dst));
+                    self.gen_record_alloc(&name, &[], dst)?;
                 } else {
                     self.gen_expr_to(inner, dst)?;
                 }
@@ -3357,19 +4151,77 @@ impl CodeGen {
 
     fn gen_call_expr(&mut self, expr: &Expr) -> Result<(), String> {
         if let Expr::Call(callee, args, _) = expr {
-            // sys->func(args)
-            if let Expr::ModQual(module, func_name, _) = callee.as_ref()
-                && let Expr::Ident(mod_name, _) = module.as_ref()
-                && mod_name == "sys"
-            {
-                return self.gen_sys_call(func_name, args, None);
+            // handle->func(args) — a cross-module call through any handle.
+            if let Expr::ModQual(module, func_name, _) = callee.as_ref() {
+                let Expr::Ident(handle, _) = module.as_ref() else {
+                    return Err(format!(
+                        "`{func_name}` must be called through a module variable"
+                    ));
+                };
+                return self.gen_module_call(handle, func_name, args, None);
             }
             // Local function call: func(args)
             if let Expr::Ident(func_name, _) = callee.as_ref() {
+                if let Some(qualified) = self.imported_callee(func_name)? {
+                    return self.gen_call_expr(&Expr::Call(
+                        Box::new(qualified),
+                        args.clone(),
+                        Span::default(),
+                    ));
+                }
                 return self.gen_local_call(func_name, args, None);
             }
+            // obj.method(args) — an ADT function member.
+            if let Expr::Dot(obj, method, _) = callee.as_ref() {
+                return self.gen_adt_method_call(obj, method, args, None);
+            }
+            // Statement position is no excuse for dropping the call: the
+            // callee still has effects. Say what could not be lowered.
+            return Err(unsupported_call_target(callee));
         }
         Ok(())
+    }
+
+    /// Rewrite a bare call to an imported function into its qualified form.
+    ///
+    /// This is what the reference compiler does: every imported name is
+    /// reconstructed as `Omdot(eimport, importid)` before code generation
+    /// (ecom.c:184), so `open(...)` and `sys->open(...)` reach codegen as the
+    /// same tree and emit the same `MFRAME`/`MCALL` pair. A locally defined
+    /// function of the same name wins, matching Limbo's scoping.
+    fn imported_callee(&self, name: &str) -> Result<Option<Expr>, String> {
+        if self.func_table.iter().any(|(n, _, _, _)| n == name) {
+            return Ok(None);
+        }
+        let Some(imp) = self.imported.get(name) else {
+            return Ok(None);
+        };
+        // With the interface in hand, only rewrite calls to things that really
+        // are functions, and refuse the ones that have no module reference to
+        // call through. Without it (no include path) the name is still known to
+        // come from `imp.module`, and a call site can only be a call, so it goes
+        // to the qualified path regardless: `open(...)` must behave exactly as
+        // `sys->open(...)` would, including where that form is itself imperfect.
+        if let Some(module_type) = &imp.module_type {
+            if !matches!(
+                self.module_member(module_type, name),
+                Some(Symbol::Func { .. })
+            ) {
+                return Ok(None);
+            }
+            if !imp.from_variable {
+                return Err(format!(
+                    "cannot call `{name}` because `{}` is a module interface, not a module \
+                     variable",
+                    imp.module
+                ));
+            }
+        }
+        Ok(Some(Expr::ModQual(
+            Box::new(Expr::Ident(imp.module.clone(), Span::default())),
+            name.to_string(),
+            Span::default(),
+        )))
     }
 
     fn gen_call_with_result(
@@ -3378,12 +4230,18 @@ impl CodeGen {
         args: &[Expr],
         dst: i32,
     ) -> Result<(), String> {
-        // sys->func(args)
-        if let Expr::ModQual(module, func_name, _) = callee
-            && let Expr::Ident(mod_name, _) = module.as_ref()
-            && mod_name == "sys"
-        {
-            return self.gen_sys_call(func_name, args, Some(dst));
+        // handle->func(args) — a cross-module call through any handle.
+        if let Expr::ModQual(module, func_name, _) = callee {
+            let Expr::Ident(handle, _) = module.as_ref() else {
+                return Err(format!(
+                    "`{func_name}` must be called through a module variable"
+                ));
+            };
+            return self.gen_module_call(handle, func_name, args, Some(dst));
+        }
+        // obj.method(args) — an ADT function member.
+        if let Expr::Dot(obj, method, _) = callee {
+            return self.gen_adt_method_call(obj, method, args, Some(dst));
         }
         // Nested calls like sys->fildes(1)
         if let Expr::Call(inner_callee, inner_args, _) = callee {
@@ -3391,10 +4249,14 @@ impl CodeGen {
         }
         // Local function call
         if let Expr::Ident(func_name, _) = callee {
+            if let Some(qualified) = self.imported_callee(func_name)? {
+                return self.gen_call_with_result(&qualified, args, dst);
+            }
             return self.gen_local_call(func_name, args, Some(dst));
         }
-        self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(dst));
-        Ok(())
+        // A callee shape with no lowering at all: say so rather than storing a
+        // zero and pretending the call happened.
+        Err(unsupported_call_target(callee))
     }
 
     fn gen_local_call(
@@ -3411,7 +4273,12 @@ impl CodeGen {
             .find(|(_, (n, _, _, _))| n == func_name)
             .map(|(i, (_, pc, _, ret))| (i, *pc, *ret));
 
-        if let Some((func_idx, func_pc, ret_kind)) = func_info {
+        // A call to a name no declaration provides used to emit nothing at
+        // all, so execution simply carried on as though it had happened.
+        let Some((func_idx, func_pc, ret_kind)) = func_info else {
+            return Err(format!("call to undefined function `{func_name}`"));
+        };
+        {
             let func_type = 2 + func_idx as i32;
 
             // Evaluate args first into temps sized by each arg's kind so
@@ -3487,13 +4354,62 @@ impl CodeGen {
         Ok(())
     }
 
-    fn gen_sys_call(
+    /// Emit a cross-module call `handle->func_name(args)`.
+    ///
+    /// The module reference lives in the handle variable's own storage slot —
+    /// the one `load` filled in — so any handle works, not just one spelled
+    /// `sys`. The reference compiler reaches this same shape for both
+    /// spellings: an imported name is rewritten to `handle->name` before code
+    /// generation (ecom.c:184), so `open(...)` and `sys->open(...)` produce
+    /// identical `MFRAME`/`MCALL` pairs.
+    fn gen_module_call(
         &mut self,
+        handle: &str,
         func_name: &str,
         args: &[Expr],
         result_dst: Option<i32>,
     ) -> Result<(), String> {
-        let func_idx = self.ensure_sys_func(func_name);
+        let (slot, ..) = self
+            .lookup_var(handle)
+            .ok_or_else(|| self.unresolved_handle_error(handle, func_name))?;
+        let interface = self
+            .module_handle_type
+            .get(handle)
+            .cloned()
+            .ok_or_else(|| self.not_a_module_handle_error(handle, func_name))?;
+        // With the interface in hand, a name it does not declare is an error
+        // naming both — the same check `import` makes. Without it (the `.m`
+        // was not on the include path) there is nothing to check against.
+        if self.interface_is_known(&interface) {
+            match self.module_member(&interface, func_name) {
+                Some(Symbol::Func { .. }) => {}
+                Some(_) => {
+                    return Err(format!(
+                        "`{func_name}` is not a function of module `{handle}` (interface \
+                         `{interface}`)"
+                    ));
+                }
+                None => return Err(self.not_a_member(func_name, handle, &interface)),
+            }
+        }
+        let ret_kind = self.module_call_num_kind(handle, func_name);
+        self.emit_module_call(slot, &interface, func_name, args, result_dst, ret_kind)
+    }
+
+    /// Emit the `mframe`/`mcall` pair for one cross-module call: the module
+    /// reference comes from `slot`, and `entry` names the callee as the
+    /// callee module's export table spells it.
+    fn emit_module_call(
+        &mut self,
+        slot: Slot,
+        interface: &str,
+        entry: &str,
+        args: &[Expr],
+        result_dst: Option<i32>,
+        ret_kind: NumKind,
+    ) -> Result<(), String> {
+        let func_idx = self.ensure_module_func(interface, entry);
+        let module_operand = slot.operand();
 
         // Phase 1: Evaluate all arguments into kind-sized temps BEFORE
         // allocating the call frame. Nested calls (like sys->fildes(1))
@@ -3511,12 +4427,12 @@ impl CodeGen {
         // Phase 2: Allocate call frame and fill it
         let frame_tmp = self.alloc_temp();
         // Wide enough for big/real returns; pointer returns share the 4-byte
-        // size of Word so ValType::Ptr sys functions are unaffected.
-        let ret_tmp = self.alloc_temp_for(sys_return_kind(func_name));
+        // size of Word so ValType::Ptr module functions are unaffected.
+        let ret_tmp = self.alloc_temp_for(ret_kind);
 
         self.emit(
             Opcode::Mframe,
-            op_mp(self.sys_mp_ref),
+            module_operand,
             mid_imm(func_idx as i32),
             op_fp(frame_tmp),
         );
@@ -3550,9 +4466,405 @@ impl CodeGen {
             Opcode::Mcall,
             op_fp(frame_tmp),
             mid_imm(func_idx as i32),
-            op_mp(self.sys_mp_ref),
+            module_operand,
         );
         Ok(())
+    }
+
+    /// Materialise the value of `name->member`, where `name` is either a
+    /// module interface (`Sys->UTFmax`) or a module handle (`sys->UTFmax`).
+    ///
+    /// Only constants have a value this compiler can produce. Anything else —
+    /// another module's variable, a member the interface does not declare, an
+    /// unresolvable interface — is reported. Emitting `Movw $0` here is what
+    /// turned a missing `PATH` or a mistyped constant into a silent zero.
+    fn gen_mod_qual_value(&mut self, name: &str, member: &str, dst: i32) -> Result<(), String> {
+        // The interface to look the member up in: `name` itself when it names
+        // an interface, or the interface of the handle it names.
+        let interface = self
+            .module_handle_type
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        match self.qualified_const_value(&interface, member) {
+            Some(Ok(value)) => return self.gen_const_to(&value, dst),
+            Some(Err(why)) => return Err(format!("`{name}->{member}` is unusable: {why}")),
+            None => {}
+        }
+        // A module's `PATH` names where to load it from. Every Inferno
+        // interface declares one, so the fallback only fires when the `.m`
+        // could not be read — and `$Name` is the convention for the built-in
+        // modules, which are exactly the ones a bare `include` misses.
+        if member == "PATH" && !self.interface_is_known(&interface) {
+            let path = format!("${interface}");
+            let mp = self.intern_string(&path);
+            self.emit(Opcode::Movp, op_mp(mp), mid_unused(), op_fp(dst));
+            return Ok(());
+        }
+        Err(match self.module_member(&interface, member) {
+            Some(Symbol::Opaque { reason }) => {
+                format!("`{name}->{member}` cannot be used here: {reason}")
+            }
+            Some(Symbol::Type { .. }) => format!("`{name}->{member}` is a type, not a value"),
+            Some(Symbol::Func { .. }) => {
+                format!("`{name}->{member}` is a function; it can only be called")
+            }
+            Some(Symbol::Var { .. }) => format!(
+                "`{name}->{member}` is a variable of another module; qualified access to another \
+                 module's variables is not supported yet"
+            ),
+            Some(_) => format!("`{name}->{member}` is not a value"),
+            None if self.interface_is_known(&interface) => {
+                self.not_a_member(member, name, &interface)
+            }
+            None => format!(
+                "`{name}->{member}`: the interface of `{interface}` was not found (is the include \
+                 path set?)"
+            ),
+        })
+    }
+
+    /// The ADT an `obj.method(...)` callee refers to, and whether `obj` is a
+    /// value to pass as the receiver.
+    ///
+    /// `p.sum(...)` names the ADT of `p` and passes `p`; `Point.make(...)`
+    /// names the ADT directly and passes nothing.
+    fn adt_method_target(&self, obj: &Expr, method: &str) -> Option<(String, bool)> {
+        if let Expr::Ident(name, _) = obj
+            && self.adt_methods.contains_key(name)
+            && self
+                .adt_methods
+                .get(name)
+                .is_some_and(|m| m.contains_key(method))
+            && self.lookup_var(name).is_none()
+        {
+            // `Adt.method(...)` — the ADT named directly, no receiver.
+            return Some((name.clone(), false));
+        }
+        let adt = self.adt_name_for_expr(obj)?;
+        let sig = self.adt_methods.get(&adt)?.get(method)?;
+        let takes_self = sig.params.first().is_some_and(|p| p.is_self);
+        Some((adt, takes_self))
+    }
+
+    /// Lower `obj.method(args)`.
+    ///
+    /// A method of an ADT this module declares is compiled here, under the
+    /// name `Adt.method`, so the call is an ordinary local one. A method of an
+    /// ADT that belongs to another interface is compiled *there*, and its
+    /// export is named `Adt.method` too (see any Inferno `.dis`), so the call
+    /// is a cross-module call through a handle for that interface.
+    fn gen_adt_method_call(
+        &mut self,
+        obj: &Expr,
+        method: &str,
+        args: &[Expr],
+        result_dst: Option<i32>,
+    ) -> Result<(), String> {
+        let Some((adt, takes_self)) = self.adt_method_target(obj, method) else {
+            return Err(unsupported_call_target(&Expr::Dot(
+                Box::new(obj.clone()),
+                method.to_string(),
+                Span::default(),
+            )));
+        };
+        let entry = format!("{adt}.{method}");
+        let mut full_args: Vec<Expr> = Vec::with_capacity(args.len() + 1);
+        if takes_self {
+            full_args.push(obj.clone());
+        }
+        full_args.extend_from_slice(args);
+
+        if self.func_table.iter().any(|(n, _, _, _)| n == &entry) {
+            return self.gen_local_call(&entry, &full_args, result_dst);
+        }
+        let Some(owner) = self.adt_owner.get(&adt).cloned() else {
+            return Err(format!(
+                "`{entry}` is declared but not defined, and `{adt}` belongs to no interface this \
+                 file can see"
+            ));
+        };
+        let Some(handle) = self.handle_for_interface(&owner) else {
+            return Err(format!(
+                "cannot call `{entry}`: no module variable of interface `{owner}` is in scope to \
+                 call it through"
+            ));
+        };
+        let Some((slot, ..)) = self.lookup_var(&handle) else {
+            return Err(format!("cannot call `{entry}`: `{handle}` has no storage"));
+        };
+        let ret_kind = self.adt_method_num_kind(&adt, method);
+        self.emit_module_call(slot, &owner, &entry, &full_args, result_dst, ret_kind)
+    }
+
+    /// A module variable whose interface is `interface`, if one is in scope.
+    /// Locals win over globals, and among equals the first declared.
+    fn handle_for_interface(&self, interface: &str) -> Option<String> {
+        let matches = |name: &String| {
+            self.module_handle_type
+                .get(name)
+                .is_some_and(|i| i == interface)
+        };
+        if let Some((name, ..)) = self.locals.iter().find(|(n, _, _, _)| matches(n)) {
+            return Some(name.clone());
+        }
+        self.globals
+            .iter()
+            .find(|(n, _, _, _)| matches(n))
+            .map(|(n, _, _, _)| n.clone())
+    }
+
+    /// The width of the value `Adt.method` returns.
+    fn adt_method_num_kind(&self, adt: &str, method: &str) -> NumKind {
+        self.adt_method_sig(adt, method)
+            .and_then(|s| s.ret.as_ref().map(type_num_kind))
+            .unwrap_or(NumKind::Word)
+    }
+
+    fn adt_method_sig(&self, adt: &str, method: &str) -> Option<&FuncSig> {
+        self.adt_methods.get(adt)?.get(method)
+    }
+
+    /// The ADT a constructor expression names, spelled either bare (`Xfid`)
+    /// or through the interface that declares it (`Bufio->Iobuf`).
+    fn adt_ctor_name(&self, expr: &Expr) -> Option<String> {
+        let name = match expr {
+            Expr::Ident(name, _) => name,
+            Expr::ModQual(_, name, _) => name,
+            _ => return None,
+        };
+        self.adt_layouts.contains_key(name).then(|| name.clone())
+    }
+
+    /// The element kind of an array literal: its declared element type when
+    /// it has one, otherwise what its elements are. The kind fixes both the
+    /// allocation's element width and which of its words the collector
+    /// follows, so the value has to be the same one the reader of `a[i]` uses.
+    fn array_lit_elem_kind(&self, elems: &[ArrayElem], elem_ty: Option<&Type>) -> ElemKind {
+        match elem_ty {
+            Some(t) => ElemKind::of(t),
+            None if !elems.is_empty() && elems.iter().all(|e| is_byte_cast(&e.value)) => {
+                ElemKind::Byte
+            }
+            None => match elems.first().map(|e| self.infer_expr_type(&e.value)) {
+                Some(ValType::Word) | None => {
+                    match elems.first().map(|e| self.infer_num_kind(&e.value)) {
+                        Some(NumKind::Big) => ElemKind::Big,
+                        Some(NumKind::Real) => ElemKind::Real,
+                        _ => ElemKind::Word,
+                    }
+                }
+                Some(_) => ElemKind::Ptr,
+            },
+        }
+    }
+
+    /// `array[n] of {..}` where the value is wanted at run time rather than
+    /// folded into the data section.
+    ///
+    /// Each element is written at the index it names, so a keyed or ranged
+    /// selector places its value where the source says rather than in
+    /// declaration order.
+    fn gen_array_literal(
+        &mut self,
+        size: Option<&Expr>,
+        elems: &[ArrayElem],
+        elem_ty: Option<&Type>,
+        dst: i32,
+    ) -> Result<(), String> {
+        // Where each element goes. A positional element takes the next free
+        // slot; a keyed or ranged one the slots it names.
+        let mut placed: Vec<(i64, &Expr)> = Vec::new();
+        let mut default: Option<&Expr> = None;
+        let mut next = 0i64;
+        for e in elems {
+            match &e.index {
+                None => {
+                    placed.push((next, &e.value));
+                    next += 1;
+                }
+                Some(ArrayIndex::Selectors(sels)) => {
+                    for (lo, hi) in sels {
+                        let Ok(ConstVal::Int(lo)) = self.fold_const(lo, 0) else {
+                            return Err(
+                                "an array-literal index must be a constant here".to_string()
+                            );
+                        };
+                        let hi = match hi {
+                            None => lo,
+                            Some(hi) => match self.fold_const(hi, 0) {
+                                Ok(ConstVal::Int(hi)) => hi,
+                                _ => {
+                                    return Err("an array-literal index must be a constant here"
+                                        .to_string());
+                                }
+                            },
+                        };
+                        for i in lo..=hi {
+                            placed.push((i, &e.value));
+                        }
+                        next = hi + 1;
+                    }
+                }
+                Some(ArrayIndex::Wildcard) => default = Some(&e.value),
+            }
+        }
+        let kind = self.array_lit_elem_kind(elems, elem_ty);
+        let len_tmp = self.alloc_temp();
+        match size {
+            Some(e) => self.gen_expr_to(e, len_tmp)?,
+            None => {
+                let len = placed.iter().map(|(i, _)| *i + 1).max().unwrap_or(0);
+                let len =
+                    i32::try_from(len).map_err(|_| "array size is out of range".to_string())?;
+                self.gen_word_const_to(len, len_tmp);
+            }
+        }
+        let at = self.code.len();
+        self.emit(Opcode::Newa, op_fp(len_tmp), mid_imm(0), op_fp(dst));
+        self.need_type(at, TypeOperand::Middle, TypeKey::Elem(kind));
+
+        let val_kind = match kind {
+            ElemKind::Big => NumKind::Big,
+            ElemKind::Real => NumKind::Real,
+            _ => NumKind::Word,
+        };
+        let (ind_op, mut mov_op) = Self::array_elem_opcodes(Some(kind.basic()));
+        if kind.is_ptr() {
+            // Pointer elements need the ref-counting move, not a raw word copy.
+            mov_op = Opcode::Movp;
+        }
+        // `* => v` fills every slot; the named elements are then written over
+        // it. The length may only be known at run time, so this is a loop
+        // rather than an unrolled sequence.
+        if let Some(value) = default {
+            let val_tmp = self.alloc_temp_for(val_kind);
+            self.gen_expr_to_kind(value, val_tmp, val_kind)?;
+            let i_tmp = self.alloc_temp();
+            self.emit(Opcode::Movw, op_imm(0), mid_unused(), op_fp(i_tmp));
+            let loop_start = self.code.len() as i32;
+            let exit = self.code.len();
+            self.emit(Opcode::Bgew, op_fp(i_tmp), mid_fp(len_tmp), op_imm(0));
+            let ref_tmp = self.alloc_temp();
+            self.emit(ind_op, op_fp(dst), mid_fp(ref_tmp), op_fp(i_tmp));
+            self.emit(mov_op, op_fp(val_tmp), mid_unused(), op_fp_ind(ref_tmp, 0));
+            self.emit(Opcode::Addw, op_imm(1), mid_unused(), op_fp(i_tmp));
+            self.emit(Opcode::Jmp, op_unused(), mid_unused(), op_imm(loop_start));
+            self.code[exit].destination = op_imm(self.code.len() as i32);
+        }
+        for (index, value) in placed {
+            let index =
+                i32::try_from(index).map_err(|_| "array index is out of range".to_string())?;
+            let val_tmp = self.alloc_temp_for(val_kind);
+            self.gen_expr_to_kind(value, val_tmp, val_kind)?;
+            let idx_tmp = self.alloc_temp();
+            self.gen_word_const_to(index, idx_tmp);
+            let ref_tmp = self.alloc_temp();
+            self.emit(ind_op, op_fp(dst), mid_fp(ref_tmp), op_fp(idx_tmp));
+            self.emit(mov_op, op_fp(val_tmp), mid_unused(), op_fp_ind(ref_tmp, 0));
+        }
+        Ok(())
+    }
+
+    /// `ref Adt(a, b, ...)` — allocate the record and fill its fields at the
+    /// ADT's own layout offsets with kind-aware moves, so big/real fields land
+    /// in 8-byte slots and pointer fields get the ref-counting move.
+    ///
+    /// An unknown layout falls back to the historical `i*4` / `Movw` packing.
+    fn gen_record_alloc(&mut self, adt: &str, args: &[Expr], dst: i32) -> Result<(), String> {
+        let key = if self.adt_shapes.contains_key(adt) {
+            TypeKey::Adt(adt.to_string())
+        } else {
+            TypeKey::OpaqueRecord
+        };
+        let at = self.code.len();
+        self.emit(Opcode::New, op_imm(0), mid_unused(), op_fp(dst));
+        self.need_type(at, TypeOperand::Source, key);
+        let layout = self.adt_layouts.get(adt).cloned();
+        for (i, arg) in args.iter().enumerate() {
+            let (field_off, field_ty) = match layout.as_ref().and_then(|l| l.get(i)) {
+                Some((_, t, off)) => (*off, Some(t.clone())),
+                None => ((i as i32) * 4, None),
+            };
+            let kind = field_ty
+                .as_ref()
+                .map(type_num_kind)
+                .unwrap_or(NumKind::Word);
+            let arg_tmp = self.alloc_temp_for(kind);
+            self.gen_expr_to_kind(arg, arg_tmp, kind)?;
+            let op = match field_ty.as_ref() {
+                Some(Type::Basic(BasicType::Big)) => Opcode::Movl,
+                Some(Type::Basic(BasicType::Real)) => Opcode::Movf,
+                Some(Type::Basic(_)) => Opcode::Movw,
+                Some(_) => Opcode::Movp,
+                None => {
+                    // Heuristic fallback when the ADT layout is unknown.
+                    if self.infer_expr_type(arg) != ValType::Word {
+                        Opcode::Movp
+                    } else {
+                        Opcode::Movw
+                    }
+                }
+            };
+            self.emit(op, op_fp(arg_tmp), mid_unused(), op_fp_ind(dst, field_off));
+        }
+        Ok(())
+    }
+
+    /// Was the interface behind a handle actually found and parsed?
+    fn interface_is_known(&self, interface: &str) -> bool {
+        self.symtab
+            .as_ref()
+            .is_some_and(|st| st.modules.contains_key(interface))
+    }
+
+    /// `h->f()` where `h` names no variable at all.
+    fn unresolved_handle_error(&self, handle: &str, member: &str) -> String {
+        if self.is_known_interface(handle) {
+            format!(
+                "cannot call `{member}` because `{handle}` is a module interface, not a module \
+                 variable"
+            )
+        } else {
+            format!("undefined identifier `{handle}` in `{handle}->{member}`")
+        }
+    }
+
+    /// `h->f()` where `h` is a variable, but not one of module type.
+    fn not_a_module_handle_error(&self, handle: &str, member: &str) -> String {
+        format!(
+            "cannot call `{member}` through `{handle}`: `{handle}` is not declared with a module \
+             type"
+        )
+    }
+
+    /// Is `name` an interface this file can see by name?
+    fn is_known_interface(&self, name: &str) -> bool {
+        self.module_decls.contains(name) || self.interface_is_known(name)
+    }
+
+    /// The width of the value `handle->func` returns.
+    fn module_call_num_kind(&self, handle: &str, func: &str) -> NumKind {
+        match self.handle_member(handle, func) {
+            Some(Symbol::Func { ty }) => match ty.ret.as_deref() {
+                Some(r) => resolved_num_kind(r),
+                None => NumKind::Word,
+            },
+            // No interface to consult: fall back to the built-in knowledge of
+            // `$Sys`, which is the module every program reaches for.
+            _ => sys_return_kind(func),
+        }
+    }
+
+    /// The storage shape of the value `handle->func` returns.
+    fn module_call_val_type(&self, handle: &str, func: &str) -> ValType {
+        match self.handle_member(handle, func) {
+            Some(Symbol::Func { ty }) => match ty.ret.as_deref() {
+                Some(r) => resolved_val_type(r),
+                None => ValType::Word,
+            },
+            _ => sys_return_val_type(func),
+        }
     }
 
     /// Estimate field offset for ADT field access.
@@ -3687,6 +4999,107 @@ mod tests {
             .parse_file()
             .map_err(|e| format!("{e}"))?;
         CodeGen::new().compile(&ast)
+    }
+
+    /// Compile through the full driver so `include`/`module` declarations
+    /// populate the symbol table that `import` resolves against.
+    fn compile_resolved(src: &str) -> Result<Module, String> {
+        crate::compile(src, "test.b")
+    }
+
+    // ── import ──────────────────────────────────────────────────
+
+    /// An unqualified call to an imported function must emit the *same*
+    /// cross-module call as its qualified spelling. Comparing the whole
+    /// instruction stream is the point: anything that fell back to a local
+    /// `Call`, or to the silent `Movw $0`, would differ here.
+    #[test]
+    fn imported_function_call_emits_the_same_code_as_the_qualified_call() {
+        let prelude = r#"implement Test;
+Sys: module {
+    PATH: con "$Sys";
+    print: fn(s: string): int;
+};
+sys: Sys;
+"#;
+        let qualified = compile_resolved(&format!(
+            r#"{prelude}init(nil: ref Draw->Context, nil: list of string)
+{{
+    sys = load Sys Sys->PATH;
+    sys->print("hi\n");
+}}
+"#
+        ))
+        .expect("qualified call should compile");
+        let imported = compile_resolved(&format!(
+            r#"{prelude}print: import sys;
+init(nil: ref Draw->Context, nil: list of string)
+{{
+    sys = load Sys Sys->PATH;
+    print("hi\n");
+}}
+"#
+        ))
+        .expect("imported call should compile");
+
+        let render = |m: &Module| {
+            m.code
+                .iter()
+                .map(|i| {
+                    format!(
+                        "{:?} {:?} {:?} {:?}",
+                        i.opcode, i.source, i.middle, i.destination
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(render(&imported), render(&qualified));
+        assert!(
+            imported.code.iter().any(|i| i.opcode == Opcode::Mcall),
+            "the imported call must be a cross-module Mcall"
+        );
+    }
+
+    /// Calling a function imported from a module *interface* name has no
+    /// module reference to call through, so it is an error — the same one the
+    /// reference compiler reports (typecheck.c:1459).
+    #[test]
+    fn calling_a_function_imported_from_an_interface_name_is_an_error() {
+        let err = compile_resolved(
+            r#"implement Test;
+Sys: module {
+    print: fn(s: string): int;
+};
+print: import Sys;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    print("hi\n");
+}
+"#,
+        )
+        .expect_err("calling through an interface name must fail");
+        assert!(err.contains("module interface"), "unexpected error: {err}");
+    }
+
+    /// Using an imported ADT name where a value is expected must say so
+    /// instead of reporting the name as undefined.
+    #[test]
+    fn imported_type_used_as_a_value_is_a_typed_error() {
+        let err = compile_resolved(
+            r#"implement Test;
+Bufio: module {
+    Iobuf: adt { x: int; };
+};
+b: Bufio;
+Iobuf: import b;
+init(nil: ref Draw->Context, nil: list of string)
+{
+    x := Iobuf + 1;
+}
+"#,
+        )
+        .expect_err("a type is not a value");
+        assert!(err.contains("is a type, not a value"), "got: {err}");
     }
 
     // ── Hello world ─────────────────────────────────────────────
@@ -4157,9 +5570,11 @@ init(nil: ref Draw->Context, nil: list of string)
         // `table` cannot be folded, so it needs generated code to run — and
         // there is no entry function to put that code in. Silently leaving
         // `table` zero at run time is the one outcome that is not allowed.
+        // (An `array[n] of T` initialiser *is* constant and goes in the data
+        // section, so it deliberately is not the example here.)
         let src = r#"
 implement Test;
-table := array[4] of int;
+table := helper();
 helper(): int
 {
     return 1;
@@ -4179,7 +5594,11 @@ helper(): int
         // function, the deferred initialiser is emitted into it.
         let src = r#"
 implement Test;
-table := array[4] of int;
+table := helper();
+helper(): int
+{
+    return 1;
+}
 init(nil: ref Draw->Context, nil: list of string)
 {
     x := 1;

@@ -30,9 +30,12 @@ pub(crate) fn op_new(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let size = vm
         .current_type_size(type_idx)
         .ok_or_else(|| ExecError::Other(format!("invalid type index: {type_idx}")))?;
+    // Resolve the record's pointer map now: after this instruction nothing can
+    // tell which module's type index `type_idx` was.
+    let trace = vm.trace_map_for_type(type_idx);
     let id = vm
         .heap
-        .alloc(type_idx as u32, HeapData::Record(vec![0; size]));
+        .alloc_typed(type_idx as u32, HeapData::Record(vec![0; size]), trace);
     vm.move_ptr_to_dst(id)
 }
 
@@ -59,7 +62,9 @@ pub(crate) fn op_newa(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         _ => return vm.raise_exception(OUT_OF_MEMORY),
     };
     let data = vec![0u8; byte_len];
-    let id = vm.heap.alloc(
+    // The element type's map, repeated once per element by `TraceMap`.
+    let trace = vm.trace_map_for_type(elem_type_idx);
+    let id = vm.heap.alloc_typed(
         elem_type_idx as u32,
         HeapData::Array {
             elem_type: elem_type_idx as u32,
@@ -67,6 +72,7 @@ pub(crate) fn op_newa(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             data,
             length,
         },
+        trace,
     );
     vm.move_ptr_to_dst(id)
 }
@@ -137,7 +143,7 @@ mod tests {
                 stack_extent: 0,
                 code_size: 1,
                 data_size: 0,
-                type_size: 2,
+                type_size: 3,
                 export_size: 0,
                 entry_pc: 0,
                 entry_type: 0,
@@ -160,6 +166,14 @@ mod tests {
                     size: 16,
                     pointer_map: PointerMap { bytes: vec![] },
                     pointer_count: 0,
+                },
+                // Two words, of which only the second is a pointer. The map is
+                // most-significant-bit first, as the .dis format writes it.
+                TypeDescriptor {
+                    id: 2,
+                    size: 8,
+                    pointer_map: PointerMap { bytes: vec![0x40] },
+                    pointer_count: 1,
                 },
             ],
             data: vec![],
@@ -412,6 +426,134 @@ mod tests {
         assert!(
             err.to_string().contains("invalid type index"),
             "error should mention invalid type index, got: {err}"
+        );
+    }
+
+    /// Allocate through `op_new` and hand back the object's trace map offsets.
+    fn new_of_type(vm: &mut VmState<'_>, type_idx: i32) -> (u32, Option<Vec<usize>>) {
+        let fp = vm.frames.current_data_offset();
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = type_idx;
+        vm.dst = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        op_new(vm).expect("op_new should succeed");
+        let id = memory::read_word(&vm.frames.data, fp) as u32;
+        let obj = vm.heap.get(id).expect("heap object should exist");
+        let size = match &obj.data {
+            HeapData::Record(data) => data.len(),
+            other => panic!("expected Record, got {:?}", std::mem::discriminant(other)),
+        };
+        let offsets = obj
+            .trace
+            .as_ref()
+            .map(|map| map.pointer_offsets(size).collect());
+        (id, offsets)
+    }
+
+    /// The type index alone cannot be resolved later -- index 2 means something
+    /// different in every module -- so the descriptor is resolved here, where
+    /// the module is known, and the map travels with the object.
+    #[test]
+    fn op_new_takes_the_pointer_map_from_the_type_descriptor() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+
+        let (_, offsets) = new_of_type(&mut vm, 2);
+
+        assert_eq!(
+            offsets,
+            Some(vec![4]),
+            "type 2's second word is its only pointer"
+        );
+    }
+
+    #[test]
+    fn op_new_records_an_empty_map_for_a_pointerless_type() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+
+        let (_, offsets) = new_of_type(&mut vm, 1);
+
+        assert_eq!(
+            offsets,
+            Some(Vec::new()),
+            "a type with no pointers is traced precisely as holding none, \
+             which is what stops its buffer retaining objects by coincidence"
+        );
+    }
+
+    #[test]
+    fn op_new_shares_one_map_between_objects_of_the_same_type() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+
+        let (first, _) = new_of_type(&mut vm, 2);
+        let (second, _) = new_of_type(&mut vm, 2);
+
+        let first_map = vm.heap.get(first).unwrap().trace.clone().unwrap();
+        let second_map = vm.heap.get(second).unwrap().trace.clone().unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&first_map, &second_map),
+            "one map per type, not a copy per object"
+        );
+    }
+
+    #[test]
+    fn op_newa_takes_the_pointer_map_from_the_element_type() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fp = vm.frames.current_data_offset();
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 3; // three elements
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 2; // of type 2: two words, the second a pointer
+        vm.dst = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+
+        op_newa(&mut vm).expect("op_newa should succeed");
+
+        let id = memory::read_word(&vm.frames.data, fp) as u32;
+        let obj = vm.heap.get(id).expect("heap object should exist");
+        let map = obj.trace.as_ref().expect("array carries its element map");
+        assert_eq!(
+            map.pointer_offsets(24).collect::<Vec<_>>(),
+            vec![4, 12, 20],
+            "the element map repeats once per element"
+        );
+    }
+
+    /// The false retention this precision is for: bytes read into a buffer can
+    /// spell out a live id, and used to keep that object alive indefinitely.
+    #[test]
+    fn a_byte_array_does_not_retain_an_object_by_coincidence() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fp = vm.frames.current_data_offset();
+
+        let victim = vm.heap.alloc(0, HeapData::Str("unreferenced".to_string()));
+
+        // `array[16] of byte`, whose element type has no pointers.
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = 16;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 1; // pointerless element type
+        vm.dst = AddrTarget::Frame(fp);
+        memory::write_word(&mut vm.frames.data, fp, heap::NIL as i32);
+        op_newa(&mut vm).expect("op_newa should succeed");
+        let buf = memory::read_word(&vm.frames.data, fp) as u32;
+
+        // What `sys->read` would have left in it.
+        let mut payload = vec![0u8; 8];
+        memory::write_word(&mut payload, 0, victim as i32);
+        vm.heap.array_write(buf, 0, &payload);
+
+        vm.collect_garbage();
+
+        assert!(vm.heap.contains(buf), "the array itself is rooted");
+        assert!(
+            !vm.heap.contains(victim),
+            "data bytes must not keep an object alive"
         );
     }
 

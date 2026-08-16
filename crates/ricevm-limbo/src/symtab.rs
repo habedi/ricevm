@@ -87,6 +87,14 @@ pub enum Symbol {
         name: String,
         members: HashMap<String, Symbol>,
     },
+    /// A member that is declared by the interface but whose value this
+    /// compiler cannot represent — an ADT- or tuple-valued `con`, for
+    /// instance. Keeping it in the table distinguishes "no such member" from
+    /// "member exists, but using it is not supported yet", so `import` accepts
+    /// the name and only a use site complains.
+    Opaque {
+        reason: String,
+    },
 }
 
 /// Module-level symbol table.
@@ -96,6 +104,13 @@ pub struct SymbolTable {
     pub symbols: HashMap<String, Symbol>,
     /// Module declarations from included .m files
     pub modules: HashMap<String, HashMap<String, Symbol>>,
+    /// ADT declarations by module: module name -> ADT name -> declaration.
+    ///
+    /// `Symbol::Type` only records *that* a name is an ADT. Code generation
+    /// needs the fields too — a record allocated against a guessed layout
+    /// reads its own fields back from the wrong offsets — so the declaration
+    /// is kept whole.
+    pub adt_decls: HashMap<String, HashMap<String, crate::ast::AdtDecl>>,
     /// Include search paths
     pub include_paths: Vec<String>,
 }
@@ -127,6 +142,14 @@ impl SymbolTable {
     /// Register a module's members.
     pub fn register_module(&mut self, name: &str, members: HashMap<String, Symbol>) {
         self.modules.insert(name.to_string(), members);
+    }
+
+    /// Register the ADT declarations a module's interface makes.
+    pub fn register_module_adts(&mut self, name: &str, adts: HashMap<String, crate::ast::AdtDecl>) {
+        if adts.is_empty() {
+            return;
+        }
+        self.adt_decls.insert(name.to_string(), adts);
     }
 
     /// Resolve a type from a module: e.g., "Draw->Context".

@@ -21,15 +21,7 @@ pub fn process_includes(file: &SourceFile, symtab: &mut SymbolTable) {
     // Also process top-level module declarations from the source file itself
     for decl in &file.decls {
         if let Decl::Module(md) = decl {
-            let members = extract_module_members(&md.members);
-            symtab.register_module(&md.name, members.clone());
-            symtab.define(
-                &md.name,
-                Symbol::Module {
-                    name: md.name.clone(),
-                    members,
-                },
-            );
+            register_module_decl(md, symtab);
         }
         if let Decl::Var(v) = decl {
             for name in &v.names {
@@ -65,17 +57,7 @@ fn process_include(path: &str, symtab: &mut SymbolTable) {
     // Extract module declarations from the .m file
     for decl in &parsed.decls {
         match decl {
-            Decl::Module(md) => {
-                let members = extract_module_members(&md.members);
-                symtab.register_module(&md.name, members.clone());
-                symtab.define(
-                    &md.name,
-                    Symbol::Module {
-                        name: md.name.clone(),
-                        members,
-                    },
-                );
-            }
+            Decl::Module(md) => register_module_decl(md, symtab),
             Decl::Var(v) => {
                 for name in &v.names {
                     let ty = resolve_ast_type(v.ty.as_ref(), symtab);
@@ -83,7 +65,7 @@ fn process_include(path: &str, symtab: &mut SymbolTable) {
                 }
             }
             Decl::Const(c) => {
-                if let Some(value) = eval_const_expr(&c.value, 0, &HashMap::new()) {
+                if let Some(value) = eval_const_expr(&c.value, 0, &HashMap::new(), symtab) {
                     symtab.define(
                         &c.name,
                         Symbol::Const {
@@ -96,6 +78,33 @@ fn process_include(path: &str, symtab: &mut SymbolTable) {
             _ => {}
         }
     }
+}
+
+/// Record everything one `Mod: module { ... }` declaration contributes: its
+/// members (for qualified and imported lookups), the interface name itself,
+/// and the ADT declarations code generation needs the field layouts of.
+fn register_module_decl(md: &ModuleDecl, symtab: &mut SymbolTable) {
+    let members = extract_module_members(&md.members, symtab);
+    symtab.register_module(&md.name, members.clone());
+    symtab.register_module_adts(&md.name, extract_module_adts(&md.members));
+    symtab.define(
+        &md.name,
+        Symbol::Module {
+            name: md.name.clone(),
+            members,
+        },
+    );
+}
+
+/// The ADT declarations an interface makes, by name.
+fn extract_module_adts(members: &[ModuleMember]) -> HashMap<String, AdtDecl> {
+    members
+        .iter()
+        .filter_map(|m| match m {
+            ModuleMember::Adt(adt) => Some((adt.name.clone(), adt.clone())),
+            _ => None,
+        })
+        .collect()
 }
 
 fn find_include_file(path: &str, search_paths: &[String]) -> Option<PathBuf> {
@@ -114,7 +123,10 @@ fn find_include_file(path: &str, search_paths: &[String]) -> Option<PathBuf> {
     None
 }
 
-fn extract_module_members(members: &[ModuleMember]) -> HashMap<String, Symbol> {
+fn extract_module_members(
+    members: &[ModuleMember],
+    symtab: &SymbolTable,
+) -> HashMap<String, Symbol> {
     let mut map = HashMap::new();
     // `iota` counts up within one `con` declaration and restarts at the next,
     // so `Next, Down, Skip, Quit: con iota;` yields 0,1,2,3 — not four zeroes.
@@ -124,10 +136,19 @@ fn extract_module_members(members: &[ModuleMember]) -> HashMap<String, Symbol> {
     for member in members {
         match member {
             ModuleMember::Const(c) => {
-                // A constant this evaluator cannot fold is left out of the
-                // interface entirely: a use site then reports the name as
-                // undefined instead of silently reading zero.
-                let Some(value) = eval_const_expr(&c.value, iota.next(c.span), &prior) else {
+                // A constant this evaluator cannot fold — an ADT- or
+                // tuple-valued `con`, say — stays in the interface as an
+                // opaque member. That keeps `import` able to see the name
+                // while a use site still refuses to invent a value for it.
+                let Some(value) = eval_const_expr(&c.value, iota.next(c.span), &prior, symtab)
+                else {
+                    map.insert(
+                        c.name.clone(),
+                        Symbol::Opaque {
+                            reason: "its value is not a form this compiler can represent yet"
+                                .to_string(),
+                        },
+                    );
                     continue;
                 };
                 prior.insert(c.name.clone(), value.clone());
@@ -268,12 +289,18 @@ fn eval_const_expr(
     expr: &Expr,
     iota: i64,
     prior: &HashMap<String, ConstValue>,
+    symtab: &SymbolTable,
 ) -> Option<ConstValue> {
-    let folded = fold(expr, iota, prior)?;
+    let folded = fold(expr, iota, prior, symtab)?;
     Some(ConstValue::from(&folded))
 }
 
-fn fold(expr: &Expr, iota: i64, prior: &HashMap<String, ConstValue>) -> Option<ConstVal> {
+fn fold(
+    expr: &Expr,
+    iota: i64,
+    prior: &HashMap<String, ConstValue>,
+    symtab: &SymbolTable,
+) -> Option<ConstVal> {
     match expr {
         Expr::IntLit(v, _) => Some(ConstVal::Int(*v)),
         Expr::CharLit(v, _) => Some(ConstVal::Int(*v as i64)),
@@ -281,7 +308,19 @@ fn fold(expr: &Expr, iota: i64, prior: &HashMap<String, ConstValue>) -> Option<C
         Expr::StringLit(s, _) => Some(ConstVal::Str(s.clone())),
         Expr::Ident(name, _) if name == "iota" => Some(ConstVal::Int(iota)),
         Expr::Ident(name, _) => prior.get(name).map(ConstVal::from),
-        Expr::Unary(op, inner, _) => match (op, fold(inner, iota, prior)?) {
+        // One interface may define a constant in terms of another's:
+        // `bufio.m` has `OREAD: con Sys->OREAD;`. Leaving it unfolded made
+        // every `bufio->OREAD` use site unusable.
+        Expr::ModQual(module, member, _) => {
+            let Expr::Ident(module, _) = module.as_ref() else {
+                return None;
+            };
+            match symtab.lookup_qualified(module, member) {
+                Some(Symbol::Const { value, .. }) => Some(ConstVal::from(value)),
+                _ => None,
+            }
+        }
+        Expr::Unary(op, inner, _) => match (op, fold(inner, iota, prior, symtab)?) {
             (UnaryOp::Neg, ConstVal::Int(v)) => Some(ConstVal::Int(-v)),
             (UnaryOp::Neg, ConstVal::Real(v)) => Some(ConstVal::Real(-v)),
             (UnaryOp::BitNot, ConstVal::Int(v)) => Some(ConstVal::Int(!v)),
@@ -289,16 +328,18 @@ fn fold(expr: &Expr, iota: i64, prior: &HashMap<String, ConstValue>) -> Option<C
             _ => None,
         },
         Expr::Binary(lhs, op, rhs, _) => {
-            let l = fold(lhs, iota, prior)?;
-            let r = fold(rhs, iota, prior)?;
+            let l = fold(lhs, iota, prior, symtab)?;
+            let r = fold(rhs, iota, prior, symtab)?;
             fold_const_binary(&l, *op, &r).ok()
         }
-        Expr::Cast(ty, inner, _) => match (ty.as_ref(), fold(inner, iota, prior)?) {
+        Expr::Cast(ty, inner, _) => match (ty.as_ref(), fold(inner, iota, prior, symtab)?) {
             (Type::Basic(BasicType::Real), ConstVal::Int(v)) => Some(ConstVal::Real(v as f64)),
             (Type::Basic(BasicType::Int | BasicType::Big | BasicType::Byte), ConstVal::Real(v)) => {
                 Some(ConstVal::Int(v as i64))
             }
-            (Type::Basic(BasicType::String), ConstVal::Int(v)) => Some(ConstVal::Str(v.to_string())),
+            (Type::Basic(BasicType::String), ConstVal::Int(v)) => {
+                Some(ConstVal::Str(v.to_string()))
+            }
             (_, v) => Some(v),
         },
         _ => None,
@@ -314,7 +355,7 @@ mod tests {
     fn eval_const_int() {
         let expr = Expr::IntLit(42, Span::default());
         assert!(matches!(
-            eval_const_expr(&expr, 0, &HashMap::new()),
+            eval_const_expr(&expr, 0, &HashMap::new(), &SymbolTable::new()),
             Some(ConstValue::Int(42))
         ));
     }
@@ -328,7 +369,7 @@ mod tests {
             Span::default(),
         );
         assert!(matches!(
-            eval_const_expr(&expr, 0, &HashMap::new()),
+            eval_const_expr(&expr, 0, &HashMap::new(), &SymbolTable::new()),
             Some(ConstValue::Int(42))
         ));
     }
@@ -342,7 +383,7 @@ mod tests {
             Span::default(),
         );
         assert!(matches!(
-            eval_const_expr(&expr, 0, &HashMap::new()),
+            eval_const_expr(&expr, 0, &HashMap::new(), &SymbolTable::new()),
             Some(ConstValue::Int(256))
         ));
     }
@@ -355,7 +396,7 @@ mod tests {
             Span::default(),
         );
         assert!(matches!(
-            eval_const_expr(&expr, 0, &HashMap::new()),
+            eval_const_expr(&expr, 0, &HashMap::new(), &SymbolTable::new()),
             Some(ConstValue::Int(-7))
         ));
     }
@@ -364,7 +405,7 @@ mod tests {
     fn eval_const_string() {
         let expr = Expr::StringLit("hello".to_string(), Span::default());
         assert!(
-            matches!(eval_const_expr(&expr, 0, &HashMap::new()), Some(ConstValue::String(s)) if s == "hello")
+            matches!(eval_const_expr(&expr, 0, &HashMap::new(), &SymbolTable::new()), Some(ConstValue::String(s)) if s == "hello")
         );
     }
 
@@ -391,5 +432,66 @@ Test: module {
         let mut symtab = SymbolTable::new();
         process_includes(&file, &mut symtab);
         assert!(symtab.lookup("Test").is_some());
+    }
+
+    fn members_of(src: &str, module: &str) -> HashMap<String, Symbol> {
+        let tokens = Lexer::new(src, "<test>").tokenize().expect("lex");
+        let file = crate::parser::Parser::new(tokens, "<test>")
+            .parse_file()
+            .expect("parse");
+        let mut symtab = SymbolTable::new();
+        process_includes(&file, &mut symtab);
+        symtab.modules.get(module).cloned().unwrap_or_default()
+    }
+
+    /// `A, B, C: con iota;` in an interface numbers its names 0,1,2. The
+    /// previous evaluator answered 0 for every one of them, so an importer of
+    /// `Next, Down, Skip, Quit` silently got four zeroes.
+    #[test]
+    fn interface_iota_constants_are_numbered() {
+        let members = members_of(
+            r#"implement Test;
+Fs: module {
+    Next, Down, Skip, Quit: con iota;
+    Big: con Quit + 10;
+};
+"#,
+            "Fs",
+        );
+        let value = |name: &str| match members.get(name) {
+            Some(Symbol::Const {
+                value: ConstValue::Int(v),
+                ..
+            }) => *v,
+            other => panic!("{name} should be an int constant, got {other:?}"),
+        };
+        assert_eq!(
+            [
+                value("Next"),
+                value("Down"),
+                value("Skip"),
+                value("Quit"),
+                value("Big")
+            ],
+            [0, 1, 2, 3, 13]
+        );
+    }
+
+    /// A constant whose value this compiler cannot represent stays in the
+    /// interface as an opaque member, so `import` can still see the name.
+    #[test]
+    fn unrepresentable_interface_constant_is_opaque_not_missing() {
+        let members = members_of(
+            r#"implement Test;
+Fs: module {
+    Nilentry: con (nil, nil, 0);
+};
+"#,
+            "Fs",
+        );
+        assert!(matches!(
+            members.get("Nilentry"),
+            Some(Symbol::Opaque { .. })
+        ));
     }
 }

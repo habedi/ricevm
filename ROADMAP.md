@@ -70,7 +70,9 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Stack frame allocation and deallocation with two-phase push
 - [x] Heap allocation for dynamic types (records, arrays, strings, lists, channels, and module refs)
 - [x] Reference counting for deterministic destruction (module refs protected from premature freeing)
-- [x] `op_ret` frees frame pointers via type descriptor pointer maps (matching reference `freeptrs`)
+- [ ] `op_ret` frees frame pointers via type descriptor pointer maps (matching reference `freeptrs`) -- disabled: the frame header's type index is
+  unreliable for frames built by builtin `mcall`/`mframe`, so releasing by it would dec_ref values that are not pointers. The collector reclaims the
+  frame's objects instead (ops/control.rs)
 - [x] Mark-and-sweep garbage collector (scans frames, MP, caller MP stacks, all loaded module MPs, and all suspended threads)
 - [x] Optional toggle to disable mark-and-sweep collection (`--no-gc` flag; debug only, since reference counting alone leaks -- see Known Limitations)
 - [x] Bounds-safe memory access (out-of-bounds reads return 0; writes are no-ops)
@@ -263,13 +265,17 @@ This document outlines the features implemented in RiceVM and the future goals f
   VM; a preemptive scheduler with OS threads exists but is not connected because it would require `Arc<Mutex<>>` refactoring of VmState
 - `op_ret` does not restore module context from the frame; the `mcall` wrapper handles module context restoration instead (correct behavior, different
   structure from reference)
-- Heap tracing is conservative, not precise. `dec_ref` cascades only through slots whose reference is provably taken on store (list tails, array-slice
-  parents), and mark-and-sweep scans record/array/ADT buffers word by word, retaining anything that looks like a live id. Telling a genuine pointer slot
-  from a coincidental byte pattern needs the type descriptor pointer maps, which the heap cannot reach: `HeapObject::type_id` is a bare per-module type
-  index with no module identity, and list nodes carry no descriptor at all. The result is sound -- nothing is freed while still reachable -- but imprecise
-  in both directions: pointers owned by a buffer survive until the collector runs, and byte or `real` data can keep an object alive by coincidence.
-  Making it precise means giving heap objects a module-qualified type id and reference counting every block write (`heap_write`, `array_write`,
-  `cons_bytes`, `movm`), which today copy bytes without counting anything.
+- Heap tracing is precise where a type descriptor is known, conservative everywhere else, and releasing is still conservative throughout. `new`, `newa`
+  and `newaz` resolve the allocating module's type descriptor while the module is still known and hang the resulting pointer map on the object
+  (`heap::TraceMap`, interned per `(module, type)`), so mark-and-sweep traces exactly the words the module calls pointers: bytes read into an
+  `array of byte`, or the halves of a `real`, no longer keep an object alive by coincidence. Objects allocated without a descriptor -- strings, list
+  nodes, channels, module data arrays, the records the runtime builds for its own use -- keep the word-by-word scan, which retains anything that looks
+  like a live id. `dec_ref` still cascades only through slots whose reference is provably taken on store (list tails, array-slice parents) and not
+  through buffers, mapped or not: a pointer map states layout, not ownership, and the block-copy paths (`heap_write`, `array_write`, `cons_bytes`,
+  `movm`, `headm`) move pointers in *and out* of buffers without counting anything, while `op_ret` never releases a frame's pointers. Cascading on the
+  map alone would release references that were never acquired. So pointers owned by a buffer are still reclaimed by the collector rather than at drop,
+  and with `--no-gc` they leak. Closing that gap means a counted write barrier on every block copy in both directions, plus a working `freeptrs` at
+  `ret`.
 
 #### Unimplementable on Host OS
 

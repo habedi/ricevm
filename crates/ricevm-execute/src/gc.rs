@@ -263,6 +263,7 @@ mod tests {
 
         let mut thread_queue = std::collections::VecDeque::new();
         thread_queue.push_back(crate::vm::SuspendedThread {
+            pid: 0,
             frames: thread_frames,
             mp: Vec::new(),
             pc: 0,
@@ -392,6 +393,7 @@ mod tests {
 
         let mut thread_queue = std::collections::VecDeque::new();
         thread_queue.push_back(crate::vm::SuspendedThread {
+            pid: 0,
             frames: FrameStack::new(),
             mp: Vec::new(),
             pc: 0,

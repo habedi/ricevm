@@ -155,49 +155,7 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 
     // 3. Try loading from filesystem
-    let mut candidates = vec![path.clone(), format!("{path}.dis")];
-
-    // If a root path is configured, resolve absolute Inferno paths through it.
-    let root = &vm.root_path;
-    if !root.is_empty() && path.starts_with('/') {
-        candidates.insert(0, format!("{root}{path}"));
-        candidates.insert(1, format!("{root}{path}.dis"));
-    }
-
-    // Strip common Inferno prefixes for relative resolution
-    let stripped_paths: Vec<String> = ["/dis/lib/", "/dis/", "/"]
-        .iter()
-        .filter_map(|prefix| path.strip_prefix(prefix).map(|s| s.to_string()))
-        .collect();
-
-    // Add probe paths from RICEVM_PROBE env var
-    if let Ok(probe) = std::env::var("RICEVM_PROBE") {
-        for dir in probe.split(':') {
-            if !dir.is_empty() {
-                candidates.push(format!("{dir}/{path}"));
-                candidates.push(format!("{dir}/{path}.dis"));
-                // Also try stripped paths
-                for sp in &stripped_paths {
-                    candidates.push(format!("{dir}/{sp}"));
-                    candidates.push(format!("{dir}/{sp}.dis"));
-                }
-            }
-        }
-    }
-    // Also try root + stripped paths
-    if !root.is_empty() {
-        for sp in &stripped_paths {
-            candidates.push(format!("{root}/dis/{sp}"));
-            candidates.push(format!("{root}/dis/{sp}.dis"));
-            candidates.push(format!("{root}/dis/lib/{sp}"));
-            candidates.push(format!("{root}/dis/lib/{sp}.dis"));
-        }
-    }
-    candidates.push(format!("./{path}.dis"));
-    for sp in &stripped_paths {
-        candidates.push(sp.clone());
-        candidates.push(format!("{sp}.dis"));
-    }
+    let candidates = module_candidates(&path, &vm.root_path, std::env::var("RICEVM_PROBE").ok());
 
     for candidate in &candidates {
         if let Ok(bytes) = std::fs::read(candidate)
@@ -253,6 +211,58 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
     // Module not found: set dst to nil
     vm.move_ptr_to_dst(heap::NIL)
+}
+
+/// Filesystem paths to try for a module, most specific first.
+///
+/// Inferno paths are absolute (`/dis/lib/env.dis`) but the tree they name may
+/// be mounted anywhere, so each probe directory is tried with the leading
+/// `/dis/lib/`, `/dis/` or `/` removed. Order matters more than it looks:
+/// `/dis/lib/env.dis` and `/dis/env.dis` are *different modules* (`Env`, five
+/// exports; `Envcmd`, one), and several other names collide the same way. The
+/// prefixes are therefore stripped shortest-first, so the candidate that keeps
+/// the most of the original path is tried first and a probe directory pointing
+/// at `dis/` cannot answer a request for `dis/lib/`.
+fn module_candidates(path: &str, root: &str, probe: Option<String>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if !root.is_empty() && path.starts_with('/') {
+        candidates.push(format!("{root}{path}"));
+        candidates.push(format!("{root}{path}.dis"));
+    }
+    candidates.push(path.to_string());
+    candidates.push(format!("{path}.dis"));
+
+    // Shortest prefix first: "/" keeps `dis/lib/env.dis`, "/dis/lib/" keeps
+    // only `env.dis`. Trying them in that order prefers the specific match.
+    let stripped: Vec<String> = ["/", "/dis/", "/dis/lib/"]
+        .iter()
+        .filter_map(|p| path.strip_prefix(p).map(str::to_string))
+        .collect();
+
+    if let Some(probe) = probe {
+        for dir in probe.split(':').filter(|d| !d.is_empty()) {
+            candidates.push(format!("{dir}/{path}"));
+            candidates.push(format!("{dir}/{path}.dis"));
+            for sp in &stripped {
+                candidates.push(format!("{dir}/{sp}"));
+                candidates.push(format!("{dir}/{sp}.dis"));
+            }
+        }
+    }
+    if !root.is_empty() {
+        for sp in &stripped {
+            candidates.push(format!("{root}/dis/{sp}"));
+            candidates.push(format!("{root}/dis/{sp}.dis"));
+            candidates.push(format!("{root}/dis/lib/{sp}"));
+            candidates.push(format!("{root}/dis/lib/{sp}.dis"));
+        }
+    }
+    candidates.push(format!("./{path}.dis"));
+    for sp in &stripped {
+        candidates.push(sp.clone());
+        candidates.push(format!("{sp}.dis"));
+    }
+    candidates
 }
 
 /// Resolved module reference: either a built-in or a loaded .dis module.
@@ -855,6 +865,39 @@ mod tests {
     use crate::builtin::{BuiltinFunc, BuiltinModule};
     use crate::heap::HeapData;
     use crate::memory;
+
+    /// `/dis/lib/env.dis` is `Env` (five exports) and `/dis/env.dis` is
+    /// `Envcmd` (one). A probe directory pointing at `dis/` must not answer a
+    /// request for `dis/lib/` -- `sh` asks for `Env` and then calls its second
+    /// export, which fails outright against `Envcmd`.
+    #[test]
+    fn module_candidates_prefer_the_directory_the_path_names() {
+        let c = module_candidates(
+            "/dis/lib/env.dis",
+            "",
+            Some("/probe/dis:/probe/dis/lib".into()),
+        );
+        let specific = c
+            .iter()
+            .position(|p| p == "/probe/dis/lib/env.dis")
+            .expect("the lib/ path must be a candidate");
+        let generic = c
+            .iter()
+            .position(|p| p == "/probe/dis/env.dis")
+            .expect("the stripped path stays a fallback");
+        assert!(
+            specific < generic,
+            "dis/lib/env.dis must be tried before dis/env.dis, got {c:#?}"
+        );
+    }
+
+    #[test]
+    fn module_candidates_still_strip_for_a_flat_probe_dir() {
+        // A probe directory holding the modules directly still resolves, which
+        // is what the stripped forms are for.
+        let c = module_candidates("/dis/lib/string.dis", "", Some("/flat".into()));
+        assert!(c.contains(&"/flat/string.dis".to_string()));
+    }
 
     fn test_module() -> Module {
         Module {

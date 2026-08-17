@@ -91,6 +91,7 @@ impl VmThread {
                 frames,
                 mp,
                 pc,
+                pid: id as i32,
                 heap_refs: Vec::new(),
                 last_error: String::new(),
                 current_loaded_module: None,
@@ -592,6 +593,9 @@ fn run_thread_quanta_shared(
             blocked_channel: None,
             unwind_floor: 0,
             thread_queue: std::collections::VecDeque::new(),
+            current_pid: 1,
+            next_pid: 2,
+            wait_records: std::collections::VecDeque::new(),
             heap_refs: std::mem::take(&mut thread.heap_refs),
         };
 
@@ -671,6 +675,7 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
             frames: FrameStack::new(),
             mp: Vec::new(),
             pc: 0,
+            pid: 0,
             heap_refs: Vec::new(),
             last_error: String::new(),
             current_loaded_module: None,
@@ -711,6 +716,9 @@ fn dispatch_for_thread(sched: &mut Scheduler<'_>, inst: &Instruction) -> Result<
         blocked_channel: None,
         unwind_floor: 0,
         thread_queue,
+        current_pid: thread.id as i32,
+        next_pid: 0,
+        wait_records: std::collections::VecDeque::new(),
         heap_refs: std::mem::take(&mut thread.heap_refs),
     };
 

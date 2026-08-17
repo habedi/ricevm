@@ -84,10 +84,13 @@ pub(crate) fn op_spawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 
     // Create suspended thread for the child.
+    let pid = vm.next_pid;
+    vm.next_pid += 1;
     let child = crate::vm::SuspendedThread {
         frames: child_frames,
         mp: cloned_mp,
         pc: target_pc,
+        pid,
         heap_refs: Vec::new(),
         last_error: String::new(),
         current_loaded_module: vm.current_loaded_module,
@@ -156,10 +159,13 @@ pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             }
         }
 
+        let pid = vm.next_pid;
+        vm.next_pid += 1;
         let child = crate::vm::SuspendedThread {
             frames: child_frames,
             mp: cloned_mp,
             pc: entry_pc,
+            pid,
             heap_refs: Vec::new(),
             last_error: String::new(),
             current_loaded_module: vm.current_loaded_module,
@@ -1441,6 +1447,7 @@ mod tests {
 
         // A peer thread suspended trying to send on the (full) channel.
         vm.thread_queue.push_back(crate::vm::SuspendedThread {
+            pid: 0,
             frames: crate::frame::FrameStack::new(),
             mp: Vec::new(),
             pc: 0,

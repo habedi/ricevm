@@ -600,6 +600,9 @@ fn read_fd(
     fd: i32,
     buf: &mut [u8],
 ) -> Result<std::io::Result<usize>, ExecError> {
+    if vm.files.get_path(fd).is_some_and(|p| p.ends_with("/wait")) {
+        return Ok(Ok(read_wait_file(vm, buf)?));
+    }
     loop {
         match vm.files.read(fd, buf) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -610,6 +613,28 @@ fn read_fd(
             // For a pipe not even that, and `read_blocking` says so at once
             // instead of hanging the VM.
             return Ok(vm.files.read_blocking(fd, buf));
+        }
+    }
+}
+
+/// Serve a read of `/prog/N/wait`: hand back the oldest exit record, running
+/// the threads that could produce one if none is waiting yet.
+///
+/// A shell spawns a command and reads this file straight away, so the child
+/// usually has not run at that point; giving up and reporting end-of-file
+/// would hand the caller an empty record, which it then parses positionally
+/// and walks off the end of. Returning 0 is right only once nothing is left
+/// that could still exit.
+fn read_wait_file(vm: &mut VmState<'_>, buf: &mut [u8]) -> Result<usize, ExecError> {
+    loop {
+        if let Some(record) = vm.wait_records.pop_front() {
+            let bytes = record.as_bytes();
+            let n = bytes.len().min(buf.len());
+            buf[..n].copy_from_slice(&bytes[..n]);
+            return Ok(n);
+        }
+        if !run_other_vm_thread(vm)? {
+            return Ok(0);
         }
     }
 }
@@ -657,6 +682,7 @@ fn run_other_vm_thread(vm: &mut VmState<'_>) -> Result<bool, ExecError> {
     let ran = crate::vm::SuspendedThread {
         frames: std::mem::replace(&mut vm.frames, saved_frames),
         mp: std::mem::replace(&mut vm.mp, saved_mp),
+        pid: vm.current_pid,
         pc: vm.pc,
         heap_refs: std::mem::replace(&mut vm.heap_refs, saved_heap_refs),
         last_error: std::mem::replace(&mut vm.last_error, saved_last_error),
@@ -963,8 +989,11 @@ fn sys_sleep(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn sys_pctl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    // Stub: return 0 (success)
-    memory::write_word(&mut vm.frames.data, frame_base, 0);
+    // The flags select which parts of the process state to fork; none of that
+    // is modelled here. What callers do rely on is the return value: `pctl`
+    // answers with the caller's own pid, which is how a program names its
+    // children and finds its own `/prog/<pid>/wait`.
+    memory::write_word(&mut vm.frames.data, frame_base, vm.current_pid);
     Ok(())
 }
 
@@ -2378,6 +2407,7 @@ mod tests {
         let mut frames = crate::frame::FrameStack::new();
         frames.push_entry(64, -1);
         crate::vm::SuspendedThread {
+            pid: 0,
             frames,
             mp: Vec::new(),
             pc: 0,

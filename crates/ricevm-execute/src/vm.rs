@@ -79,6 +79,16 @@ pub(crate) struct VmState<'m> {
 
     /// Queue of suspended threads for cooperative scheduling.
     pub(crate) thread_queue: std::collections::VecDeque<SuspendedThread>,
+
+    /// Pid of the thread currently running. `sys->pctl` reports it, and a
+    /// program that spawns children uses it to tell them apart.
+    pub(crate) current_pid: i32,
+    /// Source of pids for threads spawned from here.
+    pub(crate) next_pid: i32,
+    /// Exit records for threads that have finished, oldest first, in the form
+    /// the reference writes them: `pid "module":cause`, with an empty cause on
+    /// success (emu/port/dis.c:438). A read of `/prog/N/wait` takes one.
+    pub(crate) wait_records: std::collections::VecDeque<String>,
 }
 
 /// Per-thread state saved when a thread is suspended.
@@ -87,6 +97,8 @@ pub(crate) struct SuspendedThread {
     pub frames: FrameStack,
     pub mp: Vec<u8>,
     pub pc: usize,
+    /// Pid this thread reports through `sys->pctl` and names in its exit record.
+    pub pid: i32,
     pub heap_refs: Vec<(heap::HeapId, usize)>,
     pub last_error: String,
     pub current_loaded_module: Option<usize>,
@@ -508,6 +520,9 @@ impl<'m> VmState<'m> {
             blocked_channel: None,
             unwind_floor: 0,
             thread_queue: std::collections::VecDeque::new(),
+            current_pid: 1,
+            next_pid: 2,
+            wait_records: std::collections::VecDeque::new(),
             heap_refs: Vec::new(),
         })
     }
@@ -575,6 +590,9 @@ impl<'m> VmState<'m> {
 
         loop {
             if self.halted {
+                // This thread is done; leave its exit record for whoever is
+                // waiting on it before handing the VM to the next thread.
+                self.record_thread_exit("");
                 // Current thread halted: check for other threads
                 if self.thread_queue.is_empty() {
                     return Ok(());
@@ -665,6 +683,7 @@ impl<'m> VmState<'m> {
             frames: std::mem::replace(&mut self.frames, FrameStack::new()),
             mp: std::mem::take(&mut self.mp),
             pc: self.pc,
+            pid: self.current_pid,
             heap_refs: std::mem::take(&mut self.heap_refs),
             last_error: std::mem::take(&mut self.last_error),
             current_loaded_module: self.current_loaded_module.take(),
@@ -680,6 +699,7 @@ impl<'m> VmState<'m> {
         let suspended = SuspendedThread {
             frames: std::mem::replace(&mut self.frames, FrameStack::new()),
             mp: std::mem::take(&mut self.mp),
+            pid: self.current_pid,
             pc: self.pc, // DON'T advance; will re-execute recv/alt when unblocked
             heap_refs: std::mem::take(&mut self.heap_refs),
             last_error: std::mem::take(&mut self.last_error),
@@ -760,6 +780,15 @@ impl<'m> VmState<'m> {
                     None => true, // wildcard
                 };
                 if matches {
+                    // A case can carry the `NOPC` sentinel instead of a
+                    // landing pc, which means this handler does not take the
+                    // exception after all; the reference guards the same way
+                    // with `if(newpc != NOPC)` (emu/port/exception.c:126).
+                    // Keep looking, and let the caller unwind if nothing else
+                    // matches.
+                    if case.pc < 0 {
+                        continue;
+                    }
                     return Some((case.pc as usize, handler.exception_offset.max(0) as usize));
                 }
             }
@@ -849,7 +878,23 @@ impl<'m> VmState<'m> {
         self.last_error = thread.last_error;
         self.current_loaded_module = thread.current_loaded_module;
         self.caller_mp_stack = thread.caller_mp_stack;
+        self.current_pid = thread.pid;
         self.halted = false;
+    }
+
+    /// Record that the running thread finished, in the form a read of
+    /// `/prog/N/wait` returns: `pid "module":cause`, the cause empty when the
+    /// thread ran to completion (emu/port/dis.c:438). A shell spawns a command
+    /// and then reads that file to learn how the command ended, so a thread
+    /// that exits without leaving a record hangs the shell -- or, since the
+    /// record is parsed positionally, walks it off the end of an empty string.
+    pub(crate) fn record_thread_exit(&mut self, cause: &str) {
+        let name = match self.current_loaded_module {
+            Some(idx) => self.loaded_modules[idx].module.name.clone(),
+            None => self.module.name.clone(),
+        };
+        self.wait_records
+            .push_back(format!("{} \"{}\":{}", self.current_pid, name, cause));
     }
 
     pub(crate) fn trace_instruction(&self, inst: &Instruction) {
@@ -1625,6 +1670,80 @@ mod tests {
         assert_eq!(vm.next_pc, 99);
     }
 
+    /// A wildcard case whose pc is the `NOPC` sentinel (-1) means "no handler
+    /// here, keep unwinding" -- the reference checks `if(newpc != NOPC)` before
+    /// taking it (emu/port/exception.c:126). Treating it as a jump target sends
+    /// the thread to pc -1; running `echo` under the shipped Inferno shell hit
+    /// exactly that.
+    #[test]
+    fn raise_exception_skips_a_wildcard_case_with_no_pc() {
+        use ricevm_core::{ExceptionCase, Handler};
+
+        let mut module = test_module();
+        module.handlers = vec![Handler {
+            exception_offset: 0,
+            begin_pc: 0,
+            end_pc: 10,
+            type_descriptor: None,
+            cases: vec![ExceptionCase {
+                name: None, // wildcard, but with no landing pc
+                pc: -1,
+            }],
+        }];
+
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.pc = 5;
+
+        let result = vm.raise_exception("anything");
+        assert!(
+            result.is_err(),
+            "a NOPC wildcard must not be taken as a handler; got next_pc={}",
+            vm.next_pc
+        );
+    }
+
+    /// The record a waiter reads has to be exactly the shape the reference
+    /// writes, `pid "module":cause` (emu/port/dis.c:438) -- consumers parse it
+    /// positionally, looking for the space, the quotes and the colon in turn.
+    #[test]
+    fn thread_exit_record_matches_the_reference_format() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.current_pid = 7;
+
+        vm.record_thread_exit("");
+        let record = vm.wait_records.pop_front().expect("a record");
+        assert_eq!(record, format!("7 \"{}\":", module.name));
+
+        vm.record_thread_exit("some failure");
+        assert_eq!(
+            vm.wait_records.pop_front().expect("a record"),
+            format!("7 \"{}\":some failure", module.name)
+        );
+    }
+
+    /// `sys->pctl` reports the running thread's own pid; a shell uses it both
+    /// to name its children and to find its own `/prog/<pid>/wait`.
+    #[test]
+    fn a_resumed_thread_reports_its_own_pid() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        assert_eq!(vm.current_pid, 1, "the first thread is pid 1");
+
+        vm.load_thread(SuspendedThread {
+            frames: FrameStack::new(),
+            mp: Vec::new(),
+            pc: 0,
+            pid: 42,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            current_loaded_module: None,
+            caller_mp_stack: Vec::new(),
+            blocked_on: None,
+        });
+        assert_eq!(vm.current_pid, 42);
+    }
+
     #[test]
     fn raise_exception_no_handler_returns_error() {
         let module = test_module(); // no handlers
@@ -2026,6 +2145,7 @@ mod tests {
         let child_fp = child_frames.current_data_offset();
         memory::write_word(&mut child_frames.data, child_fp, child_chan as i32);
         vm.thread_queue.push_back(SuspendedThread {
+            pid: 0,
             frames: child_frames,
             mp: Vec::new(),
             pc: 0,

@@ -33,8 +33,7 @@ jobs:
 
     strategy:
       matrix:
-        # Define the Rust versions for linting against
-        rust-version: [ "1.92.0", "stable" ]
+        rust-version: [ "1.97.1", "stable" ]
 
     steps:
       - name: Checkout code

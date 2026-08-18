@@ -292,9 +292,10 @@ rather than a guarantee: a program can run to completion and still print the wro
   `array of byte`, or the halves of a `real`, no longer keep an object alive by coincidence. Objects allocated without a descriptor -- strings, list
   nodes, channels, module data arrays, the records the runtime builds for its own use -- keep the word-by-word scan, which retains anything that looks
   like a live id. `dec_ref` still cascades only through slots whose reference is provably taken on store (list tails, array-slice parents) and not
-  through buffers, mapped or not: a pointer map states layout, not ownership, and the block-copy paths (`heap_write`, `array_write`, `cons_bytes`,
-  `movm`, `headm`) move pointers in *and out* of buffers without counting anything, while `op_ret` never releases a frame's pointers. Cascading on the
-  map alone would release references that were never acquired. So pointers owned by a buffer are still reclaimed by the collector rather than at drop,
+  through buffers, mapped or not: a pointer map states layout, not ownership, and several block-copy paths (`heap_write`, `array_write`, `cons_bytes`,
+  `movm`, and `headm`) move pointers in *and out* of buffers without counting anything, while `op_ret` never releases a frame's pointers. Cascading on
+  the map alone would release references that were never acquired. The typed copies are counted: `movmp`, `consmp`, `headmp`, and `slicela` walk the
+  pointer map and take a reference for every pointer they duplicate, matching `incmem` in the reference. So pointers owned by a buffer are still reclaimed by the collector rather than at drop,
   and with `--no-gc` they leak. Closing that gap means a counted write barrier on every block copy in both directions, plus a working `freeptrs` at
   `ret`.
 

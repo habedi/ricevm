@@ -102,9 +102,15 @@ impl<'src> Lexer<'src> {
     }
 
     fn err(&self, msg: impl Into<String>) -> LexError {
+        self.err_at(self.span(), msg)
+    }
+
+    /// Error reported at a place the lexer has already moved past, such as the
+    /// first character of the token being read.
+    fn err_at(&self, span: Span, msg: impl Into<String>) -> LexError {
         LexError {
             file: self.file.clone(),
-            span: self.span(),
+            span,
             message: msg.into(),
         }
     }
@@ -127,8 +133,15 @@ impl<'src> Lexer<'src> {
             return self.lex_dot_number(span);
         }
 
-        // Identifiers and keywords
-        if ch.is_ascii_alphabetic() || ch == b'_' {
+        // Identifiers and keywords. A scalar outside ASCII is a letter as far
+        // as the reference is concerned: its character map marks every byte
+        // above 0xA0 as an identifier character and reports every rune from
+        // 0x100 up as a lowercase letter (lex.c:141-147 and lex.c:188-195),
+        // and `lexid` accumulates whatever those two rules accept
+        // (lex.c:511-543, reached from lex.c:1082-1083). The corpus uses it:
+        // appl/spree/lib/testsets.b:18 declares `∈: Set;` and appl/wm/c4.b:387
+        // passes `∞`.
+        if ch.is_ascii_alphabetic() || ch == b'_' || is_ident_byte(ch) {
             return self.lex_ident(span);
         }
 
@@ -154,7 +167,9 @@ impl<'src> Lexer<'src> {
     fn lex_ident(&mut self, span: Span) -> Result<Token, LexError> {
         let start = self.pos;
         while self.pos < self.src.len()
-            && (self.peek().is_ascii_alphanumeric() || self.peek() == b'_')
+            && (self.peek().is_ascii_alphanumeric()
+                || self.peek() == b'_'
+                || is_ident_byte(self.peek()))
         {
             self.advance();
         }
@@ -238,8 +253,12 @@ impl<'src> Lexer<'src> {
         }
 
         // Check for float: digits.digits, digits., digits.digitsE..., digits E...
+        // A dot always ends the integer part: the reference moves from its
+        // `Int` state to `Frac` on any dot and never returns (lex.c:702-705),
+        // so `1.e-30` is one real literal (appl/math/gr.b:215) and `1.` is a
+        // real even when a letter follows it.
         let mut is_float = false;
-        if self.peek() == b'.' && !self.peek2().is_ascii_alphabetic() && self.peek2() != b'.' {
+        if self.peek() == b'.' {
             is_float = true;
             self.advance(); // skip '.'
             while self.pos < self.src.len() && self.peek().is_ascii_digit() {
@@ -548,7 +567,11 @@ impl<'src> Lexer<'src> {
             b',' => TokenKind::Comma,
             b'.' => TokenKind::Dot,
             b';' => TokenKind::Semicolon,
-            _ => return Err(self.err(format!("unexpected character: {:?}", ch as char))),
+            // Reported at the character itself, which `advance` has already
+            // stepped over.
+            _ => {
+                return Err(self.err_at(span, format!("unexpected character: {:?}", ch as char)));
+            }
         };
         Ok(Token { kind, span })
     }
@@ -962,8 +985,17 @@ include "sys.m";
 
     #[test]
     fn keyword_lookalikes_are_identifiers() {
-        for word in ["ifx", "elsewhere", "_if", "If", "INT", "int32", "raises", "dynamic", "fixed"]
-        {
+        for word in [
+            "ifx",
+            "elsewhere",
+            "_if",
+            "If",
+            "INT",
+            "int32",
+            "raises",
+            "dynamic",
+            "fixed",
+        ] {
             assert_eq!(
                 lex(word),
                 vec![TokenKind::Ident(word.to_string())],
@@ -1112,6 +1144,38 @@ include "sys.m";
         }
     }
 
+    /// `1.e-30` is one real literal: the reference leaves its integer state on
+    /// any dot and reads the exponent from the fraction state (lex.c:702-724).
+    /// It used to lex as `1`, `.`, `e`, `-`, `30`, which broke every source
+    /// that writes a real that way, such as appl/math/gr.b:215.
+    #[test]
+    fn real_literal_with_a_dot_before_the_exponent() {
+        assert_eq!(lex("1.e-30"), vec![TokenKind::RealLit(1e-30)]);
+        assert_eq!(lex("1.E+3"), vec![TokenKind::RealLit(1000.0)]);
+        assert_eq!(
+            lex("r := 1.e-30;"),
+            vec![
+                TokenKind::Ident("r".to_string()),
+                TokenKind::ColonEq,
+                TokenKind::RealLit(1e-30),
+                TokenKind::Semicolon,
+            ]
+        );
+    }
+
+    /// A trailing dot ends the literal even when a letter follows, which is
+    /// what the reference's `Frac` state does (lex.c:715-723).
+    #[test]
+    fn trailing_dot_before_a_letter_is_still_a_real() {
+        assert_eq!(
+            lex("1000.foo"),
+            vec![
+                TokenKind::RealLit(1000.0),
+                TokenKind::Ident("foo".to_string())
+            ]
+        );
+    }
+
     /// A number followed by `r` and a real fraction (`16r1.8`) is a radix real
     /// in the reference (the `FracB` state, lex.c:766-785). This front end has
     /// no radix-real form, so it stops the literal at the dot; the digits after
@@ -1208,7 +1272,9 @@ include "sys.m";
         // Two-, three-, and four-byte scalars all keep their own code point.
         assert_eq!(
             lex("\"a\u{E9}\u{20AC}\u{1F600}b\""),
-            vec![TokenKind::StringLit("a\u{E9}\u{20AC}\u{1F600}b".to_string())]
+            vec![TokenKind::StringLit(
+                "a\u{E9}\u{20AC}\u{1F600}b".to_string()
+            )]
         );
         assert_eq!(
             lex("'\u{1F600}'"),

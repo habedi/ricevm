@@ -27,6 +27,9 @@ const LIST_AFTER: usize = 10;
 /// Number of frames a backtrace walks before it gives up.
 const MAX_BACKTRACE_DEPTH: usize = 100;
 
+/// Number of stepped instructions between garbage collections.
+const GC_INTERVAL: usize = 10_000;
+
 /// A command the debugger understands, as parsed from one line of input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -247,7 +250,7 @@ fn walk_backtrace(data: &[u8], current_base: usize) -> Vec<BacktraceEntry> {
     let mut entries = Vec::new();
     let mut base = current_base;
     loop {
-        if base + 8 > data.len() {
+        if base.saturating_add(8) > data.len() {
             break;
         }
         let prev_pc: Pc = memory::read_word(data, base);
@@ -481,7 +484,7 @@ impl<'m> Debugger<'m> {
 
         if self.vm.gc_enabled {
             self.vm.gc_counter += 1;
-            if self.vm.gc_counter >= 10_000 {
+            if self.vm.gc_counter >= GC_INTERVAL {
                 self.vm.gc_counter = 0;
                 crate::gc::collect(
                     &mut self.vm.heap,
@@ -587,14 +590,23 @@ impl<'m> Debugger<'m> {
         let Ok(offset) = off_str.parse::<usize>() else {
             return Vec::new();
         };
-        let abs = self.vm.frames.current_data_offset() + offset;
-        if abs + 4 <= self.vm.frames.data.len() {
-            vec![InfoValue::Word {
+        // The offset is typed by the user, so both sums need checking before the
+        // result is used as an address.
+        let fits = self
+            .vm
+            .frames
+            .current_data_offset()
+            .checked_add(offset)
+            .filter(|abs| {
+                abs.checked_add(4)
+                    .is_some_and(|end| end <= self.vm.frames.data.len())
+            });
+        match fits {
+            Some(abs) => vec![InfoValue::Word {
                 offset,
                 value: memory::read_word(&self.vm.frames.data, abs),
-            }]
-        } else {
-            vec![InfoValue::OffsetOutOfBounds]
+            }],
+            None => vec![InfoValue::OffsetOutOfBounds],
         }
     }
 
@@ -620,7 +632,9 @@ impl<'m> Debugger<'m> {
         for (index, entry) in entries.iter().enumerate() {
             let depth = index + 1;
             match entry {
-                BacktraceEntry::Caller(pc) => println!("  #{depth} pc={}", format!("{pc}").yellow()),
+                BacktraceEntry::Caller(pc) => {
+                    println!("  #{depth} pc={}", format!("{pc}").yellow())
+                }
                 BacktraceEntry::Entry => println!("  #{depth} pc=<entry> (bottom of stack)"),
                 BacktraceEntry::Truncated => println!("  ... (truncated)"),
             }
@@ -824,7 +838,10 @@ mod tests {
 
     #[test]
     fn parse_break_ignores_words_after_the_pc() {
-        assert_eq!(parse_command("break 5 and then some"), Ok(Command::Break(5)));
+        assert_eq!(
+            parse_command("break 5 and then some"),
+            Ok(Command::Break(5))
+        );
     }
 
     #[test]
@@ -865,9 +882,7 @@ mod tests {
     fn parse_reports_a_missing_info_target() {
         assert_eq!(
             parse_command("info"),
-            Err(ParseError::MissingArgument(
-                "info regs|break|frame|heap|mp"
-            ))
+            Err(ParseError::MissingArgument("info regs|break|frame|heap|mp"))
         );
     }
 
@@ -986,9 +1001,15 @@ mod tests {
     fn execution_stops_only_at_a_breakpoint_pc() {
         let mut breakpoints = HashSet::new();
         set_breakpoint(&mut breakpoints, 3);
-        assert!(!should_stop(&breakpoints, 2), "pc 2 is before the breakpoint");
+        assert!(
+            !should_stop(&breakpoints, 2),
+            "pc 2 is before the breakpoint"
+        );
         assert!(should_stop(&breakpoints, 3), "pc 3 is the breakpoint");
-        assert!(!should_stop(&breakpoints, 4), "pc 4 is after the breakpoint");
+        assert!(
+            !should_stop(&breakpoints, 4),
+            "pc 4 is after the breakpoint"
+        );
     }
 
     #[test]
@@ -1059,7 +1080,11 @@ mod tests {
         dbg.vm.pc = module.code.len();
         dbg.step().expect("step past the end");
         assert!(dbg.vm.halted);
-        assert_eq!(dbg.vm.pc, module.code.len(), "pc must not move past the end");
+        assert_eq!(
+            dbg.vm.pc,
+            module.code.len(),
+            "pc must not move past the end"
+        );
     }
 
     #[test]
@@ -1075,6 +1100,40 @@ mod tests {
             .expect("step on a halted program");
         assert_eq!(flow, Flow::Continue);
         assert_eq!(dbg.vm.pc, pc_at_halt, "pc must not move after the exit");
+    }
+
+    #[test]
+    fn stepping_collects_garbage_once_per_interval() {
+        let module = nop_module(4);
+        let mut dbg = Debugger::new(&module).expect("debugger should start");
+        dbg.vm.gc_enabled = true;
+        dbg.vm.gc_counter = 0;
+
+        dbg.step().expect("step");
+        assert_eq!(
+            dbg.vm.gc_counter, 1,
+            "each step counts towards the next collection"
+        );
+
+        dbg.vm.gc_counter = GC_INTERVAL - 1;
+        dbg.step().expect("step over the interval");
+        assert_eq!(
+            dbg.vm.gc_counter, 0,
+            "reaching the interval collects and resets the counter"
+        );
+        assert_eq!(dbg.vm.pc, 2, "collecting does not disturb the pc");
+    }
+
+    #[test]
+    fn stepping_does_not_count_when_the_collector_is_off() {
+        let module = nop_module(4);
+        let mut dbg = Debugger::new(&module).expect("debugger should start");
+        dbg.vm.gc_enabled = false;
+        dbg.vm.gc_counter = 0;
+
+        dbg.step().expect("step");
+        assert_eq!(dbg.vm.gc_counter, 0);
+        assert_eq!(dbg.vm.pc, 1, "the step still runs");
     }
 
     // --- Continuing to a breakpoint ---
@@ -1329,6 +1388,18 @@ mod tests {
     }
 
     #[test]
+    fn print_word_rejects_an_offset_that_would_overflow_an_address() {
+        let module = nop_module(1);
+        let dbg = Debugger::new(&module).expect("debugger should start");
+        // The offset is typed by the user, so adding it to the frame pointer must
+        // not overflow.
+        assert_eq!(
+            dbg.print_values_for("word", Some(&usize::MAX.to_string())),
+            vec![InfoValue::OffsetOutOfBounds]
+        );
+    }
+
+    #[test]
     fn print_word_without_an_offset_shows_its_usage() {
         let module = nop_module(1);
         let dbg = Debugger::new(&module).expect("debugger should start");
@@ -1389,7 +1460,11 @@ mod tests {
     fn the_list_window_clamps_to_the_ends_of_the_code() {
         assert_eq!(list_window(0, 100), (0, 10), "no lines before the first pc");
         assert_eq!(list_window(2, 100), (0, 12));
-        assert_eq!(list_window(98, 100), (93, 100), "clamped to the code length");
+        assert_eq!(
+            list_window(98, 100),
+            (93, 100),
+            "clamped to the code length"
+        );
         assert_eq!(list_window(0, 0), (0, 0), "an empty module lists nothing");
     }
 

@@ -754,8 +754,7 @@ mod tests {
                     FALL_THROUGH
                 };
                 assert_eq!(
-                    landed,
-                    want,
+                    landed, want,
                     "{width} {opcode:?} with {}: expected pc {want}, landed on {landed}",
                     CASE_NAMES[case]
                 );
@@ -1034,7 +1033,7 @@ mod tests {
         ];
         for (opcode, s, m, taken) in cases {
             let mut vm = VmState::new(&module).expect("vm init");
-            let mut id_of = |vm: &mut VmState<'_>, text: Option<&str>| match text {
+            let id_of = |vm: &mut VmState<'_>, text: Option<&str>| match text {
                 None => heap::NIL,
                 Some(t) => vm.heap.alloc(0, heap::HeapData::Str(t.to_string())),
             };

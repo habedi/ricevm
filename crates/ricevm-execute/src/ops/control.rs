@@ -431,15 +431,28 @@ fn run_nested_module_call(
     // not the caller -- decides where execution resumes.
     let saved_unwind_floor = std::mem::replace(&mut vm.unwind_floor, vm.frames.current_base);
 
-    if let Some(idx) = module_idx {
-        // Swap in the loaded module's persistent MP so module refs stored
-        // during execution persist for subsequent calls, and push the caller's
-        // MP so cross-module virtual addresses can still resolve to it.
+    // Swap in the callee's own data so anything it stores persists across
+    // calls, and park the caller's where cross-module virtual addresses can
+    // still resolve to it.
+    //
+    // A loaded module's data rests in `LoadedModule::mp`; the main module's
+    // rests on the caller stack, put there when it called into the module that
+    // is now calling back. Both are found the same way, so a loaded module
+    // holding a `$self` reference can call the program that loaded it.
+    let entering = module_idx != saved_loaded_module;
+    let parked_slot = vm.caller_mp_stack.iter().rposition(|(virt, _)| *virt == 0);
+    if entering {
         let caller_virt_idx = vm.current_module_virt_idx();
-        let loaded_mp = std::mem::take(&mut vm.loaded_modules[idx].mp);
-        let parent_mp = std::mem::replace(&mut vm.mp, loaded_mp);
+        let callee_mp = match module_idx {
+            Some(idx) => std::mem::take(&mut vm.loaded_modules[idx].mp),
+            None => match parked_slot {
+                Some(slot) => std::mem::take(&mut vm.caller_mp_stack[slot].1),
+                None => std::mem::take(&mut vm.mp),
+            },
+        };
+        let parent_mp = std::mem::replace(&mut vm.mp, callee_mp);
         vm.caller_mp_stack.push((caller_virt_idx, parent_mp));
-        vm.current_loaded_module = Some(idx);
+        vm.current_loaded_module = module_idx;
     }
     vm.pc = entry_pc;
     vm.halted = false;
@@ -447,11 +460,18 @@ fn run_nested_module_call(
     let nested = nested_interpreter_loop(vm, module_idx, call_frame_base);
 
     vm.unwind_floor = saved_unwind_floor;
-    if let Some(idx) = module_idx {
-        // Write the loaded module's MP back (preserving any changes), then
-        // restore the caller's MP from the stack.
+    if entering {
+        // Hand the callee's data back to its home (keeping any changes), then
+        // restore the caller's from the stack.
         let (_, parent_mp) = vm.caller_mp_stack.pop().unwrap_or_default();
-        vm.loaded_modules[idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
+        let callee_mp = std::mem::replace(&mut vm.mp, parent_mp);
+        match module_idx {
+            Some(idx) => vm.loaded_modules[idx].mp = callee_mp,
+            None => match parked_slot {
+                Some(slot) => vm.caller_mp_stack[slot].1 = callee_mp,
+                None => vm.mp = callee_mp,
+            },
+        }
     }
     vm.pc = saved_pc;
     vm.next_pc = saved_next_pc;
@@ -557,12 +577,6 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             }
         }
         ModuleKind::Main { func_map } => {
-            if vm.current_loaded_module.is_some() {
-                return Err(ExecError::Other(
-                    "calling main-module refs from loaded modules is unsupported".to_string(),
-                ));
-            }
-
             let export_idx = func_map
                 .get(func_idx as usize)
                 .copied()

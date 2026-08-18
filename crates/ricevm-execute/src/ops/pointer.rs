@@ -317,17 +317,31 @@ pub(crate) fn op_slicela(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         )));
     }
 
-    // For pointer-sized elements, collect old dst values before overwrite
-    // so we can adjust reference counts (inc new, dec old).
+    // The copy duplicates every pointer the elements hold, so each one is a new
+    // reference and each one it overwrites is a released reference.
+    //
+    // Which words are pointers comes from the element's own map where the array
+    // carries one; an array of bare pointers has no map, and there every word is
+    // one. Counting only the second case is what let an array of *records* --
+    // `(int, string)`, say -- hand out uncounted copies.
+    let copied_bytes = src_len * elem_size;
+    let ptr_offsets: Vec<usize> = match vm.heap.get(real_dst_id).and_then(|o| o.trace.clone()) {
+        Some(map) => map.pointer_offsets(copied_bytes).collect(),
+        None if elem_size == 4 => (0..src_len).map(|i| i * 4).collect(),
+        None => Vec::new(),
+    };
+
     let mut old_ptrs = Vec::new();
     let mut new_ptrs = Vec::new();
-    if elem_size == 4 {
+    if !ptr_offsets.is_empty() {
         let copy_start = dst_byte_offset + insert_pos * elem_size;
         if let Some(obj) = vm.heap.get(real_dst_id)
             && let heap::HeapData::Array { data, .. } = &obj.data
         {
-            for i in 0..src_len {
-                let off = copy_start + i * 4;
+            for off in ptr_offsets
+                .iter()
+                .filter_map(|o| copy_start.checked_add(*o))
+            {
                 if off + 4 <= data.len() {
                     let id = crate::memory::read_word(data, off) as u32;
                     if id != heap::NIL && vm.heap.contains(id) {
@@ -336,8 +350,7 @@ pub(crate) fn op_slicela(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 }
             }
         }
-        for i in 0..src_len {
-            let off = i * 4;
+        for &off in &ptr_offsets {
             if off + 4 <= src_data.len() {
                 let id = crate::memory::read_word(&src_data, off) as u32;
                 if id != heap::NIL && vm.heap.contains(id) {
@@ -1065,6 +1078,66 @@ mod tests {
         let (ref_id, ref_offset) = vm.heap_refs[ref_idx];
         assert_eq!(ref_id, parent_id, "should resolve to parent");
         assert_eq!(ref_offset, 16); // byte_start(8) + index(2) * elem_size(4)
+    }
+
+    #[test]
+    /// Copying array elements duplicates whatever pointers those elements hold,
+    /// so each copy is a new reference. Reference counts were only adjusted for
+    /// arrays of bare pointers (`elem_size == 4`), which left an array of
+    /// *records* -- say `(int, string)` -- handing out uncounted copies. The
+    /// first operation to release one, such as a `movmp` writing over that
+    /// field, then freed an object still in use.
+    fn slicela_counts_pointers_inside_record_elements() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+
+        let held = vm
+            .heap
+            .alloc(0, HeapData::Str("still referenced".to_string()));
+        let before = vm.heap.get(held).expect("just allocated").ref_count;
+
+        // Elements are 8 bytes: a word, then a pointer at offset 4.
+        let elem_map = std::sync::Arc::new(crate::heap::TraceMap::new(&[0x40], 8));
+
+        let mut src_data = vec![0u8; 8];
+        memory::write_word(&mut src_data, 0, 1234);
+        memory::write_word(&mut src_data, 4, held as i32);
+        let src_id = vm.heap.alloc_typed(
+            0,
+            HeapData::Array {
+                elem_type: 1,
+                elem_size: 8,
+                data: src_data,
+                length: 1,
+            },
+            Some(elem_map.clone()),
+        );
+        let dst_id = vm.heap.alloc_typed(
+            0,
+            HeapData::Array {
+                elem_type: 1,
+                elem_size: 8,
+                data: vec![0u8; 8],
+                length: 1,
+            },
+            Some(elem_map),
+        );
+
+        let fp = vm.frames.current_data_offset();
+        memory::write_word(&mut vm.frames.data, fp, src_id as i32);
+        memory::write_word(&mut vm.frames.data, fp + 4, dst_id as i32);
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Frame(fp + 4);
+        op_slicela(&mut vm).expect("slicela should succeed");
+
+        let after = vm.heap.get(held).expect("must still be live").ref_count;
+        assert_eq!(
+            after,
+            before + 1,
+            "the copy in the destination array is a new reference"
+        );
     }
 
     #[test]

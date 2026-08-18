@@ -81,11 +81,11 @@ This module includes functions for cryptographic operations.
 |-------------------------------------------------------------------------------------------------------|-----------------------------------------------|
 | `md4(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState`    | MD4 hash (real implementation)                |
 | `md5(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState`    | MD5 hash (real implementation)                |
-| `sha1(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState`   | SHA1 hash (real implementation)               |
-| `sha224(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA224 hash (real implementation)             |
-| `sha256(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA256 hash (real implementation)             |
-| `sha384(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA384 hash (real implementation)             |
-| `sha512(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA512 hash (real implementation)             |
+| `sha1(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState`   | SHA-1 hash (real implementation)               |
+| `sha224(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA-224 hash (real implementation)             |
+| `sha256(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA-256 hash (real implementation)             |
+| `sha384(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA-384 hash (real implementation)             |
+| `sha512(data: array of byte, n: int, digest: array of byte, state: ref DigestState): ref DigestState` | SHA-512 hash (real implementation)             |
 | `readauthinfo(path: string): ref Authinfo`                                                            | Read authentication info (stub)               |
 | `writeauthinfo(path: string, info: ref Authinfo): int`                                                | Write authentication info (stub)              |
 | `getstring(fd: ref Sys->FD): string`                                                                  | Read a string from a secure source (stub)     |
@@ -114,16 +114,16 @@ The `ricevm-limbo` crate exposes a public Rust API:
 
 ```rust
 // Compile source to a Module
-let module = ricevm_limbo::compile(src, "hello.b") ?;
+let module = ricevm_limbo::compile(src, "hello.b")?;
 
 // Compile source to .dis binary bytes
-let bytes = ricevm_limbo::compile_to_bytes(src, "hello.b") ?;
+let bytes = ricevm_limbo::compile_to_bytes(src, "hello.b")?;
 
 // Compile with include paths
 let opts = ricevm_limbo::CompileOptions {
 include_paths: vec!["external/inferno-os/module".to_string()],
 };
-let module = ricevm_limbo::compile_with_options(src, "hello.b", & opts) ?;
+let module = ricevm_limbo::compile_with_options(src, "hello.b", &opts)?;
 ```
 
 ## Virtual Device Files
@@ -143,5 +143,5 @@ RiceVM emulates these Inferno device files on the host OS:
 | `/dev/audio`     | PCM audio output (optional `audio` feature) |
 | `/dev/audioctl`  | Audio configuration                         |
 | `/prog/N/status` | Process status                              |
-| `/prog/N/wait`   | Process wait (returns EOF)                  |
+| `/prog/N/wait`   | Exit record of a finished thread            |
 | `/env/*`         | Environment variables                       |

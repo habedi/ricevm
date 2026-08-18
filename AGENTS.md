@@ -4,11 +4,9 @@ This file provides guidance to coding agents collaborating on this repository.
 
 ## Mission
 
-RiceVM is a Dis virtual machine and Limbo compiler in Rust.
-The Dis VM is a register machine that executes bytecode compiled from the Limbo programming language.
-The project includes a built-in Limbo compiler that compiles `.b` source files to `.dis` bytecode
-without depending on the reference compiler from Inferno OS.
-Priorities, in order:
+RiceVM is a Dis virtual machine and Limbo compiler in Rust. The Dis VM is a register machine that executes bytecode compiled from the Limbo
+programming language. The project includes a built-in Limbo compiler that compiles `.b` source files to `.dis` bytecode without depending on the
+reference compiler from Inferno OS. Priorities, in order:
 
 1. Correct implementation of the Dis VM specification and Limbo language.
 2. Clean, idiomatic Rust with safe abstractions over VM internals.
@@ -24,10 +22,10 @@ Priorities, in order:
 - Add comments only when they clarify non-obvious behavior.
 - Do not add features, error handling, or abstractions beyond what is needed for the current task.
 - Add tests for every bug fix and new feature to prevent regression.
-- Write the test before the fix, and confirm it fails for the reason being fixed. A test that never failed against the old code
-  proves only that the code compiles, which is how several bugs here survived a passing suite: `alt` emitted no code at all,
-  `string` of a real produced 0, and a tuple channel delivered zeros. Assert the value or the control flow, not that the call
-  returned. When a fix lands before its test, prove the test is real by reverting the fix, watching it fail, and restoring it.
+- Write the test before the fix, and confirm it fails for the reason being fixed. A test that never failed against the old code proves only that the
+  code compiles, which is how several bugs here survived a passing suite: `alt` emitted no code at all,
+  `string` of a real produced 0, and a tuple channel delivered zeros. Assert the value or the control flow, not that the call returned. When a fix
+  lands before its test, prove the test is real by reverting the fix, watching it fail, and restoring it.
 
 ## Writing Style
 
@@ -42,40 +40,38 @@ Priorities, in order:
 - Prefer noun phrases for checklist items over imperative verbs. Write "frame teardown" not "tear down the frame".
 - Do not bold the lead-in of a list item. Write "Pointer maps: ..." not "**Pointer maps**: ...".
 - Use sentence case for the lead-in of a list item. Write "Wait records: ..." not "Wait Records: ...". Proper nouns keep their capitals.
-- Do not use a colon in place of a verb. Three uses are fine: joining two clauses inside a complete sentence, which is the replacement the em dash rule
-  calls for; introducing the gloss of a list item; and introducing an enumeration, whether as a list or inline ("Opcodes: movp, movmp, and slicela").
-  What a colon must not do is turn a sentence into a label and a definition. Write "A cross-module call swaps in the callee's data and pushes the
-  caller's" rather than "Cross-module calls: swap in the callee's data". That shape belongs to a list item, and carrying it into prose leaves a fragment
-  where a sentence was required.
+- Do not use a colon in place of a verb. Three uses are fine: joining two clauses inside a complete sentence, which is the replacement the em dash
+  rule calls for; introducing the gloss of a list item; and introducing an enumeration, whether as a list or inline ("Opcodes: movp, movmp, and
+  slicela"). What a colon must not do is turn a sentence into a label and a definition. Write "A cross-module call swaps in the callee's data and
+  pushes the caller's" rather than "Cross-module calls: swap in the callee's data". That shape belongs to a list item, and carrying it into prose
+  leaves a fragment where a sentence was required.
 - Capitalize only the first part of a hyphenated compound: "Built-in Modules" in a heading, "Mark-and-sweep" at the start of a sentence, and "built-in
   module" elsewhere. Never write "Built-In".
 - Headings in Markdown files must be in title case: "Build from Source" not "Build from source". Minor words stay lowercase unless they are the first
-  word: the articles (a, an, and the), the coordinating conjunctions (and, but, or, nor, so, yet, and for), and the short prepositions (in, on, at, to,
-  by, of, up, as, from, with, into, and over). That example is why the prepositions are listed: "from" has to be lowercase for "Build from Source" to be
-  correct, and an earlier version of this rule stopped at "of", which made its own example a violation.
+  word: the articles (a, an, and the), the coordinating conjunctions (and, but, or, nor, so, yet, and for), and the short prepositions (in, on, at,
+  to, by, of, up, as, from, with, into, and over). That example is why the prepositions are listed: "from" has to be lowercase for "Build from Source"
+  to be correct, and an earlier version of this rule stopped at "of", which made its own example a violation.
 
 ## Repository Layout
 
 - `crates/ricevm-core/`: Shared types (Module, Opcode, Instruction, TypeDescriptor, and errors). No runtime logic.
 - `crates/ricevm-loader/`: Binary format parser for `.dis` module files. One public function: `load(&[u8]) -> Result<Module, LoadError>`.
 - `crates/ricevm-execute/`: Execution engine with 176 opcode handlers, heap, GC, built-in modules ($Sys, $Math, $Draw, $Tk, $Keyring, $Crypt, and
-  audio),
-  virtual device files, and file-based module loading.
-- `crates/ricevm-limbo/`: Built-in Limbo compiler. Lexer, parser, code generator, and .dis binary writer.
-  Compiles Limbo source to Dis bytecode end-to-end without depending on the reference limbo.dis compiler in the Inferno OS.
-  Codegen is kind-aware: it tracks `NumKind` (word, big, and real) per local; sidecar maps for array element types, channel element types, and ADT
-  layouts; and a fixup pass for forward-referenced calls and spawns.
+  audio), virtual device files, and file-based module loading.
+- `crates/ricevm-limbo/`: Built-in Limbo compiler. Lexer, parser, code generator, and .dis binary writer. Compiles Limbo source to Dis bytecode
+  end-to-end without depending on the reference limbo.dis compiler in the Inferno OS. Codegen is kind-aware: it tracks `NumKind` (word, big, and real)
+  per local; sidecar maps for array element types, channel element types, and ADT layouts; and a fixup pass for forward-referenced calls and spawns.
 - `crates/ricevm-cli/`: CLI with `run`, `dis`, and `compile` subcommands.
 - `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
   `libinterp/xec.c` for correctness validation).
 - `Makefile`: GNU Make wrapper around `cargo` commands (`make test`, `make build`, `make lint`, etc.).
-- `rust-toolchain.toml`: Pinned Rust toolchain (1.97.1) with `rustfmt`, `clippy`, and `rust-analyzer`. Everyone who builds
-  through rustup gets this version, which keeps builds and lint output reproducible.
-- The workspace's `rust-version` (1.90.0) is the minimum supported version, and it is deliberately lower than the pinned
-  toolchain. It records the oldest compiler the code actually builds on, which is what a packager building against a
-  distribution's own rustc needs; edition 2024 puts a hard floor at 1.85. Every crate inherits it with
-  `rust-version.workspace = true`, so `cargo` refuses an older toolchain up front instead of failing later in the build.
-  Raise it only when something in the code needs a newer compiler, and update the first entry of the CI matrices in
+- `rust-toolchain.toml`: Pinned Rust toolchain (1.97.1) with `rustfmt`, `clippy`, and `rust-analyzer`. Everyone who builds through rustup gets this
+  version, which keeps builds and lint output reproducible.
+- The workspace's `rust-version` (1.90.0) is the minimum supported version, and it is deliberately lower than the pinned toolchain. It records the
+  oldest compiler the code actually builds on, which is what a packager building against a distribution's own rustc needs; edition 2024 puts a hard
+  floor at 1.85. Every crate inherits it with
+  `rust-version.workspace = true`, so `cargo` refuses an older toolchain up front instead of failing later in the build. Raise it only when something
+  in the code needs a newer compiler, and update the first entry of the CI matrices in
   `.github/workflows/lints.yml` and `tests.yml` to match, since that is what keeps the claim tested.
 
 ## Architecture
@@ -93,41 +89,40 @@ ricevm-cli
 
 ### Key Internal Modules in `ricevm-execute`
 
-| Module         | Purpose                                                                                          |
-|----------------|--------------------------------------------------------------------------------------------------|
-| `vm.rs`        | `VmState` struct, execution loop with cooperative threading, and thread suspend/resume           |
-| `frame.rs`     | `FrameStack` with two-phase push (`alloc_pending` and `activate_pending`)                        |
-| `heap.rs`      | `Heap` with reference counting, copy-on-write strings, and `ArraySlice` shared views             |
+| Module         | Purpose                                                                                                        |
+|----------------|----------------------------------------------------------------------------------------------------------------|
+| `vm.rs`        | `VmState` struct, execution loop with cooperative threading, and thread suspend/resume                         |
+| `frame.rs`     | `FrameStack` with two-phase push (`alloc_pending` and `activate_pending`)                                      |
+| `heap.rs`      | `Heap` with reference counting, copy-on-write strings, and `ArraySlice` shared views                           |
 | `gc.rs`        | Mark-and-sweep collector (frames, MP, caller MP stacks, loaded module MPs, suspended threads, and `heap_refs`) |
-| `address.rs`   | Operand resolution with `ModuleMp` virtual ranges and `decode_virtual_addr`                      |
-| `memory.rs`    | Typed read/write on byte buffers with bounds checking                                            |
-| `data.rs`      | Module data (MP) initialization with type-aware elem sizes and nested arrays                     |
-| `filetab.rs`   | Portable file descriptor table with in-memory pipe, virtual device files, and non-blocking stdin |
-| `ops/`         | 176 instruction handlers organized by category                                                   |
-| `sys.rs`       | Built-in `$Sys` module (43 functions with tuple return support, `%b`, `%u`, and `%.*`)           |
-| `math.rs`      | Built-in `$Math` module (66 functions including linear algebra)                                  |
-| `draw.rs`      | Built-in `$Draw` module (SDL2 backend, optional `gui` feature)                                   |
-| `tk.rs`        | Built-in `$Tk` module (widget toolkit with embedded bitmap font and SDL2 rendering)              |
-| `audio.rs`     | `/dev/audio` and `/dev/audioctl` support (cpal backend, optional `audio` feature)                |
-| `builtin.rs`   | `ModuleRegistry` for built-in module registration with name and signature lookup                 |
-| `scheduler.rs` | Preemptive thread scheduler infrastructure (not yet connected to main loop)                      |
-| `channel.rs`   | Channel data structure for inter-thread communication                                            |
+| `address.rs`   | Operand resolution with `ModuleMp` virtual ranges and `decode_virtual_addr`                                    |
+| `memory.rs`    | Typed read/write on byte buffers with bounds checking                                                          |
+| `data.rs`      | Module data (MP) initialization with type-aware elem sizes and nested arrays                                   |
+| `filetab.rs`   | Portable file descriptor table with in-memory pipe, virtual device files, and non-blocking stdin               |
+| `ops/`         | 176 instruction handlers organized by category                                                                 |
+| `sys.rs`       | Built-in `$Sys` module (43 functions with tuple return support, `%b`, `%u`, and `%.*`)                         |
+| `math.rs`      | Built-in `$Math` module (66 functions including linear algebra)                                                |
+| `draw.rs`      | Built-in `$Draw` module (SDL2 backend, optional `gui` feature)                                                 |
+| `tk.rs`        | Built-in `$Tk` module (widget toolkit with embedded bitmap font and SDL2 rendering)                            |
+| `audio.rs`     | `/dev/audio` and `/dev/audioctl` support (cpal backend, optional `audio` feature)                              |
+| `builtin.rs`   | `ModuleRegistry` for built-in module registration with name and signature lookup                               |
+| `scheduler.rs` | Preemptive thread scheduler infrastructure (not yet connected to main loop)                                    |
+| `channel.rs`   | Channel data structure for inter-thread communication                                                          |
 
 ### Key Design Decisions
 
 - Package names use hyphens (`ricevm-core`); Rust identifiers use underscores (`ricevm_core`).
-- The heap uses `HashMap<u32, HeapObject>` with monotonic IDs starting at `HEAP_ID_BASE` (0x1000_0000);
-  pointers stored as `Word` (i32) in frames.
+- The heap uses `HashMap<u32, HeapObject>` with monotonic IDs starting at `HEAP_ID_BASE` (0x1000_0000); pointers stored as `Word` (i32) in frames.
 - Array element references use a `heap_refs` table with `HEAP_REF_FLAG` sentinel, resolved during double-indirect addressing.
-- `ArraySlice` heap type provides shared-storage views into parent arrays (required for Bufio buffer semantics);
-  all operations (`cvtac`, `slicela`, `pread`, `pwrite`, channel send/recv) resolve slices to their parent.
-- `slicela` adjusts reference counts for pointer-containing elements (e.g., `array of string`) to prevent
-  premature freeing during operations like mergesort.
+- `ArraySlice` heap type provides shared-storage views into parent arrays (required for Bufio buffer semantics); all operations (`cvtac`, `slicela`,
+  `pread`, `pwrite`, channel send/recv) resolve slices to their parent.
+- `slicela` adjusts reference counts for pointer-containing elements (e.g., `array of string`) to prevent premature freeing during operations like
+  mergesort.
 - Unified virtual address space: frame addresses are low, each module's MP has a unique range starting at
-  `MP_BASE` (0x0080_0000) with `MP_STRIDE` (0x0010_0000) between modules, heap IDs above `HEAP_ID_BASE`.
-  The `decode_virtual_addr()` function decodes addresses back to `AddrTarget`.
-  `MAX_MODULES` (128) bounds the MP window, leaving a reserved gap below the heap IDs: without it the MP range
-  reaches `HEAP_ID_BASE` and a module's data decodes as a heap object. Addresses in the gap, MP offsets past
+  `MP_BASE` (0x0080_0000) with `MP_STRIDE` (0x0010_0000) between modules, heap IDs above `HEAP_ID_BASE`. The `decode_virtual_addr()` function decodes
+  addresses back to `AddrTarget`.
+  `MAX_MODULES` (128) bounds the MP window, leaving a reserved gap below the heap IDs: without it the MP range reaches `HEAP_ID_BASE` and a module's
+  data decodes as a heap object. Addresses in the gap, MP offsets past
   `MP_STRIDE`, and frame offsets past `MP_BASE` are rejected rather than silently misrouted.
 - `caller_mp_stack` in `VmState` tracks caller module MPs during loaded module execution.
 - Branch instructions: `if src OP mid, goto dst` (not `if src OP dst, goto mid`).
@@ -136,26 +131,26 @@ ricevm-cli
 - Multi-module execution: loaded modules' MPs are swapped (not cloned) to persist state across calls.
 - Built-in function dispatch prefers name matching over signature hash matching (avoids collisions like read/write).
 - `movmp` looks up the type descriptor to determine copy size (mid is a type index, not a byte count).
-- Data initialization (`data.rs`) uses type descriptors for array element sizes and writes to the active buffer context
-  (parent array or MP) for correct nested array initialization.
-- Builtin return value copy in `mcall` transfers 4 bytes to the caller's return pointer; big-returning functions
-  (like `seek`) and tuple-returning functions write their results directly through the return pointer.
+- Data initialization (`data.rs`) uses type descriptors for array element sizes and writes to the active buffer context (parent array or MP) for
+  correct nested array initialization.
+- Builtin return value copy in `mcall` transfers 4 bytes to the caller's return pointer; big-returning functions (like `seek`) and tuple-returning
+  functions write their results directly through the return pointer.
 - Type conversions match the reference: `cvtfw`/`cvtfl` round (±0.5), `cvtrf`/`cvtfr` convert f32↔f64,
   `cvtwc`/`cvtcw` format/parse decimal strings, `cvtfc` uses `%g` format.
 - `expw`/`expl`/`expf` use repeated-squaring with base from mid and integer exponent from src.
 - Cooperative threading: `spawn` creates threads in a queue, the run loop rotates every 2048 instructions,
-  `recv` on empty channels blocks the thread, `send` on full channels blocks the thread,
-  both directions unblock on state change. Cloned MP adjusts heap ref counts.
+  `recv` on empty channels blocks the thread, `send` on full channels blocks the thread, both directions unblock on state change. Cloned MP adjusts
+  heap ref counts.
 - Alt table format: `{nsend, nrecv}` header followed by 8-byte `{channel_ptr, data_ptr}` entries.
 - Per-thread error string (`last_error`) implements the `werrstr`/`%r` mechanism.
-- Portable I/O via `FileTable` (no `libc` dependency) with in-memory pipe support and non-blocking stdin
-  (background reader thread prevents `sys->read` from freezing all VM threads).
+- Portable I/O via `FileTable` (no `libc` dependency) with in-memory pipe support and non-blocking stdin (background reader thread prevents
+  `sys->read` from freezing all VM threads).
 - Virtual device files: `/dev/sysctl`, `/dev/sysname`, `/dev/user`, `/dev/time`, `/dev/cons`, `/dev/null`,
   `/dev/random`, `/dev/drivers`, `/prog/N/{status,wait,ns,ctl}`, and `/env/*`.
-- `$Keyring` module provides real MD5 and SHA1 digests via the `md-5` and `sha1` crates;
-  auth functions (`readauthinfo`, `auth`, etc.) are stubs returning nil.
-- Nil dereferences (channel, array, string, list) are caught in the run loop and dispatched to
-  exception handler tables, matching the reference Dis VM behavior.
+- `$Keyring` module provides real MD5 and SHA1 digests via the `md-5` and `sha1` crates; auth functions (`readauthinfo`, `auth`, etc.) are stubs
+  returning nil.
+- Nil dereferences (channel, array, string, list) are caught in the run loop and dispatched to exception handler tables, matching the reference Dis VM
+  behavior.
 - Library modules with `entry_pc = -1` return success immediately (no init function).
 - SDL2 for GUI is behind an optional `gui` feature flag.
 - Audio support (`/dev/audio` and `/dev/audioctl`) is behind an optional `audio` feature flag (cpal backend).
@@ -205,8 +200,8 @@ Run `make lint` and `make test` for any change. Key targets:
   ricevm-cli compile hello.b
   ricevm-cli run hello.dis --probe external/inferno-os/dis
   ```
-- `make test-limbo` compiles programs with both the built-in and reference compilers, runs both outputs on RiceVM, and
-  compares results. Phase 1 checks correctness (11 tests), Phase 2 checks compilation coverage (159 Inferno programs).
+- `make test-limbo` compiles programs with both the built-in and reference compilers, runs both outputs on RiceVM, and compares results. Phase 1
+  checks correctness (11 tests), Phase 2 checks compilation coverage (159 Inferno programs).
 
 ## Commit and PR Hygiene
 

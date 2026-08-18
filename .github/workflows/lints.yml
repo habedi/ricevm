@@ -32,6 +32,9 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      # One entry failing must not cancel the other, or a green run on
+      # stable is reported as cancelled and its result is lost.
+      fail-fast: false
       matrix:
         rust-version: [ "1.90.0", "stable" ]
 
@@ -47,11 +50,15 @@ jobs:
         with:
           toolchain: ${{ matrix.rust-version }}
 
+      # `make lint` needs only clippy and the rustfmt its `format` prerequisite
+      # runs. `make install-deps` would also build cargo-tarpaulin and friends
+      # from source, which fails on the MSRV entry because those tools require a
+      # newer compiler than this project does.
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y clang curl pkg-config libssl-dev make
-          make install-deps
+          rustup component add rustfmt clippy
 
       - name: Run linters
         run: make lint

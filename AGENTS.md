@@ -27,12 +27,28 @@ Priorities, in order:
 
 ## Writing Style
 
+- Write in simple, plain English. Use short sentences and everyday words. Keep every fact, name, number, link, and file path.
+- Write correct and complete sentences. Start each sentence with a capital letter, capitalize proper nouns (Rust, Limbo, Inferno, and Dis), and leave
+  common nouns lowercase in the middle of a sentence.
+- Avoid made-up words. Use participial phrases and abbreviations sparingly.
 - Use Oxford commas in inline lists: "a, b, and c" not "a, b, c".
-- Do not use em dashes. Restructure the sentence, or use a colon or semicolon instead.
-- Avoid colorful adjectives and adverbs. Write "TCP proxy" not "lightweight TCP proxy", "scoring components" not "transparent scoring components".
-- Use noun phrases for checklist items, not imperative verbs. Write "redundant index detection" not "detect redundant indexes".
-- Headings in Markdown files must be in the title case: "Build from Source" not "Build from source". Minor words (a, an, the, and, but, or, for, in,
-  on, at, to, by, of) stay lowercase unless they are the first word.
+- Do not use em dashes. Restructure the sentence, or use a colon or a semicolon instead.
+- Avoid colorful adjectives and adverbs. Write "operand decoding" not "fast operand decoding", and "reference counting" not "careful reference
+  counting".
+- Prefer noun phrases for checklist items over imperative verbs. Write "frame teardown" not "tear down the frame".
+- Do not bold the lead-in of a list item. Write "Pointer maps: ..." not "**Pointer maps**: ...".
+- Use sentence case for the lead-in of a list item. Write "Wait records: ..." not "Wait Records: ...". Proper nouns keep their capitals.
+- Do not use a colon in place of a verb. Three uses are fine: joining two clauses inside a complete sentence, which is the replacement the em dash rule
+  calls for; introducing the gloss of a list item; and introducing an enumeration, whether as a list or inline ("Opcodes: movp, movmp, and slicela").
+  What a colon must not do is turn a sentence into a label and a definition. Write "A cross-module call swaps in the callee's data and pushes the
+  caller's" rather than "Cross-module calls: swap in the callee's data". That shape belongs to a list item, and carrying it into prose leaves a fragment
+  where a sentence was required.
+- Capitalize only the first part of a hyphenated compound: "Built-in Modules" in a heading, "Mark-and-sweep" at the start of a sentence, and "built-in
+  module" elsewhere. Never write "Built-In".
+- Headings in Markdown files must be in title case: "Build from Source" not "Build from source". Minor words stay lowercase unless they are the first
+  word: the articles (a, an, and the), the coordinating conjunctions (and, but, or, nor, so, yet, and for), and the short prepositions (in, on, at, to,
+  by, of, up, as, from, with, into, and over). That example is why the prepositions are listed: "from" has to be lowercase for "Build from Source" to be
+  correct, and an earlier version of this rule stopped at "of", which made its own example a violation.
 
 ## Repository Layout
 
@@ -49,7 +65,9 @@ Priorities, in order:
 - `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
   `libinterp/xec.c` for correctness validation).
 - `Makefile`: GNU Make wrapper around `cargo` commands (`make test`, `make build`, `make lint`, etc.).
-- `rust-toolchain.toml`: Pinned Rust toolchain (1.92.0) with `rustfmt`, `clippy`, and `rust-analyzer`.
+- `rust-toolchain.toml`: Pinned Rust toolchain (1.97.1) with `rustfmt`, `clippy`, and `rust-analyzer`.
+  The workspace's `rust-version` is the minimum supported version and holds the same 1.97.1; every crate inherits it with
+  `rust-version.workspace = true`, so `cargo` refuses an older toolchain rather than failing later in the build.
 
 ## Architecture
 
@@ -71,7 +89,7 @@ ricevm-cli
 | `vm.rs`        | `VmState` struct, execution loop with cooperative threading, and thread suspend/resume           |
 | `frame.rs`     | `FrameStack` with two-phase push (`alloc_pending` and `activate_pending`)                        |
 | `heap.rs`      | `Heap` with reference counting, copy-on-write strings, and `ArraySlice` shared views             |
-| `gc.rs`        | Mark-and-sweep garbage collector (scans frames, MP, and loaded module MPs)                       |
+| `gc.rs`        | Mark-and-sweep collector (frames, MP, caller MP stacks, loaded module MPs, suspended threads, and `heap_refs`) |
 | `address.rs`   | Operand resolution with `ModuleMp` virtual ranges and `decode_virtual_addr`                      |
 | `memory.rs`    | Typed read/write on byte buffers with bounds checking                                            |
 | `data.rs`      | Module data (MP) initialization with type-aware elem sizes and nested arrays                     |
@@ -89,7 +107,7 @@ ricevm-cli
 ### Key Design Decisions
 
 - Package names use hyphens (`ricevm-core`); Rust identifiers use underscores (`ricevm_core`).
-- The heap uses `HashMap<u32, HeapObject>` with monotonic IDs starting at `HEAP_ID_BASE` (0x0100_0000);
+- The heap uses `HashMap<u32, HeapObject>` with monotonic IDs starting at `HEAP_ID_BASE` (0x1000_0000);
   pointers stored as `Word` (i32) in frames.
 - Array element references use a `heap_refs` table with `HEAP_REF_FLAG` sentinel, resolved during double-indirect addressing.
 - `ArraySlice` heap type provides shared-storage views into parent arrays (required for Bufio buffer semantics);
@@ -99,6 +117,9 @@ ricevm-cli
 - Unified virtual address space: frame addresses are low, each module's MP has a unique range starting at
   `MP_BASE` (0x0080_0000) with `MP_STRIDE` (0x0010_0000) between modules, heap IDs above `HEAP_ID_BASE`.
   The `decode_virtual_addr()` function decodes addresses back to `AddrTarget`.
+  `MAX_MODULES` (128) bounds the MP window, leaving a reserved gap below the heap IDs: without it the MP range
+  reaches `HEAP_ID_BASE` and a module's data decodes as a heap object. Addresses in the gap, MP offsets past
+  `MP_STRIDE`, and frame offsets past `MP_BASE` are rejected rather than silently misrouted.
 - `caller_mp_stack` in `VmState` tracks caller module MPs during loaded module execution.
 - Branch instructions: `if src OP mid, goto dst` (not `if src OP dst, goto mid`).
 - Case instructions (`casew`, `casec`, and `casel`) use binary search matching the reference Dis VM (`xec.c`).

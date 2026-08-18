@@ -47,8 +47,16 @@ The built-in Limbo compiler (`ricevm-limbo`) handles a large subset of the langu
 
 ## Compatibility
 
-At the moment, 546 of 844 (65%) pre-compiled Inferno `.dis` programs pass. Excluding programs that need command-line
-arguments or are library modules not meant to run standalone, the effective pass rate is about 83%.
+At the moment, 669 of the 781 runnable pre-compiled Inferno `.dis` programs (86%) run without a VM fault. Of the 866
+files in the submodule, 85 are library modules with no init function to execute. Of the remainder, 475 run to
+completion and 194 exit through `fail:...`, which is how a Limbo program reports a usage message or a missing service.
+The 104 faults and 8 timeouts are concentrated in the subsystems that need a display or a network service, `wm/` and
+`charon/` most of all.
 
-The built-in compiler parses 159/159 (100%) of Inferno `cmd/` source files and compiles 155/159 (97%)
-with both the built-in and reference compilers producing identical outputs.
+This counts programs that start and do not fault (which is a floor rather than a guarantee). Not that a program can run
+to completion and still print the wrong thing.
+
+The built-in compiler parses 159/159 (100%) of Inferno `cmd/` source files and compiles 98 of them, or 356 of the 945
+`.b` files under `appl/` when measured with `-I external/inferno-os/module`. An earlier figure of 155/159 counted
+programs that compiled only because unresolved names lowered to a zero and unsupported statements emitted nothing;
+those are diagnostics now, so the count is lower and means more. See the roadmap for the breakdown of what remains.

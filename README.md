@@ -27,7 +27,7 @@ RiceVM is a cross-platform [Dis virtual machine](https://www.inferno-os.org/infe
 - Provides a fully functional Dis runtime (with GC, concurrency, etc.)
 - Includes a Limbo compiler, `.dis` file disassembler, and debugger
 - Includes most of the built-in modules from Dis virtual machine, including `$Sys`, `$Math`, `$Crypt`, etc.
-- Supports for GUI applications and audio playback
+- Supports GUI applications and audio playback
 - Is fully cross-platform (runs on Windows, Linux, and macOS)
 
 See [ROADMAP.md](ROADMAP.md) for the full list of implemented and planned features.
@@ -102,7 +102,7 @@ cargo run -p ricevm-cli --release --features gui -- run external/inferno-os/dis/
 
 #### Pre-built Binaries
 
-The latest release of RiceVM can be downloaded from [here](https://github.com/habedi/ricevm/releases/latest) insead of building it from source.
+The latest release of RiceVM can be downloaded from [here](https://github.com/habedi/ricevm/releases/latest) instead of building it from source.
 
 ---
 

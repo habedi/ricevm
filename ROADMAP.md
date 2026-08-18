@@ -171,25 +171,33 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] `--root` flag for Inferno root path mapping
 - [x] `--trace` flag for instruction-level debugging
 - [x] `--no-gc` flag to disable mark-and-sweep garbage collection
-- [x] `--threads` flag to configure scheduler thread pool size
+- [ ] `--threads` flag to configure scheduler thread pool size: the flag is accepted and sets `RICEVM_THREADS`, but nothing reads it, so it has no
+  effect until the preemptive scheduler is connected
 - [x] `-- arg1 arg2` guest argument passing
 - [x] Colored output, elapsed time reporting, and exit codes
 - [x] Debugger integration (breakpoints, single-stepping, stack inspection, colored output, and `info` command)
 
 ### Compatibility
 
-- [x] 546 of 844 pre-compiled Inferno `.dis` programs pass (65%); ~83% effective pass rate excluding programs that need arguments or are library
-  modules
-- [x] 58 timeouts (programs waiting for interactive input; expected with no stdin)
+- [x] 669 of the 781 runnable pre-compiled Inferno `.dis` programs run without a VM fault (86%). Of the 866 files in the submodule, 85 are libraries
+  with `entry_pc = -1` and nothing to execute; of the rest, 475 run to completion and 194 exit through `fail:...`, which is how a Limbo program
+  reports a usage message or a missing service, so the program itself worked
+- [x] 8 timeouts, all interactive: the `wm/` clock, calendar, and games, plus `math/sieve` and `grid/demo/blur`
+- [x] 104 faults, concentrated in the subsystems that need a display or a network service: 33 under `wm/`, 9 under `charon/`, and the rest spread
+  across `acme/`, `svc/httpd/`, `collab/servers/`, and `spree/clients/`
 - [x] Systematic audit against reference xec.c implementation
-- [ ] Target: 600+ programs passing (70%+); remaining failures are mostly environment-dependent (Plan 9 namespaces, crypto, device files)
+- [ ] Reduce the 104 faults; the remainder are mostly environment-dependent (Plan 9 namespaces, crypto beyond the `$Keyring` stub, and device files)
+
+Measured with the probe paths and no `--root`, no arguments, and empty stdin. This counts programs that start and do not fault, which is a floor
+rather than a guarantee: a program can run to completion and still print the wrong thing. The runtime differential harness
+(`scripts/diff-runtime.sh`) is what checks output against the reference compiler's own build of the same source.
 
 ### Development and Testing
 
 - [x] Cargo workspace with modular crate structure
 - [x] CI pipeline with automated tests
 - [x] Dual license (MIT and Apache 2.0)
-- [x] 200+ tests total:
+- [x] 963 tests total:
     - Unit tests for instruction decoding and execution
     - Property-based tests for arithmetic (commutativity, associativity, and identity)
     - Property-based tests for string operations (slicec bounds, addc associativity)
@@ -198,9 +206,9 @@ This document outlines the features implemented in RiceVM and the future goals f
     - Limbo compiler end-to-end test
 - [x] End-to-end pipeline tests with hand-crafted `.dis` binaries
 - [x] Fuzz testing setup for the module loader (`cargo-fuzz` with `libfuzzer`)
-- [x] 800+ pre-compiled `.dis` files available via `external/inferno-os` submodule
+- [x] 866 pre-compiled `.dis` files available via `external/inferno-os` submodule
 - [x] `make lint` passes (clippy with `-D warnings -D clippy::unwrap_used -D clippy::expect_used`)
-- [x] `make test` passes (233 tests, 0 failures)
+- [x] `make test` passes (0 failures)
 
 ### Built-in Limbo Compiler (`ricevm-limbo` crate)
 
@@ -272,8 +280,10 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 #### Design Choices
 
-- Cooperative threading with non-blocking stdin: the run loop rotates threads by quantum; stdin reads use a background thread to avoid blocking the
-  VM; a preemptive scheduler with OS threads exists but is not connected because it would require `Arc<Mutex<>>` refactoring of VmState
+- Cooperative threading with non-blocking stdin: the run loop rotates threads by quantum, and stdin reads use a background thread to avoid blocking
+  the VM. A preemptive scheduler with an OS thread pool exists in `scheduler.rs` and holds its state in `Arc<Mutex<SharedState>>`, but nothing
+  instantiates it: the live loop is `VmState::run`. Connecting it needs the same treatment for the rest of `VmState`, which the cooperative loop owns
+  outright
 - `op_ret` does not restore module context from the frame; the `mcall` wrapper handles module context restoration instead (correct behavior, different
   structure from reference)
 - Heap tracing is precise where a type descriptor is known, conservative everywhere else, and releasing is still conservative throughout. `new`, `newa`
@@ -294,7 +304,7 @@ This document outlines the features implemented in RiceVM and the future goals f
 - ~240 pre-compiled programs fail: ~100 need command-line arguments (working correctly), ~50 need Plan 9 namespace/device features, ~30 need crypto
   modules beyond the current `$Keyring` stub, and ~60 have other environment dependencies
 
-#### Measuring built-in compiler coverage
+#### Measuring Built-in Compiler Coverage
 
 A compile-success count only means something if unresolved names are errors. Before the built-in compiler reported them, an unknown identifier
 lowered to `Movw $0`, an `alt` statement emitted no code at all, and a call through any module handle other than `sys` emitted nothing -- so almost

@@ -15,7 +15,7 @@ authors = ["Hassan Abedi <hassan.abedi.t+ricevm@gmail.com>"]
 repository = "https://github.com/habedi/ricevm"
 license = "MIT OR Apache-2.0"
 publish = false
-rust-version = "1.92.0"
+rust-version = "1.97.1"
 
 [profile.release]
 opt-level = 3

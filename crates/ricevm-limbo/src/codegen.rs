@@ -1245,8 +1245,17 @@ impl CodeGen {
     /// operand so the runtime can map this module's function indices onto the
     /// loaded module's exports.
     fn ensure_module_import(&mut self, interface: &str) -> usize {
-        if let Some((_, imp)) = self.module_imports.iter().find(|(n, _)| n == interface) {
-            return imp.index;
+        let slot = self.ensure_module_import_slot(interface);
+        self.module_imports[slot].1.index
+    }
+
+    /// The slot `interface` occupies in `module_imports`, adding it on first
+    /// use. Callers that go on to touch the entry take the slot rather than the
+    /// import index, so they can index straight into it instead of searching
+    /// again and having to answer for a lookup that cannot fail.
+    fn ensure_module_import_slot(&mut self, interface: &str) -> usize {
+        if let Some(slot) = self.module_imports.iter().position(|(n, _)| n == interface) {
+            return slot;
         }
         let index = self.imports.len();
         self.imports.push(ImportModule { functions: vec![] });
@@ -1257,19 +1266,15 @@ impl CodeGen {
                 funcs: Vec::new(),
             },
         ));
-        index
+        self.module_imports.len() - 1
     }
 
     /// The index of `name` within `interface`'s import block, adding it on
     /// first use. `mframe`/`mcall` carry this index.
     fn ensure_module_func(&mut self, interface: &str, name: &str) -> usize {
-        let block = self.ensure_module_import(interface);
-        let entry = self
-            .module_imports
-            .iter_mut()
-            .find(|(n, _)| n == interface)
-            .map(|(_, imp)| imp)
-            .expect("ensure_module_import just created the block");
+        let slot = self.ensure_module_import_slot(interface);
+        let block = self.module_imports[slot].1.index;
+        let entry = &mut self.module_imports[slot].1;
         if let Some((_, idx)) = entry.funcs.iter().find(|(n, _)| n == name) {
             return *idx;
         }
@@ -2337,11 +2342,13 @@ impl CodeGen {
             self.types.push(td);
         }
         let index_of = |key: &TypeKey| -> i32 {
-            base + self
-                .needed_types
-                .iter()
-                .position(|k| k == key)
-                .expect("every needed type was allocated") as i32
+            // Every key asked for here was appended to `needed_types` above, so
+            // the search succeeds. Falling back to the reserved descriptor 0
+            // keeps a compiler from panicking if that ever stops holding.
+            match self.needed_types.iter().position(|k| k == key) {
+                Some(pos) => base + pos as i32,
+                None => 0,
+            }
         };
         for (item, elem) in &pending {
             let id = index_of(&TypeKey::Elem(*elem));

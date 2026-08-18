@@ -671,7 +671,7 @@ dependencies = [
 
 [[package]]
 name = "ricevm-cli"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "clap",
  "colored",
@@ -684,14 +684,14 @@ dependencies = [
 
 [[package]]
 name = "ricevm-core"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "ricevm-execute"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "colored",
  "cpal",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "ricevm-limbo"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "ricevm-core",
  "ricevm-execute",
@@ -717,7 +717,7 @@ dependencies = [
 
 [[package]]
 name = "ricevm-loader"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "ricevm-core",
  "tracing",

@@ -153,9 +153,34 @@ pub(crate) fn op_consm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     cons_bytes(vm, size)
 }
 
-/// consmp: cons a memory block with pointers. Same as consm for now.
+/// consmp: cons a record that contains pointers.
+///
+/// Unlike `consm`, whose middle operand is a plain byte count, this one names a
+/// *type* -- and the copy it makes is a new reference to every pointer the
+/// record holds, so each has to be counted before the bytes are moved
+/// (`incmem(R.s, t)` in the reference, libinterp/xec.c). Skipping that leaves
+/// the list holding pointers nobody counted, and whichever operation releases
+/// them first frees an object that is still in use.
 pub(crate) fn op_consmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
-    op_consm(vm)
+    let type_idx = vm.mid_word()? as usize;
+    // An unknown type has no map and no size; fall back to treating the operand
+    // as a byte count, exactly as the untyped `movm`/`consm` pair does.
+    let size = vm.current_type_size(type_idx).unwrap_or(type_idx);
+    if size > MAX_CONS_BYTES {
+        return Err(ExecError::ThreadFault(format!(
+            "consmp: block size too large: {size}"
+        )));
+    }
+    if let Some(ptr_map) = vm.trace_map_for_type(type_idx) {
+        let head = read_cons_head(vm, size)?;
+        for offset in ptr_map.pointer_offsets(size) {
+            let ptr_val = memory::read_word(&head, offset) as u32;
+            if ptr_val >= heap::HEAP_ID_BASE && vm.heap.contains(ptr_val) {
+                vm.heap.inc_ref(ptr_val);
+            }
+        }
+    }
+    cons_bytes(vm, size)
 }
 
 // --- head operations: extract the head value from a list ---
@@ -166,10 +191,14 @@ fn head_read<'a>(vm: &'a VmState<'_>, list_id: HeapId) -> Result<&'a [u8], ExecE
         // Head of nil: return empty slice (graceful)
         return Ok(&[]);
     }
+    // A non-nil id with nothing behind it is a dangling reference, not a nil
+    // one -- the list was released while this slot still named it. Say so, and
+    // name the id: calling it a nil dereference sends the reader looking at the
+    // program's own logic instead of at the heap.
     let obj = vm
         .heap
         .get(list_id)
-        .ok_or_else(|| ExecError::ThreadFault("nil list dereference (head)".to_string()))?;
+        .ok_or_else(|| ExecError::ThreadFault(format!("head of a released list (id {list_id})")))?;
     match &obj.data {
         HeapData::List { head, .. } => Ok(head.as_slice()),
         _ => Err(ExecError::ThreadFault("head on non-list".to_string())),
@@ -323,6 +352,49 @@ mod tests {
             imports: vec![],
             handlers: vec![],
         }
+    }
+
+    /// `consmp` conses a record that contains pointers, so it has to take a
+    /// reference for each one -- the reference calls `incmem(R.s, t)` before
+    /// copying (libinterp/xec.c). Without it the list holds pointers nobody
+    /// counted, and the first operation to release them (a `movmp` writing over
+    /// that field, say) frees an object that is still in use. Its middle
+    /// operand is a *type index*, not the byte count `consm` takes.
+    #[test]
+    fn consmp_takes_a_reference_for_every_pointer_it_copies() {
+        let mut module = test_module();
+        // Type 1: an 8-byte record whose second word is a pointer. Pointer maps
+        // are most-significant-bit first, so word 1 is 0x40.
+        module.types.push(TypeDescriptor {
+            id: 1,
+            size: 8,
+            pointer_map: PointerMap { bytes: vec![0x40] },
+            pointer_count: 1,
+        });
+        let mut vm = VmState::new(&module).expect("vm init");
+
+        let held = vm
+            .heap
+            .alloc(0, HeapData::Str("still referenced".to_string()));
+        let before = vm.heap.get(held).expect("just allocated").ref_count;
+
+        // A record at fp+0: a plain word, then the pointer.
+        let fp = vm.frames.current_data_offset();
+        memory::write_word(&mut vm.frames.data, fp, 1234);
+        memory::write_word(&mut vm.frames.data, fp + 4, held as i32);
+
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 1; // type index, not a byte count
+        vm.dst = AddrTarget::Frame(fp + 16);
+        op_consmp(&mut vm).expect("consmp should succeed");
+
+        let after = vm.heap.get(held).expect("must still be live").ref_count;
+        assert_eq!(
+            after,
+            before + 1,
+            "the copy in the list node is a new reference"
+        );
     }
 
     #[test]

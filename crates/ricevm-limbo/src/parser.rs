@@ -1820,19 +1820,19 @@ impl Parser {
             TokenKind::Inc => {
                 // Pre-increment: ++x (semantically same as x++ for Limbo)
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::PostInc(Box::new(expr), span))
             }
             TokenKind::Dec => {
                 // Pre-decrement: --x
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::PostDec(Box::new(expr), span))
             }
             TokenKind::Plus => {
                 // Unary plus
                 self.advance();
-                self.parse_expr_bp(25)
+                self.parse_expr_bp(UNARY_BP)
             }
             TokenKind::Star => {
                 // Dereference: *expr
@@ -1841,53 +1841,53 @@ impl Parser {
                 if self.at(&TokenKind::FatArrow) {
                     return Ok(Expr::Ident("*".to_string(), span));
                 }
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Unary(UnaryOp::Ref, Box::new(expr), span)) // deref uses Ref variant for now
             }
             TokenKind::Minus => {
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Unary(UnaryOp::Neg, Box::new(expr), span))
             }
             TokenKind::Bang => {
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Unary(UnaryOp::Not, Box::new(expr), span))
             }
             TokenKind::Tilde => {
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Unary(UnaryOp::BitNot, Box::new(expr), span))
             }
             TokenKind::Hd => {
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Hd(Box::new(expr), span))
             }
             TokenKind::Tl => {
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Tl(Box::new(expr), span))
             }
             TokenKind::Len => {
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Len(Box::new(expr), span))
             }
             TokenKind::Tagof => {
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Tagof(Box::new(expr), span))
             }
             TokenKind::Ref => {
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Unary(UnaryOp::Ref, Box::new(expr), span))
             }
             TokenKind::ChanRecv => {
                 // <-chan (receive)
                 self.advance();
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Recv(Box::new(expr), span))
             }
             TokenKind::Array => {
@@ -1931,7 +1931,7 @@ impl Parser {
                     self.expect(&TokenKind::Of)?;
                     let ty = self.parse_type()?;
                     // array of type monexp (cast)
-                    let expr = self.parse_expr_bp(25)?;
+                    let expr = self.parse_expr_bp(UNARY_BP)?;
                     Ok(Expr::Cast(
                         Box::new(Type::Array(Box::new(ty))),
                         Box::new(expr),
@@ -2013,7 +2013,7 @@ impl Parser {
                     // Treat as type name in expression context (e.g., array index with type)
                     return Ok(Expr::Ident(format!("{ty:?}"), span));
                 }
-                let expr = self.parse_expr_bp(25)?;
+                let expr = self.parse_expr_bp(UNARY_BP)?;
                 Ok(Expr::Cast(Box::new(ty), Box::new(expr), span))
             }
             TokenKind::LBrace => {
@@ -2194,6 +2194,15 @@ impl Parser {
 /// Binding power of `::`: below `|` (9) and above `&&` (5). Used as both the
 /// left and the right binding power, which makes the operator right-associative.
 const CONS_BP: u8 = 7;
+
+/// Binding power of the operand of a prefix operator, and of the operand of a
+/// cast. The reference grammar gives every prefix form its own `monexp`
+/// operand (limbo.y:1228-1288 for the unary operators, limbo.y:1334-1355 for
+/// the casts), and `monexp` cannot derive a binary expression. That puts every
+/// prefix operator above `**` (`exp Lexp exp`, limbo.y:1147), so `-a ** b` is
+/// `(-a) ** b`. A binding power of 25 would have let `**` (left power 26) pull
+/// the exponentiation inside the operand instead.
+const UNARY_BP: u8 = 27;
 
 /// First name of a `a, b, c: ...` declaration group.
 fn first_name(names: &[String]) -> String {

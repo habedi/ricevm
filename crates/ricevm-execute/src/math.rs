@@ -998,11 +998,10 @@ fn math_sort(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         )));
     }
     let key = |i: i32| x.get(i as usize).copied().unwrap_or(0.0);
-    p.sort_by(|&a, &b| {
-        key(a)
-            .partial_cmp(&key(b))
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // `total_cmp` is an order over every double, NaN included. A comparison
+    // that reports NaN as equal to everything is not an order at all, and the
+    // sort is free to panic on one.
+    p.sort_by(|&a, &b| key(a).total_cmp(&key(b)));
     let mut out = vec![0u8; p.len() * 4];
     for (i, &v) in p.iter().enumerate() {
         memory::write_word(&mut out, i * 4, v);
@@ -3627,11 +3626,8 @@ mod tests {
         memory::write_word(&mut vm.frames.data, base + ARG1_OFF, x as i32);
         memory::write_word(&mut vm.frames.data, base + ARG1_OFF + 4, p as i32);
         math_sort(&mut vm).expect("sort should succeed");
-        let p = heap_ints(&vm, p, 3);
-        assert_eq!(p.len(), 3);
-        // The two ordered elements keep their relative order.
-        let pos = |v: i32| p.iter().position(|&e| e == v).unwrap_or(9);
-        assert!(pos(2) < pos(0), "x[2] = 1 sorts before x[0] = 2, got {p:?}");
+        // The total order of doubles puts a positive NaN above every number.
+        assert_eq!(heap_ints(&vm, p, 3), vec![2, 0, 1]);
     }
 
     #[test]

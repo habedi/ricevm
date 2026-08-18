@@ -577,6 +577,13 @@ impl<'src> Lexer<'src> {
     }
 }
 
+/// Is this byte part of a scalar outside ASCII? Such a byte belongs to an
+/// identifier, since the source is valid UTF-8 and every non-ASCII scalar
+/// counts as a letter (lex.c:141-147 and lex.c:188-195).
+fn is_ident_byte(b: u8) -> bool {
+    b >= 0x80
+}
+
 /// Number of bytes in the UTF-8 scalar introduced by `lead`.
 fn utf8_len(lead: u8) -> usize {
     match lead {
@@ -1317,9 +1324,42 @@ include "sys.m";
         );
     }
 
+    /// A scalar outside ASCII is an identifier character, which is what lets
+    /// appl/spree/lib/testsets.b:18 declare `∈: Set;` and appl/wm/c4.b:387 pass
+    /// `∞` as an argument.
+    #[test]
+    fn non_ascii_identifiers() {
+        assert_eq!(
+            lex("∈: Set;"),
+            vec![
+                TokenKind::Ident("∈".to_string()),
+                TokenKind::Colon,
+                TokenKind::Ident("Set".to_string()),
+                TokenKind::Semicolon,
+            ]
+        );
+        assert_eq!(
+            lex("minimax(me, ∞)"),
+            vec![
+                TokenKind::Ident("minimax".to_string()),
+                TokenKind::LParen,
+                TokenKind::Ident("me".to_string()),
+                TokenKind::Comma,
+                TokenKind::Ident("∞".to_string()),
+                TokenKind::RParen,
+            ]
+        );
+        // A non-ASCII scalar also continues an identifier that starts in ASCII.
+        assert_eq!(
+            lex("aé1"),
+            vec![TokenKind::Ident("aé1".to_string())],
+            "a non-ASCII scalar continues an identifier"
+        );
+    }
+
     #[test]
     fn unexpected_character_is_error() {
-        for src in ["@", "$", "?", "`", "\\", "\u{E9}"] {
+        for src in ["@", "$", "?", "`", "\\"] {
             let msg = lex_err(src);
             assert!(
                 msg.contains("unexpected character"),

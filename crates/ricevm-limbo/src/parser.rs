@@ -100,6 +100,59 @@ impl Parser {
         }
     }
 
+    /// Is the cursor on the wildcard arm of a `case`, `alt`, or `pick`? The
+    /// wildcard is `'*'` followed by the `=>` that opens the arm, or by the
+    /// `or` that joins it to another pattern, as in `* or "disc" =>`
+    /// (appl/ebook/reader.b:1371). The token after the star is what decides,
+    /// because a statement may start with one too (`qual: '*'` in limbo.y
+    /// against the `'*' monexp` dereference at limbo.y:1250). Taking every star
+    /// for a wildcard cut the arm short at a statement such as `*in = *b;`
+    /// (appl/cmd/limbo/gen.b:563).
+    fn at_wildcard_arm(&self) -> bool {
+        self.at(&TokenKind::Star)
+            && (self.at_offset(1, &TokenKind::FatArrow) || self.at_offset(1, &TokenKind::Or))
+    }
+
+    /// Step over a `[T1, T2]` type parameter list, which the grammar allows on
+    /// a declaration (`polydec`) and on a type name (`Lid '[' types ']'`).
+    /// Polymorphic types are not represented yet, so the list is discarded
+    /// rather than recorded.
+    fn skip_type_params(&mut self) {
+        if !self.at(&TokenKind::LBracket) {
+            return;
+        }
+        self.advance();
+        while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
+            self.advance();
+        }
+        if self.at(&TokenKind::RBracket) {
+            self.advance();
+        }
+    }
+
+    /// Step over the header of an ADT declaration: its `polydec` type
+    /// parameters and an optional `for { ... }` clause
+    /// (`adtdecl: ids ':' Ladt polydec '{' fields '}' forpoly` and
+    /// `ids ':' Ladt polydec Lfor '{' tpolys '}' '{' fields '}'`,
+    /// limbo.y:250-263). A module interface declares its ADTs with the same
+    /// rule, so both places need this: module/tables.m:3 writes
+    /// `Table: adt[T] {`, and module/alphabet.m:116 writes
+    /// `Context: adt[V, M, Ectxt] for { ... } {`.
+    fn skip_adt_header(&mut self) -> Result<(), ParseError> {
+        self.skip_type_params();
+        if self.at(&TokenKind::For) {
+            self.advance();
+            self.expect(&TokenKind::LBrace)?;
+            while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+                self.advance();
+            }
+            if self.at(&TokenKind::RBrace) {
+                self.advance();
+            }
+        }
+        Ok(())
+    }
+
     // ── Top Level ──────────────────────────────────────────────
 
     /// Parse a complete Limbo source file.
@@ -274,27 +327,7 @@ impl Parser {
             }
             TokenKind::Adt => {
                 self.advance();
-                // Skip optional polymorphic type parameters: [T1, T2]
-                if self.at(&TokenKind::LBracket) {
-                    self.advance();
-                    while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
-                        self.advance();
-                    }
-                    if self.at(&TokenKind::RBracket) {
-                        self.advance();
-                    }
-                }
-                // Skip optional 'for { ... }' clause
-                if self.at(&TokenKind::For) {
-                    self.advance();
-                    self.expect(&TokenKind::LBrace)?;
-                    while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
-                        self.advance();
-                    }
-                    if self.at(&TokenKind::RBrace) {
-                        self.advance();
-                    }
-                }
+                self.skip_adt_header()?;
                 self.expect(&TokenKind::LBrace)?;
                 let (members, pick) = self.parse_adt_members()?;
                 self.expect(&TokenKind::RBrace)?;
@@ -456,6 +489,7 @@ impl Parser {
                 }
                 TokenKind::Adt => {
                     self.advance();
+                    self.skip_adt_header()?;
                     self.expect(&TokenKind::LBrace)?;
                     let (adt_members, pick) = self.parse_adt_members()?;
                     self.expect(&TokenKind::RBrace)?;
@@ -576,6 +610,14 @@ impl Parser {
                     names.push(self.expect_ident()?);
                 }
                 self.expect(&TokenKind::Colon)?;
+                // The fields of a pick case are `dfields`, so each one may be
+                // marked `cyclic` (`dfield: ids ':' Lcyclic type ';'`,
+                // limbo.y:292, reached through `pfields: pfbody dfields`,
+                // limbo.y:312). module/json.m:8 declares
+                // `mem: cyclic list of (string, ref JValue);`.
+                if self.at(&TokenKind::Cyclic) {
+                    self.advance();
+                }
                 let ty = self.parse_type()?;
                 self.expect_semi()?;
                 fields.push(VarDecl {
@@ -638,15 +680,7 @@ impl Parser {
         let mut name = self.expect_ident()?;
 
         // Skip optional polymorphic params: func[T1, T2]
-        if self.at(&TokenKind::LBracket) {
-            self.advance();
-            while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
-                self.advance();
-            }
-            if self.at(&TokenKind::RBracket) {
-                self.advance();
-            }
-        }
+        self.skip_type_params();
 
         // Qualified name: A.B(
         while self.at(&TokenKind::Dot) {
@@ -654,15 +688,7 @@ impl Parser {
             qualifier = Some(name);
             name = self.expect_ident()?;
             // Skip polymorphic params after qualifier
-            if self.at(&TokenKind::LBracket) {
-                self.advance();
-                while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
-                    self.advance();
-                }
-                if self.at(&TokenKind::RBracket) {
-                    self.advance();
-                }
-            }
+            self.skip_type_params();
         }
 
         let sig = self.parse_func_sig(name.clone())?;
@@ -684,15 +710,7 @@ impl Parser {
         if self.at(&TokenKind::Fn) {
             self.advance();
             // Skip optional polymorphic params after fn keyword
-            if self.at(&TokenKind::LBracket) {
-                self.advance();
-                while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
-                    self.advance();
-                }
-                if self.at(&TokenKind::RBracket) {
-                    self.advance();
-                }
-            }
+            self.skip_type_params();
         }
 
         self.expect(&TokenKind::LParen)?;
@@ -928,19 +946,16 @@ impl Parser {
             TokenKind::Ident(name) => {
                 self.advance();
                 // Skip optional polymorphic params: Type[T1, T2]
-                if self.at(&TokenKind::LBracket) {
-                    self.advance();
-                    while !self.at(&TokenKind::RBracket) && !self.at(&TokenKind::Eof) {
-                        self.advance();
-                    }
-                    if self.at(&TokenKind::RBracket) {
-                        self.advance();
-                    }
-                }
+                self.skip_type_params();
                 // Check for Module->Type or Type.SubType
                 if self.at(&TokenKind::Arrow) || self.at(&TokenKind::Dot) {
                     self.advance();
                     let member = self.expect_ident()?;
+                    // A qualified name carries its own type arguments:
+                    // `type Lmdot Lid '[' types ']'` (limbo.y:38-42 of the type
+                    // rules). module/alphabet.m:8 writes
+                    // `chan of ref Proxy->Typescmd[ref Value]`.
+                    self.skip_type_params();
                     Type::Named(QualName {
                         qualifier: Some(name),
                         name: member,
@@ -1066,7 +1081,7 @@ impl Parser {
                 let mut arms = Vec::new();
                 while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
                     let mut tags = Vec::new();
-                    if self.at(&TokenKind::Star) {
+                    if self.at_wildcard_arm() {
                         self.advance();
                         tags.push("*".to_string());
                     } else {
@@ -1081,7 +1096,7 @@ impl Parser {
                     while !self.at(&TokenKind::RBrace)
                         && !self.at(&TokenKind::Eof)
                         && !self.is_pick_tag_start()
-                        && !self.at(&TokenKind::Star)
+                        && !self.at_wildcard_arm()
                     {
                         body.push(self.parse_stmt()?);
                     }
@@ -1189,7 +1204,7 @@ impl Parser {
     fn is_exception_pattern_start(&self) -> bool {
         // Patterns: "string", *, identifier — all followed eventually by =>
         match self.peek() {
-            TokenKind::Star => return true,
+            TokenKind::Star => return self.at_wildcard_arm(),
             TokenKind::StringLit(_) | TokenKind::Ident(_) => {}
             _ => return false,
         }
@@ -1465,7 +1480,7 @@ impl Parser {
     fn parse_case_patterns(&mut self) -> Result<Vec<CasePattern>, ParseError> {
         let mut patterns = Vec::new();
         loop {
-            if self.at(&TokenKind::Star) {
+            if self.at_wildcard_arm() {
                 self.advance();
                 patterns.push(CasePattern::Wildcard);
             } else {
@@ -1487,7 +1502,7 @@ impl Parser {
     }
 
     fn is_case_pattern_start(&self) -> bool {
-        if self.at(&TokenKind::Star) {
+        if self.at_wildcard_arm() {
             return true;
         }
         // Patterns must start with an expression token, not a statement/block token
@@ -1567,7 +1582,7 @@ impl Parser {
         self.expect(&TokenKind::LBrace)?;
         let mut arms = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
-            let guards = if self.at(&TokenKind::Star) {
+            let guards = if self.at_wildcard_arm() {
                 self.advance();
                 vec![AltGuard::Wildcard]
             } else {
@@ -1618,7 +1633,7 @@ impl Parser {
     }
 
     fn is_alt_guard_start(&self) -> bool {
-        if self.at(&TokenKind::Star) {
+        if self.at_wildcard_arm() {
             return true;
         }
         // Look for => within a limited range, not crossing { or ;
@@ -3665,6 +3680,99 @@ Point: adt {
         assert_eq!(ty_shape(&sig.params[0].ty), "(ref Point)");
     }
 
+    /// A module interface declares ADTs with the same rule as the top level,
+    /// so the type parameters and the `for { ... }` clause belong there too
+    /// (limbo.y:250-263). module/tables.m:3 and module/alphabet.m:116 use both.
+    #[test]
+    fn module_member_adt_with_type_parameters_and_a_for_clause() {
+        let file = parse(
+            r#"implement T;
+Tables: module {
+    Table: adt[T] {
+        items: array of T;
+    };
+    Context: adt[V, M] for {
+    V =>
+        dup: fn(t: self V): V;
+    M =>
+        mks: fn(s: string): V;
+    }
+    {
+        eval: fn(v: V): int;
+    };
+};
+"#,
+        );
+        let Decl::Module(m) = &file.decls[0] else {
+            panic!("expected a module declaration");
+        };
+        let names: Vec<&str> = m
+            .members
+            .iter()
+            .map(|mem| match mem {
+                ModuleMember::Adt(a) => a.name.as_str(),
+                other => panic!("unexpected member: {other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["Table", "Context"]);
+    }
+
+    /// A pick case's fields are `dfields`, so each may be `cyclic`
+    /// (limbo.y:292 and limbo.y:312). module/json.m:8 declares
+    /// `mem: cyclic list of (string, ref JValue);`.
+    #[test]
+    fn pick_case_field_may_be_cyclic() {
+        let file = parse(
+            r#"implement T;
+JValue: adt {
+    pick {
+    Object =>
+        mem: cyclic list of (string, ref JValue);
+    Array =>
+        a: cyclic array of ref JValue;
+    }
+};
+"#,
+        );
+        let Decl::Adt(a) = &file.decls[0] else {
+            panic!("expected an ADT declaration");
+        };
+        let cases = a.pick.as_ref().expect("pick clause");
+        let shapes: Vec<String> = cases
+            .iter()
+            .flat_map(|c| {
+                c.fields.iter().map(|f| {
+                    format!(
+                        "{}: {}",
+                        f.names.join(","),
+                        ty_shape(f.ty.as_ref().expect("field type"))
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            shapes,
+            vec![
+                "mem: (list (tuple string (ref JValue)))",
+                "a: (array (ref JValue))",
+            ]
+        );
+    }
+
+    /// A qualified type name carries its own type arguments, as in
+    /// `ref Extvalues->Values[ref Abc->Value]` (module/alphabet/abctypes.m:5).
+    #[test]
+    fn qualified_type_name_with_type_arguments() {
+        assert_eq!(
+            ty_shape(&ty_of("ref Extvalues->Values[ref Abc->Value]")),
+            "(ref Extvalues->Values)"
+        );
+        assert_eq!(
+            ty_shape(&ty_of("chan of ref Proxy->Typescmd[ref Value]")),
+            "(chan (ref Proxy->Typescmd))"
+        );
+    }
+
     #[test]
     fn adt_with_a_pick_clause() {
         let file = parse(
@@ -4020,6 +4128,69 @@ test(x: int)
         );
     }
 
+    /// A statement that starts with `*` is a dereference, not the wildcard arm.
+    /// Treating every `*` as an arm opener ended the arm early and then asked
+    /// for a `=>`, which is what broke appl/cmd/limbo/gen.b:563.
+    #[test]
+    fn a_dereference_statement_does_not_open_a_new_arm() {
+        let stmts = stmts_of(
+            r#"implement T;
+test(x: int)
+{
+    case x {
+    0 =>
+        next := in.next;
+        *in = *b;
+        in.next = next;
+    * =>
+        y = 1;
+    }
+}
+"#,
+        );
+        let Stmt::Case(c) = &stmts[0] else {
+            panic!("expected a case statement");
+        };
+        assert_eq!(c.arms.len(), 2);
+        assert_eq!(c.arms[0].body.len(), 3, "the whole arm body is one arm");
+        assert!(matches!(c.arms[1].patterns[0], CasePattern::Wildcard));
+    }
+
+    /// The wildcard may be joined to another pattern with `or`, as in
+    /// `* or 4 =>` (appl/lib/sets32.b:120) and `* or "disc" =>`
+    /// (appl/ebook/reader.b:1371).
+    #[test]
+    fn wildcard_joined_to_another_pattern_by_or() {
+        let stmts = stmts_of(
+            r#"implement T;
+test(x: int)
+{
+    case x {
+    3 =>
+        y = 1;
+    * or
+    4 =>
+        y = 2;
+    }
+}
+"#,
+        );
+        let Stmt::Case(c) = &stmts[0] else {
+            panic!("expected a case statement");
+        };
+        assert_eq!(c.arms.len(), 2);
+        let shapes: Vec<String> = c.arms[1]
+            .patterns
+            .iter()
+            .map(|p| match p {
+                CasePattern::Wildcard => "*".to_string(),
+                CasePattern::Expr(e) => sexp(e),
+                CasePattern::Range(lo, hi) => format!("({} to {})", sexp(lo), sexp(hi)),
+            })
+            .collect();
+        assert_eq!(shapes, vec!["*", "4"]);
+    }
+
     #[test]
     fn case_arm_with_an_empty_body() {
         let stmts = stmts_of(
@@ -4240,6 +4411,33 @@ test()
         };
         assert_eq!(b.stmts.len(), 1);
         assert!(matches!(&stmts[1], Stmt::Empty));
+    }
+
+    /// A guard's communication may sit anywhere inside the guard expression.
+    /// The reference finds it with `hascomm` (typecheck.c:3381-3421) and
+    /// rewrites the rest of the guard around it (com.c:1208-1242), which makes
+    /// `reqpool = <-reqdone :: reqpool =>` legal (appl/cmd/wmexport.b:180).
+    /// This front end only classifies a communication at the top of the guard,
+    /// so such a guard is reported rather than miscompiled. Known gap: closing
+    /// it needs the guard expression kept in the AST and codegen support for
+    /// the rewrite.
+    #[test]
+    fn a_nested_communication_in_an_alt_guard_is_reported() {
+        let msg = parse_err(
+            r#"implement T;
+test(reqdone: chan of int)
+{
+    alt {
+    reqpool = <-reqdone :: reqpool =>
+        x = 1;
+    }
+}
+"#,
+        );
+        assert!(
+            msg.contains("`alt` guard must be"),
+            "unexpected message: {msg}"
+        );
     }
 
     /// An exception handler pattern may hold brackets of its own, and the

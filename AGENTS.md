@@ -24,6 +24,10 @@ Priorities, in order:
 - Add comments only when they clarify non-obvious behavior.
 - Do not add features, error handling, or abstractions beyond what is needed for the current task.
 - Add tests for every bug fix and new feature to prevent regression.
+- Write the test before the fix, and confirm it fails for the reason being fixed. A test that never failed against the old code
+  proves only that the code compiles, which is how several bugs here survived a passing suite: `alt` emitted no code at all,
+  `string` of a real produced 0, and a tuple channel delivered zeros. Assert the value or the control flow, not that the call
+  returned. When a fix lands before its test, prove the test is real by reverting the fix, watching it fail, and restoring it.
 
 ## Writing Style
 

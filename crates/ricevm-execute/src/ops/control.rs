@@ -1811,6 +1811,103 @@ mod tests {
         );
     }
 
+    /// A loaded module can hold a reference to the program that loaded it and
+    /// call back into it, which is how the shipped Inferno shell hands its own
+    /// functions to the modules it loads. The call has to find the main
+    /// module's data, which is parked on the caller stack while the loaded
+    /// module runs, and hand it back afterwards.
+    #[test]
+    fn a_loaded_module_can_call_back_into_the_main_module() {
+        use crate::vm::LoadedModule;
+        use ricevm_core::module::ExportEntry;
+
+        // The main module's export writes a marker into its own data, so the
+        // test can tell that it ran with the right data swapped in.
+        let mut main = test_module();
+        main.name = "the_program".to_string();
+        main.code = vec![
+            Instruction {
+                opcode: Opcode::Movw,
+                source: Operand {
+                    mode: ricevm_core::AddressMode::Immediate,
+                    register1: 99,
+                    register2: 0,
+                },
+                middle: MiddleOperand::UNUSED,
+                destination: Operand {
+                    mode: ricevm_core::AddressMode::OffsetIndirectMp,
+                    register1: 0,
+                    register2: 0,
+                },
+            },
+            Instruction {
+                opcode: Opcode::Ret,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            },
+        ];
+        main.exports = vec![ExportEntry {
+            pc: 0,
+            frame_type: 0,
+            signature: 0,
+            name: "callback".to_string(),
+        }];
+
+        let mut vm = VmState::new(&main).expect("vm init");
+        let main_mp = vec![0u8; 16];
+        vm.mp = main_mp.clone();
+
+        // Run as if a loaded module is executing: its own data is current and
+        // the main module's is parked on the caller stack, exactly as
+        // `run_nested_module_call` leaves things.
+        let loaded_mp = vec![0xABu8; 32];
+        vm.loaded_modules.push(LoadedModule {
+            module: test_module(),
+            mp: Vec::new(),
+        });
+        vm.current_loaded_module = Some(0);
+        vm.mp = loaded_mp.clone();
+        vm.caller_mp_stack.push((0, main_mp));
+
+        let mod_ref = vm.heap.alloc(
+            0,
+            HeapData::MainModule {
+                func_map: vec![Some(0)],
+            },
+        );
+        let pending = vm.frames.alloc_pending(64).expect("alloc_pending");
+
+        vm.pc = 5;
+        vm.next_pc = 6;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref as i32;
+
+        op_mcall(&mut vm).expect("a call back into the main module must be allowed");
+
+        // The main module's code ran against the main module's data.
+        let restored = vm
+            .caller_mp_stack
+            .first()
+            .map(|(_, mp)| mp.clone())
+            .expect("the main module's data must be back on the caller stack");
+        assert_eq!(
+            memory::read_word(&restored, 0),
+            99,
+            "the callback must write into the main module's own data"
+        );
+
+        // The loaded module is current again and holds its own data.
+        assert_eq!(vm.current_loaded_module, Some(0));
+        assert_eq!(vm.mp, loaded_mp, "the caller's data must be restored");
+        assert_eq!(vm.pc, 5, "the caller's pc must be restored");
+        assert_eq!(vm.next_pc, 6, "the caller's next_pc must be restored");
+    }
+
     /// Regression: when a callee in a loaded module fails, `mcall` used to
     /// return before swapping the module context back. The caller was left
     /// running with the callee's module current, its own MP replaced by the

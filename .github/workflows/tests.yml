@@ -35,7 +35,7 @@ jobs:
     strategy:
       matrix:
         # Define the Rust versions to test against
-        rust-version: [ "1.97.1", "stable" ]
+        rust-version: [ "1.90.0", "stable" ]
 
     steps:
       - name: Checkout repository

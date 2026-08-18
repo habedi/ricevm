@@ -2,7 +2,7 @@
 
 ## Build from Source
 
-RiceVM needs Rust 1.97.1 or newer to build.
+RiceVM needs Rust 1.90.0 or newer to build.
 The optional GUI feature needs SDL2.
 
 ```bash

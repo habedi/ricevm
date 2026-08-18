@@ -65,9 +65,14 @@ Priorities, in order:
 - `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
   `libinterp/xec.c` for correctness validation).
 - `Makefile`: GNU Make wrapper around `cargo` commands (`make test`, `make build`, `make lint`, etc.).
-- `rust-toolchain.toml`: Pinned Rust toolchain (1.97.1) with `rustfmt`, `clippy`, and `rust-analyzer`.
-  The workspace's `rust-version` is the minimum supported version and holds the same 1.97.1; every crate inherits it with
-  `rust-version.workspace = true`, so `cargo` refuses an older toolchain rather than failing later in the build.
+- `rust-toolchain.toml`: Pinned Rust toolchain (1.97.1) with `rustfmt`, `clippy`, and `rust-analyzer`. Everyone who builds
+  through rustup gets this version, which keeps builds and lint output reproducible.
+- The workspace's `rust-version` (1.90.0) is the minimum supported version, and it is deliberately lower than the pinned
+  toolchain. It records the oldest compiler the code actually builds on, which is what a packager building against a
+  distribution's own rustc needs; edition 2024 puts a hard floor at 1.85. Every crate inherits it with
+  `rust-version.workspace = true`, so `cargo` refuses an older toolchain up front instead of failing later in the build.
+  Raise it only when something in the code needs a newer compiler, and update the first entry of the CI matrices in
+  `.github/workflows/lints.yml` and `tests.yml` to match, since that is what keeps the claim tested.
 
 ## Architecture
 

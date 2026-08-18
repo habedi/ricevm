@@ -15,7 +15,7 @@ and [Limbo](https://inferno-os.org/inferno/papers/limbo.html) compiler implement
 - Provides a fully functional Dis runtime (with GC, concurrency, etc.)
 - Includes a Limbo compiler, `.dis` file disassembler, and debugger
 - Includes most of the built-in modules from Dis virtual machine, including `$Sys`, `$Math`, `$Crypt`, etc.
-- Supports for GUI applications and audio playback
+- Supports GUI applications and audio playback
 - Is fully cross-platform (runs on Windows, Linux, and macOS)
 
 ## Documentation

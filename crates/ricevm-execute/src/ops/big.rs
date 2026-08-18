@@ -24,7 +24,7 @@ pub(crate) fn op_divl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_big()?;
     let m = vm.mid_or_dst_big()?;
     if s == 0 {
-        return vm.set_dst_big(0);
+        return vm.raise_exception(super::arith::ZERO_DIVIDE);
     }
     vm.set_dst_big(m.wrapping_div(s))
 }
@@ -33,7 +33,7 @@ pub(crate) fn op_modl(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let s = vm.src_big()?;
     let m = vm.mid_or_dst_big()?;
     if s == 0 {
-        return vm.set_dst_big(0);
+        return vm.raise_exception(super::arith::ZERO_DIVIDE);
     }
     vm.set_dst_big(m.wrapping_rem(s))
 }
@@ -144,12 +144,15 @@ mod tests {
     }
 
     #[test]
-    fn divl_by_zero_returns_zero() {
+    fn divl_by_zero_raises_zero_divide() {
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm init");
-        let fp = setup_big_binop(&mut vm, 0, 42);
-        op_divl(&mut vm).expect("divl by zero should succeed");
-        assert_eq!(read_dst_big(&vm, fp), 0);
+        setup_big_binop(&mut vm, 0, 42);
+        let err = op_divl(&mut vm).expect_err("divl by zero must raise");
+        assert!(
+            err.to_string().contains("zero divide"),
+            "expected zero divide, got: {err}"
+        );
     }
 
     #[test]
@@ -162,12 +165,15 @@ mod tests {
     }
 
     #[test]
-    fn modl_by_zero_returns_zero() {
+    fn modl_by_zero_raises_zero_divide() {
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm init");
-        let fp = setup_big_binop(&mut vm, 0, 42);
-        op_modl(&mut vm).expect("modl by zero should succeed");
-        assert_eq!(read_dst_big(&vm, fp), 0);
+        setup_big_binop(&mut vm, 0, 42);
+        let err = op_modl(&mut vm).expect_err("modl by zero must raise");
+        assert!(
+            err.to_string().contains("zero divide"),
+            "expected zero divide, got: {err}"
+        );
     }
 
     #[test]

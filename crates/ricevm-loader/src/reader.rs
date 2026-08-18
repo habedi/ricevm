@@ -21,9 +21,20 @@ impl<'a> Reader<'a> {
         Ok(b)
     }
 
+    /// Number of bytes left to read.
+    ///
+    /// Used as an upper bound when reserving capacity from untrusted counts:
+    /// no section can hold more elements than there are bytes remaining.
+    pub fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
     /// Read `n` bytes as a borrowed slice (zero-copy).
     pub fn read_bytes(&mut self, n: usize, section: &'static str) -> Result<&'a [u8], LoadError> {
-        if self.pos + n > self.data.len() {
+        // Compare against the remaining length instead of `pos + n`, which
+        // overflows for a huge `n` (panicking in debug, wrapping past the
+        // check and then panicking on the slice in release).
+        if n > self.remaining() {
             return Err(LoadError::UnexpectedEof { section });
         }
         let slice = &self.data[self.pos..self.pos + n];
@@ -232,5 +243,29 @@ mod tests {
     fn cstring_eof() {
         let mut r = Reader::new(b"no null");
         assert!(r.read_cstring("test").is_err());
+    }
+
+    // --- read_bytes bounds tests ---
+
+    /// A length that overflows `pos + n` must be reported as EOF rather than
+    /// panicking (debug) or wrapping past the bounds check (release).
+    #[test]
+    fn read_bytes_huge_length_returns_eof() {
+        let mut r = Reader::new(&[1, 2, 3, 4]);
+        assert_eq!(r.read_byte("test").unwrap(), 1);
+        assert!(matches!(
+            r.read_bytes(usize::MAX, "test"),
+            Err(LoadError::UnexpectedEof { section: "test" })
+        ));
+        // The failed read must not move the cursor.
+        assert_eq!(r.read_byte("test").unwrap(), 2);
+    }
+
+    #[test]
+    fn read_bytes_exact_remainder_succeeds() {
+        let mut r = Reader::new(&[1, 2, 3, 4]);
+        assert_eq!(r.read_bytes(4, "test").unwrap(), &[1, 2, 3, 4]);
+        assert_eq!(r.remaining(), 0);
+        assert!(r.read_bytes(1, "test").is_err());
     }
 }

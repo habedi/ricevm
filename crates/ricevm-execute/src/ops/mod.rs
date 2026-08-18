@@ -249,3 +249,163 @@ pub(crate) fn dispatch(vm: &mut VmState<'_>, inst: &Instruction) -> Result<(), E
         Opcode::Self_ => data_move::op_self_(vm),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        Header, MiddleOperand, Module, Operand, PointerMap, RuntimeFlags, TypeDescriptor, XMAGIC,
+    };
+
+    use super::*;
+    use crate::address::AddrTarget;
+
+    /// Number of opcodes the Dis instruction set defines, `Nop` (0x00) through
+    /// `Brkpt` (0xAF).
+    const OPCODE_COUNT: usize = 176;
+
+    fn test_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 2,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![
+                Instruction {
+                    opcode: Opcode::Nop,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+            ],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "dispatch_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    fn inst(opcode: Opcode) -> Instruction {
+        Instruction {
+            opcode,
+            source: Operand::UNUSED,
+            middle: MiddleOperand::UNUSED,
+            destination: Operand::UNUSED,
+        }
+    }
+
+    /// Every opcode byte the loader accepts has to reach a handler. A missing
+    /// arm is otherwise invisible until a real program executes that opcode,
+    /// so the whole instruction set is walked here rather than sampled. The
+    /// operands are all unused, which every accessor reads as zero, so a
+    /// handler may legitimately fault; what it may not do is report that the
+    /// opcode itself is unknown, and it may not panic.
+    #[test]
+    fn every_opcode_dispatches_to_a_handler() {
+        let module = test_module();
+        let mut dispatched = 0usize;
+        let mut faulted = Vec::new();
+        for byte in 0x00..=0xAF_u8 {
+            let opcode = Opcode::try_from(byte).expect("0x00 through 0xAF are all defined");
+            let mut vm = VmState::new(&module).expect("vm init");
+            vm.next_pc = vm.pc + 1;
+            if let Err(err) = dispatch(&mut vm, &inst(opcode)) {
+                let msg = err.to_string().to_lowercase();
+                for marker in [
+                    "unimplemented",
+                    "not implemented",
+                    "unknown opcode",
+                    "unsupported opcode",
+                    "invalid opcode",
+                    "badop",
+                ] {
+                    assert!(
+                        !msg.contains(marker),
+                        "{opcode:?} (0x{byte:02X}) reaches no handler: {err}"
+                    );
+                }
+                faulted.push(format!("{opcode:?}: {err}"));
+            }
+            dispatched += 1;
+        }
+        assert_eq!(
+            dispatched, OPCODE_COUNT,
+            "the walk must cover every defined opcode"
+        );
+        // The faults are reported rather than asserted away: with zeroed
+        // operands a handler that needs a real pointer or a real frame has
+        // nothing to work with, and refusing is the correct answer.
+        assert!(
+            faulted.len() < OPCODE_COUNT,
+            "no opcode dispatched successfully, which means the walk itself is broken: {faulted:?}"
+        );
+    }
+
+    /// Opcode 0xB0 and above are not instructions. The loader rejects them, so
+    /// `dispatch` never sees one, and this pins that boundary.
+    #[test]
+    fn bytes_above_the_last_opcode_are_not_instructions() {
+        assert!(Opcode::try_from(0xB0_u8).is_err());
+        assert_eq!(Opcode::Brkpt as u8, 0xAF);
+    }
+
+    /// `nop` changes nothing. It is the one arm whose correct behavior is to
+    /// leave every part of the machine alone.
+    #[test]
+    fn nop_leaves_the_machine_alone() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.next_pc = vm.pc + 1;
+        let frame_before = vm.frames.data.clone();
+        dispatch(&mut vm, &inst(Opcode::Nop)).expect("nop should succeed");
+        assert_eq!(vm.next_pc, 1, "nop must fall through to the next pc");
+        assert!(!vm.halted);
+        assert_eq!(vm.frames.data, frame_before);
+    }
+
+    /// `exit` and `brkpt` are the two arms that stop the thread, and the run
+    /// loop keys off `halted` alone.
+    #[test]
+    fn exit_and_brkpt_halt_the_thread() {
+        let module = test_module();
+        for opcode in [Opcode::Exit, Opcode::Brkpt] {
+            let mut vm = VmState::new(&module).expect("vm init");
+            dispatch(&mut vm, &inst(opcode)).expect("handler should succeed");
+            assert!(vm.halted, "{opcode:?} must halt the thread");
+        }
+    }
+
+    /// `jmp` and `goto` both take the destination operand as a pc. Wiring
+    /// either one to a handler that reads a different operand would leave the
+    /// pc at the fall-through, so the landing place is what is asserted.
+    #[test]
+    fn jmp_lands_on_the_destination_pc() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.next_pc = vm.pc + 1;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = 1;
+        dispatch(&mut vm, &inst(Opcode::Jmp)).expect("jmp should succeed");
+        assert_eq!(vm.next_pc, 1);
+    }
+}

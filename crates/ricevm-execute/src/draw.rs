@@ -294,7 +294,9 @@ fn draw_display_allocate(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// Display.getwindow: returns (ref Screen, ref Image)
 fn draw_display_getwindow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let display_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
+    // getwindow(d: self ref Display, winname: string, screen: ref Screen,
+    //           image: ref Image, backup: int): the display is argument 0.
+    let display_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
 
     let screen_id = make_screen(&mut vm.heap, display_id);
     let window_img = make_image(&mut vm.heap, 0, 0, 800, 600, 32, display_id);
@@ -315,7 +317,8 @@ fn draw_display_getwindow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn draw_display_color(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let display_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
+    // color(d: self ref Display, color: int): the display is argument 0.
+    let display_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
     let _color = memory::read_word(&vm.frames.data, frame_base + 36) as u32;
     let img = make_image(&mut vm.heap, 0, 0, 1, 1, 32, display_id);
     memory::write_word(&mut vm.frames.data, frame_base, img as i32);
@@ -324,7 +327,8 @@ fn draw_display_color(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn draw_display_newimage(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let display_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
+    // The display is argument 0; the rectangle follows it at +36..+52.
+    let display_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
     let rx = memory::read_word(&vm.frames.data, frame_base + 36);
     let ry = memory::read_word(&vm.frames.data, frame_base + 40);
     let rw = memory::read_word(&vm.frames.data, frame_base + 44) - rx;
@@ -533,8 +537,9 @@ fn draw_font_width(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn draw_screen_newwindow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    // Read screen ref and rectangle from the frame
-    let screen_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
+    // Read screen ref and rectangle from the frame.
+    // The screen is argument 0; the rectangle follows it at +36..+52.
+    let screen_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
     let rx = memory::read_word(&vm.frames.data, frame_base + 36);
     let ry = memory::read_word(&vm.frames.data, frame_base + 40);
     let rw = memory::read_word(&vm.frames.data, frame_base + 44) - rx;
@@ -570,7 +575,9 @@ fn draw_screen_newwindow(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
 fn draw_screen_allocate(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let frame_base = vm.frames.current_data_offset();
-    let image_id = memory::read_word(&vm.frames.data, frame_base + 48) as HeapId;
+    // allocate(image, fill: ref Image, public: int): no self pointer, so the
+    // image is argument 0.
+    let image_id = memory::read_word(&vm.frames.data, frame_base + 32) as HeapId;
     // Get display from image
     let display_id = if let Some(obj) = vm.heap.get(image_id) {
         if let HeapData::Record(data) = &obj.data {
@@ -620,5 +627,188 @@ pub(crate) mod state {
         F: FnOnce(Option<&mut DrawState>) -> R,
     {
         DRAW.with(|d| f(d.borrow_mut().as_mut()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap, RuntimeFlags,
+        TypeDescriptor, XMAGIC,
+    };
+
+    use super::*;
+
+    fn test_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "draw_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    /// Write the self pointer and a Rect(10, 20, 50, 60) into the frame.
+    fn write_self_and_rect(vm: &mut VmState<'_>, frame_base: usize, self_id: HeapId) {
+        memory::write_word(&mut vm.frames.data, frame_base + 32, self_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 36, 10);
+        memory::write_word(&mut vm.frames.data, frame_base + 40, 20);
+        memory::write_word(&mut vm.frames.data, frame_base + 44, 50);
+        memory::write_word(&mut vm.frames.data, frame_base + 48, 60);
+    }
+
+    fn record_bytes(vm: &VmState<'_>, id: HeapId) -> Vec<u8> {
+        match &vm.heap.get(id).expect("record should exist").data {
+            HeapData::Record(data) => data.clone(),
+            other => panic!("expected record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn display_newimage_uses_the_display_argument() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let display_id = make_display(&mut vm.heap, 800, 600);
+        let frame_base = vm.frames.current_data_offset();
+        write_self_and_rect(&mut vm, frame_base, display_id);
+
+        draw_display_newimage(&mut vm).expect("newimage should succeed");
+
+        let img = memory::read_word(&vm.frames.data, frame_base) as HeapId;
+        let data = record_bytes(&vm, img);
+        assert_eq!(
+            memory::read_word(&data, 44),
+            display_id as i32,
+            "the image display field should hold the display, not a rectangle coordinate"
+        );
+        assert_eq!(memory::read_word(&data, 0), 10);
+        assert_eq!(memory::read_word(&data, 4), 20);
+        assert_eq!(memory::read_word(&data, 8), 50);
+        assert_eq!(memory::read_word(&data, 12), 60);
+    }
+
+    #[test]
+    fn display_getwindow_uses_the_display_argument() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let display_id = make_display(&mut vm.heap, 800, 600);
+        let frame_base = vm.frames.current_data_offset();
+        // getwindow(d: self ref Display, winname: string, screen: ref Screen,
+        //           image: ref Image, backup: int)
+        memory::write_word(&mut vm.frames.data, frame_base + 32, display_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 36, 0); // winname
+        memory::write_word(&mut vm.frames.data, frame_base + 40, 0); // screen
+        memory::write_word(&mut vm.frames.data, frame_base + 44, 0); // image
+        memory::write_word(&mut vm.frames.data, frame_base + 48, 1); // backup
+
+        draw_display_getwindow(&mut vm).expect("getwindow should succeed");
+
+        let screen_id = memory::read_word(&vm.frames.data, frame_base) as HeapId;
+        let window_img = memory::read_word(&vm.frames.data, frame_base + 4) as HeapId;
+        assert_eq!(
+            memory::read_word(&record_bytes(&vm, screen_id), 12),
+            display_id as i32,
+            "the screen display field should hold the display, not the backup flag"
+        );
+        assert_eq!(
+            memory::read_word(&record_bytes(&vm, window_img), 44),
+            display_id as i32,
+            "the window image display field should hold the display"
+        );
+    }
+
+    #[test]
+    fn display_color_uses_the_display_argument() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let display_id = make_display(&mut vm.heap, 800, 600);
+        let frame_base = vm.frames.current_data_offset();
+        // color(d: self ref Display, color: int)
+        memory::write_word(&mut vm.frames.data, frame_base + 32, display_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 36, 0x00FF_00FF);
+
+        draw_display_color(&mut vm).expect("color should succeed");
+
+        let img = memory::read_word(&vm.frames.data, frame_base) as HeapId;
+        assert_eq!(
+            memory::read_word(&record_bytes(&vm, img), 44),
+            display_id as i32,
+            "the image display field should hold the display argument"
+        );
+    }
+
+    #[test]
+    fn screen_allocate_uses_the_image_argument() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let display_id = make_display(&mut vm.heap, 800, 600);
+        let image_id = make_image(&mut vm.heap, 0, 0, 800, 600, 32, display_id);
+        let fill_id = make_image(&mut vm.heap, 0, 0, 1, 1, 32, display_id);
+        let frame_base = vm.frames.current_data_offset();
+        // allocate(image, fill: ref Image, public: int) -- no self pointer.
+        memory::write_word(&mut vm.frames.data, frame_base + 32, image_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 36, fill_id as i32);
+        memory::write_word(&mut vm.frames.data, frame_base + 40, 1); // public
+
+        draw_screen_allocate(&mut vm).expect("allocate should succeed");
+
+        let screen_id = memory::read_word(&vm.frames.data, frame_base) as HeapId;
+        assert_eq!(
+            memory::read_word(&record_bytes(&vm, screen_id), 12),
+            display_id as i32,
+            "the screen display should come from the image argument"
+        );
+    }
+
+    #[test]
+    fn screen_newwindow_uses_the_screen_argument() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let display_id = make_display(&mut vm.heap, 800, 600);
+        let screen_id = make_screen(&mut vm.heap, display_id);
+        let frame_base = vm.frames.current_data_offset();
+        write_self_and_rect(&mut vm, frame_base, screen_id);
+
+        draw_screen_newwindow(&mut vm).expect("newwindow should succeed");
+
+        let img = memory::read_word(&vm.frames.data, frame_base) as HeapId;
+        let data = record_bytes(&vm, img);
+        assert_eq!(
+            memory::read_word(&data, 48),
+            screen_id as i32,
+            "the image screen field should hold the screen"
+        );
+        assert_eq!(
+            memory::read_word(&data, 44),
+            display_id as i32,
+            "the display should come from the screen record"
+        );
+        assert_eq!(memory::read_word(&data, 0), 10);
+        assert_eq!(memory::read_word(&data, 12), 60);
     }
 }

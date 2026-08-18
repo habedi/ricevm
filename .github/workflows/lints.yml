@@ -32,9 +32,9 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        # Define the Rust versions for linting against
-        rust-version: [ "1.92.0", "stable" ]
+        rust-version: [ "1.90.0", "stable" ]
 
     steps:
       - name: Checkout code
@@ -52,7 +52,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang curl pkg-config libssl-dev make
-          make install-deps
+          rustup component add rustfmt clippy
 
       - name: Run linters
         run: make lint

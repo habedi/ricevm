@@ -6,10 +6,46 @@ use ricevm_core::{
 
 use crate::reader::Reader;
 
+/// Convert an untrusted count or length operand into a `usize`.
+///
+/// A negative operand would wrap into a huge `usize`, which either overflows
+/// the reader's bounds check or requests an absurd allocation, so reject it.
+fn checked_count(value: i32, section: &'static str) -> Result<usize, LoadError> {
+    usize::try_from(value).map_err(|_| {
+        LoadError::ValidationError(format!("negative count {value} in {section} section"))
+    })
+}
+
+/// Read a count or length operand that must not be negative.
+fn read_count(r: &mut Reader<'_>, section: &'static str) -> Result<usize, LoadError> {
+    let value = r.read_operand(section)?;
+    checked_count(value, section)
+}
+
+/// Reject a negative offset operand.
+fn checked_offset(value: i32, section: &'static str) -> Result<i32, LoadError> {
+    if value < 0 {
+        return Err(LoadError::ValidationError(format!(
+            "negative offset {value} in {section} section"
+        )));
+    }
+    Ok(value)
+}
+
+/// Capacity to reserve for a section holding `count` elements.
+///
+/// Every element costs at least one byte in the input, so the bytes left in
+/// the file are a safe upper bound. This keeps a bogus count from turning a
+/// tiny file into a multi-gigabyte allocation while still pre-sizing the
+/// vector for well-formed modules.
+fn capacity_for(count: usize, r: &Reader<'_>) -> usize {
+    count.min(r.remaining())
+}
+
 pub(crate) fn parse_header(r: &mut Reader<'_>) -> Result<Header, LoadError> {
     let magic = r.read_operand("header")?;
     let signature = if magic == SMAGIC {
-        let sig_len = r.read_operand("header")? as usize;
+        let sig_len = read_count(r, "header")?;
         r.read_bytes(sig_len, "header")?.to_vec()
     } else if magic == XMAGIC {
         Vec::new()
@@ -69,7 +105,8 @@ fn parse_src_dst_operand(r: &mut Reader<'_>, mode_bits: u8) -> Result<Operand, L
 }
 
 pub(crate) fn parse_code(r: &mut Reader<'_>, count: i32) -> Result<Vec<Instruction>, LoadError> {
-    let mut instructions = Vec::with_capacity(count as usize);
+    let count = checked_count(count, "code")?;
+    let mut instructions = Vec::with_capacity(capacity_for(count, r));
 
     for _ in 0..count {
         let op_byte = r.read_byte("code")?;
@@ -111,12 +148,13 @@ pub(crate) fn parse_types(
     r: &mut Reader<'_>,
     count: i32,
 ) -> Result<Vec<TypeDescriptor>, LoadError> {
-    let mut descriptors = Vec::with_capacity(count as usize);
+    let count = checked_count(count, "type")?;
+    let mut descriptors = Vec::with_capacity(capacity_for(count, r));
 
     for _ in 0..count {
         let id = r.read_operand("type")? as u32;
         let size = r.read_operand("type")?;
-        let map_in_bytes = r.read_operand("type")? as usize;
+        let map_in_bytes = read_count(r, "type")?;
         let bytes = if map_in_bytes > 0 {
             r.read_bytes(map_in_bytes, "type")?.to_vec()
         } else {
@@ -160,22 +198,25 @@ pub(crate) fn parse_data(r: &mut Reader<'_>) -> Result<Vec<DataItem>, LoadError>
         }
 
         let item_type = (code >> 4) & 0x0F;
-        let mut count = (code & 0x0F) as i32;
-        if count == 0 {
-            count = r.read_operand("data")?;
-        }
+        // A zero low nibble means the count is spelled out as an operand.
+        let inline_count = (code & 0x0F) as usize;
+        let count = if inline_count == 0 {
+            read_count(r, "data")?
+        } else {
+            inline_count
+        };
 
-        let offset = r.read_operand("data")?;
+        let offset = checked_offset(r.read_operand("data")?, "data")?;
 
         let item = match item_type {
             1 => {
                 // value_bit8
-                let values = r.read_bytes(count as usize, "data")?.to_vec();
+                let values = r.read_bytes(count, "data")?.to_vec();
                 DataItem::Bytes { offset, values }
             }
             2 => {
                 // value_bit32
-                let mut values = Vec::with_capacity(count as usize);
+                let mut values = Vec::with_capacity(capacity_for(count, r));
                 for _ in 0..count {
                     values.push(r.read_word_be("data")?);
                 }
@@ -183,13 +224,13 @@ pub(crate) fn parse_data(r: &mut Reader<'_>) -> Result<Vec<DataItem>, LoadError>
             }
             3 => {
                 // utf_string
-                let bytes = r.read_bytes(count as usize, "data")?;
+                let bytes = r.read_bytes(count, "data")?;
                 let value = String::from_utf8_lossy(bytes).into_owned();
                 DataItem::String { offset, value }
             }
             4 => {
                 // value_real64
-                let mut values = Vec::with_capacity(count as usize);
+                let mut values = Vec::with_capacity(capacity_for(count, r));
                 for _ in 0..count {
                     values.push(read_real(r)?);
                 }
@@ -216,7 +257,7 @@ pub(crate) fn parse_data(r: &mut Reader<'_>) -> Result<Vec<DataItem>, LoadError>
             }
             8 => {
                 // value_bit64
-                let mut values = Vec::with_capacity(count as usize);
+                let mut values = Vec::with_capacity(capacity_for(count, r));
                 for _ in 0..count {
                     values.push(read_big(r)?);
                 }
@@ -236,7 +277,8 @@ pub(crate) fn parse_name(r: &mut Reader<'_>) -> Result<String, LoadError> {
 }
 
 pub(crate) fn parse_exports(r: &mut Reader<'_>, count: i32) -> Result<Vec<ExportEntry>, LoadError> {
-    let mut entries = Vec::with_capacity(count as usize);
+    let count = checked_count(count, "export")?;
+    let mut entries = Vec::with_capacity(capacity_for(count, r));
 
     for _ in 0..count {
         let pc = r.read_operand("export")?;
@@ -256,12 +298,12 @@ pub(crate) fn parse_exports(r: &mut Reader<'_>, count: i32) -> Result<Vec<Export
 }
 
 pub(crate) fn parse_imports(r: &mut Reader<'_>) -> Result<Vec<ImportModule>, LoadError> {
-    let module_count = r.read_operand("import")?;
-    let mut modules = Vec::with_capacity(module_count as usize);
+    let module_count = read_count(r, "import")?;
+    let mut modules = Vec::with_capacity(capacity_for(module_count, r));
 
     for _ in 0..module_count {
-        let func_count = r.read_operand("import")?;
-        let mut functions = Vec::with_capacity(func_count as usize);
+        let func_count = read_count(r, "import")?;
+        let mut functions = Vec::with_capacity(capacity_for(func_count, r));
 
         for _ in 0..func_count {
             let signature = r.read_word_be("import")?;
@@ -284,8 +326,8 @@ pub(crate) fn parse_imports(r: &mut Reader<'_>) -> Result<Vec<ImportModule>, Loa
 }
 
 pub(crate) fn parse_handlers(r: &mut Reader<'_>) -> Result<Vec<Handler>, LoadError> {
-    let handler_count = r.read_operand("handler")?;
-    let mut handlers = Vec::with_capacity(handler_count as usize);
+    let handler_count = read_count(r, "handler")?;
+    let mut handlers = Vec::with_capacity(capacity_for(handler_count, r));
 
     for _ in 0..handler_count {
         let exception_offset = r.read_operand("handler")?;
@@ -300,9 +342,10 @@ pub(crate) fn parse_handlers(r: &mut Reader<'_>) -> Result<Vec<Handler>, LoadErr
 
         let packed_cases = r.read_operand("handler")?;
         let _exception_type_count = packed_cases >> 16;
-        let total_count = packed_cases & 0xFFFF;
+        // Masked to 16 bits, so this is always in 0..=65535.
+        let total_count = (packed_cases & 0xFFFF) as usize;
 
-        let mut cases = Vec::with_capacity((total_count + 1) as usize);
+        let mut cases = Vec::with_capacity(capacity_for(total_count, r) + 1);
 
         for _ in 0..total_count {
             let name_str = r.read_cstring("handler")?;
@@ -457,6 +500,34 @@ fn validate_module(module: &Module) -> Result<(), LoadError> {
                 "handler[{i}] begin_pc {} >= end_pc {}",
                 h.begin_pc, h.end_pc
             )));
+        }
+
+        // A handler may name a type descriptor for its exception frame;
+        // operand -1 (parsed as `None`) means it has none. Any other value
+        // indexes the type table. A negative operand other than -1 wraps into
+        // a huge u32 during parsing, which this bound rejects as well.
+        if let Some(td) = h.type_descriptor
+            && td as usize >= module.types.len()
+        {
+            return Err(LoadError::ValidationError(format!(
+                "handler[{i}] type_descriptor {td} out of bounds (type count {type_len})"
+            )));
+        }
+
+        // Each case jumps to an instruction. The trailing wildcard case is
+        // allowed to carry pc == -1, which means "this handler has no
+        // catch-all"; Inferno's loader emits that sentinel.
+        let wildcard_index = h.cases.len().saturating_sub(1);
+        for (j, case) in h.cases.iter().enumerate() {
+            if j == wildcard_index && case.pc == -1 {
+                continue;
+            }
+            if case.pc < 0 || case.pc >= code_len {
+                return Err(LoadError::ValidationError(format!(
+                    "handler[{i}] case[{j}] pc {} out of bounds (code size {code_len})",
+                    case.pc
+                )));
+            }
         }
     }
 

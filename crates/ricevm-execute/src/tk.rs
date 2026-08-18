@@ -120,17 +120,26 @@ fn tk_toplevel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let tl_id = vm.heap.alloc(0, HeapData::Record(toplevel_data));
     // Write result at frame offset 0 (standard return location)
     memory::write_word(&mut vm.frames.data, frame_base, tl_id as i32);
-    // Write at the return pointer location (offset 16 holds the caller's return address)
-    let ret_addr = memory::read_word(&vm.frames.data, frame_base + 32);
+    // Write through the caller's return pointer, which the Lea instruction
+    // stored at frame offset 16 as a virtual address.
+    let ret_ptr = memory::read_word(&vm.frames.data, frame_base + 16);
     tracing::trace!(
         tl_id = tl_id,
         frame_base = frame_base,
-        ret_addr = ret_addr,
+        ret_ptr = ret_ptr,
         stack_len = vm.frames.data.len(),
         "Tk.toplevel: writing return value"
     );
-    if ret_addr > 0 && (ret_addr as usize) + 4 <= vm.frames.data.len() {
-        memory::write_word(&mut vm.frames.data, ret_addr as usize, tl_id as i32);
+    if ret_ptr != 0 {
+        match crate::address::decode_virtual_addr(ret_ptr, 0) {
+            crate::address::AddrTarget::Frame(off) => {
+                memory::write_word(&mut vm.frames.data, off, tl_id as i32);
+            }
+            crate::address::AddrTarget::Mp(off) => {
+                memory::write_word(&mut vm.mp, off, tl_id as i32);
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -430,14 +439,14 @@ fn find_option(parts: &[&str], opt: &str) -> Option<String> {
 /// Parse a hex color string like "#aaaaaa" or "#ff5500" to RGBA u32.
 fn parse_hex_color(s: &str) -> Option<u32> {
     let s = s.strip_prefix('#')?;
-    if s.len() == 6 {
-        let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-        let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-        let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-        Some(((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xFF)
-    } else {
-        None
+    // Byte slicing is only safe once the string is known to be ASCII hex.
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
     }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some(((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xFF)
 }
 
 /// Tk->namechan: register a named channel for Tk events.
@@ -852,15 +861,15 @@ fn process_tk_cmd(_vm: &mut VmState<'_>, cmd: &str) {
             for cmd in pending_cmds {
                 // Button commands are Tk send commands like "send wm_title exit"
                 let parts: Vec<&str> = shell_split(&cmd);
-                if parts.first().is_some_and(|s| *s == "send") {
-                    if let Some(chan_name) = parts.get(1) {
-                        let value = if parts.len() > 2 {
-                            parts[2..].join(" ")
-                        } else {
-                            String::new()
-                        };
-                        send_to_named_channel(_vm, chan_name, &value);
-                    }
+                if parts.first().is_some_and(|s| *s == "send")
+                    && let Some(chan_name) = parts.get(1)
+                {
+                    let value = if parts.len() > 2 {
+                        parts[2..].join(" ")
+                    } else {
+                        String::new()
+                    };
+                    send_to_named_channel(_vm, chan_name, &value);
                 }
             }
         }
@@ -1329,5 +1338,86 @@ fn extract_color_option(parts: &[&str], opt: &str) -> Option<u32> {
         "yellow" => Some(0xFFFF00FF),
         "gray" | "grey" => Some(0xBBBBBBFF),
         _ => parse_hex_color(&val),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ricevm_core::{
+        Header, Instruction, MiddleOperand, Module, Opcode, Operand, PointerMap, RuntimeFlags,
+        TypeDescriptor, XMAGIC,
+    };
+
+    use super::*;
+
+    fn test_module() -> Module {
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 1,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            }],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: "tk_test".to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_six_hex_digits() {
+        assert_eq!(parse_hex_color("#ff5500"), Some(0xFF_55_00_FF));
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_multibyte_input() {
+        // Six bytes, but the slice boundaries fall inside a character.
+        assert_eq!(parse_hex_color("#aébcd"), None);
+        assert_eq!(parse_hex_color("#ééé"), None);
+    }
+
+    #[test]
+    fn toplevel_writes_through_the_return_pointer() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let frame_base = vm.frames.current_data_offset();
+        let ret_off = frame_base + 48;
+        memory::write_word(&mut vm.frames.data, frame_base + 16, ret_off as i32);
+
+        // Argument 0 is the display, a heap pointer well above the frame range.
+        let display_id = vm.heap.alloc(0, HeapData::Record(vec![0u8; 20]));
+        memory::write_word(&mut vm.frames.data, frame_base + 32, display_id as i32);
+        let arg_id = vm.heap.alloc(0, HeapData::Str("-title test".to_string()));
+        memory::write_word(&mut vm.frames.data, frame_base + 36, arg_id as i32);
+
+        tk_toplevel(&mut vm).expect("toplevel should succeed");
+
+        let tl_id = memory::read_word(&vm.frames.data, frame_base);
+        assert_ne!(tl_id, 0, "toplevel should return a record");
+        assert_eq!(
+            memory::read_word(&vm.frames.data, ret_off),
+            tl_id,
+            "the Toplevel ref should land in the caller's return slot"
+        );
     }
 }

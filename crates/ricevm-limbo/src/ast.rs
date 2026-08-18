@@ -188,6 +188,10 @@ pub enum BasicType {
 pub enum Stmt {
     Expr(Expr),
     VarDecl(VarDecl),
+    /// `names: import modvar;` in statement position. Declares no storage, but
+    /// it does bind names, so it has to reach codegen rather than being
+    /// discarded by the parser.
+    Import(ImportDecl),
     Block(Block),
     If(IfStmt),
     For(ForStmt),
@@ -263,17 +267,46 @@ pub struct AltStmt {
     pub span: Span,
 }
 
+/// One arm of an `alt`. Limbo lets several guards share a body:
+///
+/// ```text
+/// x := <-c1 or x = <-c2 or x = <-c3 =>
+/// ```
+///
+/// Each guard is a separate entry in the `alt` table, and all of them run
+/// this one body, so the arm holds every guard rather than just the first —
+/// an arm that kept only `c1` would be a program that listens on one channel
+/// instead of three.
 #[derive(Debug, Clone)]
 pub struct AltArm {
-    pub guard: AltGuard,
+    pub guards: Vec<AltGuard>,
     pub body: Vec<Stmt>,
 }
 
+/// A communication guard of an `alt` arm, classified at parse time so that
+/// codegen never has to re-derive whether a guard sends or receives.
 #[derive(Debug, Clone)]
 pub enum AltGuard {
-    Recv(Option<Expr>, Expr),
+    /// `c <-= v`: send `v` on channel `c`. Fields are `(chan, value)`.
     Send(Expr, Expr),
+    /// `<-c`, optionally binding the received value. Fields are
+    /// `(destination, chan)`; the destination is `None` for a bare `<-c`,
+    /// whose value is discarded.
+    Recv(Option<AltDest>, Expr),
+    /// `*`: the arm taken when no guard is ready.
     Wildcard,
+}
+
+/// Where an `alt` receive guard puts the value it receives.
+#[derive(Debug, Clone)]
+pub enum AltDest {
+    /// `x := <-c` — declares `x`.
+    Decl(Vec<String>),
+    /// `(a, b) := <-c` — declares each tuple field. `nil` names a field
+    /// that is received but not bound.
+    TupleDecl(Vec<String>),
+    /// `x = <-c`, `a[i] = <-c`, `p.f = <-c` — assigns to an existing lvalue.
+    Assign(Expr),
 }
 
 #[derive(Debug, Clone)]
@@ -331,8 +364,9 @@ pub enum Expr {
     Load(Box<Type>, Box<Expr>, Span),
     /// `array[size] of type`
     ArrayAlloc(Box<Expr>, Box<Type>, Span),
-    /// `array of { elements }`
-    ArrayLit(Vec<Expr>, Option<Box<Type>>, Span),
+    /// `array[size] of { elements }` — `size` is absent for `array[] of {..}`
+    /// and `array of {..}`, where the length follows from the elements.
+    ArrayLit(Option<Box<Expr>>, Vec<ArrayElem>, Option<Box<Type>>, Span),
     /// `chan of type`
     ChanAlloc(Box<Type>, Span),
     /// `list of { elements }`
@@ -361,6 +395,25 @@ pub enum Expr {
     PostInc(Box<Expr>, Span),
     /// Postfix decrement: `expr--`
     PostDec(Box<Expr>, Span),
+}
+
+/// One element of an array literal. Limbo lets an element name the index it
+/// initialises, so dropping the selector silently shifts every value.
+#[derive(Debug, Clone)]
+pub struct ArrayElem {
+    /// `None` for a positional element.
+    pub index: Option<ArrayIndex>,
+    pub value: Expr,
+}
+
+/// The index selector of an array-literal element.
+#[derive(Debug, Clone)]
+pub enum ArrayIndex {
+    /// One or more selectors joined by `or`, each a single index or a `lo to
+    /// hi` range: `'a' to 'z' or 'A' to 'Z' or '_' => v`.
+    Selectors(Vec<(Expr, Option<Expr>)>),
+    /// `* => v`: every index not named by another element.
+    Wildcard,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

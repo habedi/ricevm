@@ -123,7 +123,7 @@ init(nil: ref Draw->Context, nil: list of string)
     assert!(!module.imports.is_empty(), "should have $Sys import");
     assert_eq!(module.exports[0].name, "init");
 
-    let bytes = ricevm_limbo::writer::write_dis(&module);
+    let bytes = ricevm_limbo::writer::write_dis(&module).expect("module should serialize");
     assert!(bytes.len() > 20, "binary should be non-trivial");
 }
 
@@ -151,4 +151,31 @@ init(nil: ref Draw->Context, nil: list of string)
             panic!("loader failed: {e}");
         }
     }
+}
+
+/// A module that is nothing but a constant table: no functions, no `init`.
+/// Its array initialiser goes into the data section, and the written `.dis`
+/// must load back — the data-section writer used to omit the offset operand of
+/// `SetArray`/`RestoreBase`, which desynchronised everything after them, and
+/// the header pointed `entry_pc` at code that does not exist.
+#[test]
+fn roundtrip_data_only_module_with_array_table() {
+    let src = r#"implement GenCP;
+GenCP: module {
+    cstab: array of int;
+};
+cstab := array[] of {16r00, 16r01, 16r02};
+"#;
+    let bytes = ricevm_limbo::compile_to_bytes(src, "gencp.b").expect("compile");
+    let m = ricevm_loader::load(&bytes).expect("the written module must load back");
+    assert_eq!(
+        m.header.entry_pc, -1,
+        "a module with no `init` has no entry"
+    );
+    assert!(
+        m.data
+            .iter()
+            .any(|d| matches!(d, ricevm_core::DataItem::Array { length: 3, .. })),
+        "the table must survive the round trip"
+    );
 }

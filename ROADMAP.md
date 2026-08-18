@@ -70,9 +70,11 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] Stack frame allocation and deallocation with two-phase push
 - [x] Heap allocation for dynamic types (records, arrays, strings, lists, channels, and module refs)
 - [x] Reference counting for deterministic destruction (module refs protected from premature freeing)
-- [x] `op_ret` frees frame pointers via type descriptor pointer maps (matching reference `freeptrs`)
+- [ ] `op_ret` frees frame pointers via type descriptor pointer maps (matching reference `freeptrs`) -- disabled: the frame header's type index is
+  unreliable for frames built by builtin `mcall`/`mframe`, so releasing by it would dec_ref values that are not pointers. The collector reclaims the
+  frame's objects instead (ops/control.rs)
 - [x] Mark-and-sweep garbage collector (scans frames, MP, caller MP stacks, all loaded module MPs, and all suspended threads)
-- [x] Optional toggle to disable mark-and-sweep collection (`--no-gc` flag)
+- [x] Optional toggle to disable mark-and-sweep collection (`--no-gc` flag; debug only, since reference counting alone leaks -- see Known Limitations)
 - [x] Bounds-safe memory access (out-of-bounds reads return 0; writes are no-ops)
 
 ### Scheduler
@@ -169,25 +171,33 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] `--root` flag for Inferno root path mapping
 - [x] `--trace` flag for instruction-level debugging
 - [x] `--no-gc` flag to disable mark-and-sweep garbage collection
-- [x] `--threads` flag to configure scheduler thread pool size
+- [ ] `--threads` flag to configure scheduler thread pool size: the flag is accepted and sets `RICEVM_THREADS`, but nothing reads it, so it has no
+  effect until the preemptive scheduler is connected
 - [x] `-- arg1 arg2` guest argument passing
 - [x] Colored output, elapsed time reporting, and exit codes
 - [x] Debugger integration (breakpoints, single-stepping, stack inspection, colored output, and `info` command)
 
 ### Compatibility
 
-- [x] 546 of 844 pre-compiled Inferno `.dis` programs pass (65%); ~83% effective pass rate excluding programs that need arguments or are library
-  modules
-- [x] 58 timeouts (programs waiting for interactive input; expected with no stdin)
+- [x] 669 of the 781 runnable pre-compiled Inferno `.dis` programs run without a VM fault (86%). Of the 866 files in the submodule, 85 are libraries
+  with `entry_pc = -1` and nothing to execute; of the rest, 475 run to completion and 194 exit through `fail:...`, which is how a Limbo program
+  reports a usage message or a missing service, so the program itself worked
+- [x] 8 timeouts, all interactive: the `wm/` clock, calendar, and games, plus `math/sieve` and `grid/demo/blur`
+- [x] 104 faults, concentrated in the subsystems that need a display or a network service: 33 under `wm/`, 9 under `charon/`, and the rest spread
+  across `acme/`, `svc/httpd/`, `collab/servers/`, and `spree/clients/`
 - [x] Systematic audit against reference xec.c implementation
-- [ ] Target: 600+ programs passing (70%+); remaining failures are mostly environment-dependent (Plan 9 namespaces, crypto, device files)
+- [ ] Reduce the 104 faults; the remainder are mostly environment-dependent (Plan 9 namespaces, crypto beyond the `$Keyring` stub, and device files)
+
+Measured with the probe paths and no `--root`, no arguments, and empty stdin. This counts programs that start and do not fault, which is a floor
+rather than a guarantee: a program can run to completion and still print the wrong thing. The runtime differential harness
+(`scripts/diff-runtime.sh`) is what checks output against the reference compiler's own build of the same source.
 
 ### Development and Testing
 
 - [x] Cargo workspace with modular crate structure
 - [x] CI pipeline with automated tests
 - [x] Dual license (MIT and Apache 2.0)
-- [x] 200+ tests total:
+- [x] 963 tests total:
     - Unit tests for instruction decoding and execution
     - Property-based tests for arithmetic (commutativity, associativity, and identity)
     - Property-based tests for string operations (slicec bounds, addc associativity)
@@ -196,9 +206,9 @@ This document outlines the features implemented in RiceVM and the future goals f
     - Limbo compiler end-to-end test
 - [x] End-to-end pipeline tests with hand-crafted `.dis` binaries
 - [x] Fuzz testing setup for the module loader (`cargo-fuzz` with `libfuzzer`)
-- [x] 800+ pre-compiled `.dis` files available via `external/inferno-os` submodule
+- [x] 866 pre-compiled `.dis` files available via `external/inferno-os` submodule
 - [x] `make lint` passes (clippy with `-D warnings -D clippy::unwrap_used -D clippy::expect_used`)
-- [x] `make test` passes (233 tests, 0 failures)
+- [x] `make test` passes (0 failures)
 
 ### Built-in Limbo Compiler (`ricevm-limbo` crate)
 
@@ -243,11 +253,22 @@ This document outlines the features implemented in RiceVM and the future goals f
 - [x] .dis binary writer: complete format with operand encoding, handler tables, and null terminators
 - [x] CLI integration: `ricevm-cli compile source.b [-o output.dis] [-I include_path]`
 - [x] `make test-limbo`: 11 correctness tests (built-in vs reference compiler output comparison)
-- [x] 155/159 Inferno programs compile with both built-in and reference compilers (100% reference coverage)
+- [x] `import` declarations: `a, b: import m;` binds module members unqualified, for both a module variable and a module interface name. Constants
+  fold (including in constant expressions), functions lower to the same cross-module call as the qualified spelling
+- [x] `implement X` brings X's own interface into unqualified scope, with real ADT field layouts
+- [x] Cross-module calls through any module handle (previously only `sys->f()` worked; every other handle emitted nothing)
+- [x] Per-type descriptors for `new`/`newa`, with MSB-first pointer maps, so the collector traces compiled programs at the right offsets
+- [x] Tuple values: literals, `.tN` read and write, whole-tuple copies, tuple arguments, returns and messages, and `((a, b) := <-c).t0`
+- [x] Tuple channels via `Newcm`/`Newcmp` with a real block descriptor
+- [x] Module-level data initialisers in a module with no `init`, written to the data section as the reference does
+- [x] `alt` statement codegen: send, receive and wildcard arms, `or`-joined guards sharing one body, tuple receives, and blocking via `Alt`/`Nbalt`
+- [x] `pick` statement codegen: tagged-ADT layout (tag at 0, then common fields, variants overlaid), `ref Adt.Variant(...)` construction, and `tagof`
+- [x] 356/945 programs under `external/inferno-os/appl` compile, measured with `-I external/inferno-os/module`
 - [ ] Full type checker (validation, not just inference)
-- [ ] Alt statement codegen
+- [ ] ADT function member calls whose receiver the compiler cannot type -- e.g. through `hd list` (199 corpus files, the largest remaining gap)
 - [ ] Exception handler block codegen
-- [ ] Pick types and cyclic ADT references
+- [ ] Cyclic ADT references
+- [ ] Array-of-channels `alt` guards (the VM's alt table cannot express them)
 
 ### Documentation
 
@@ -259,16 +280,42 @@ This document outlines the features implemented in RiceVM and the future goals f
 
 #### Design Choices
 
-- Cooperative threading with non-blocking stdin: the run loop rotates threads by quantum; stdin reads use a background thread to avoid blocking the
-  VM; a preemptive scheduler with OS threads exists but is not connected because it would require `Arc<Mutex<>>` refactoring of VmState
+- Cooperative threading with non-blocking stdin: the run loop rotates threads by quantum, and stdin reads use a background thread to avoid blocking
+  the VM. A preemptive scheduler with an OS thread pool exists in `scheduler.rs` and holds its state in `Arc<Mutex<SharedState>>`, but nothing
+  instantiates it: the live loop is `VmState::run`. Connecting it needs the same treatment for the rest of `VmState`, which the cooperative loop owns
+  outright
 - `op_ret` does not restore module context from the frame; the `mcall` wrapper handles module context restoration instead (correct behavior, different
   structure from reference)
+- Heap tracing is precise where a type descriptor is known, conservative everywhere else, and releasing is still conservative throughout. `new`, `newa`
+  and `newaz` resolve the allocating module's type descriptor while the module is still known and hang the resulting pointer map on the object
+  (`heap::TraceMap`, interned per `(module, type)`), so mark-and-sweep traces exactly the words the module calls pointers: bytes read into an
+  `array of byte`, or the halves of a `real`, no longer keep an object alive by coincidence. Objects allocated without a descriptor -- strings, list
+  nodes, channels, module data arrays, the records the runtime builds for its own use -- keep the word-by-word scan, which retains anything that looks
+  like a live id. `dec_ref` still cascades only through slots whose reference is provably taken on store (list tails, array-slice parents) and not
+  through buffers, mapped or not: a pointer map states layout, not ownership, and several block-copy paths (`heap_write`, `array_write`, `cons_bytes`,
+  `movm`, and `headm`) move pointers in *and out* of buffers without counting anything, while `op_ret` never releases a frame's pointers. Cascading on
+  the map alone would release references that were never acquired. The typed copies are counted: `movmp`, `consmp`, `headmp`, and `slicela` walk the
+  pointer map and take a reference for every pointer they duplicate, matching `incmem` in the reference. So pointers owned by a buffer are still reclaimed by the collector rather than at drop,
+  and with `--no-gc` they leak. Closing that gap means a counted write barrier on every block copy in both directions, plus a working `freeptrs` at
+  `ret`.
 
 #### Unimplementable on Host OS
 
 - `$Sys` stubs that require Plan 9 namespace semantics: `bind`, `mount`, `unmount`, `export`, `fauth`, and `file2chan` (no host OS equivalent)
 - ~240 pre-compiled programs fail: ~100 need command-line arguments (working correctly), ~50 need Plan 9 namespace/device features, ~30 need crypto
   modules beyond the current `$Keyring` stub, and ~60 have other environment dependencies
+
+#### Measuring Built-in Compiler Coverage
+
+A compile-success count only means something if unresolved names are errors. Before the built-in compiler reported them, an unknown identifier
+lowered to `Movw $0`, an `alt` statement emitted no code at all, and a call through any module handle other than `sys` emitted nothing -- so almost
+every program "compiled" and a coverage number could not distinguish working output from silently wrong output. An earlier claim of 155/159 came
+from that regime, as did a measured 856/945 over `external/inferno-os/appl`.
+
+Those paths are now diagnostics, so the count reflects programs the compiler can actually lower: **356/945**. Measure with
+`-I external/inferno-os/module`; without it no `.m` interface resolves and the number is meaningless. Remaining causes, largest first: 199 ADT
+function member calls, 97 calls to undefined functions, 54 undefined identifiers, 35 interface members this compiler cannot yet represent, 40
+missing interfaces, and a long tail. No input makes the compiler panic.
 
 #### Incomplete Modules
 

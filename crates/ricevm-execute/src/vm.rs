@@ -29,6 +29,16 @@ pub(crate) struct VmState<'m> {
     pub next_pc: usize,
     pub halted: bool,
     pub trace: bool,
+    /// Whether the mark-and-sweep pass runs (`--no-gc` / `RICEVM_NO_GC` clears it).
+    ///
+    /// Debug use only. `Heap::dec_ref` deliberately does not cascade into record,
+    /// array or ADT buffers: a pointer map says which words *may* hold pointers,
+    /// not that a reference was taken when one was stored, and the block-write
+    /// paths take none (see `Heap::child_refs`). The collector is therefore
+    /// still the only thing that reclaims what those buffers own, and with it
+    /// off a program that builds such structures leaks without bound. What the
+    /// pointer maps did change is the other direction: the collector no longer
+    /// retains an object because a byte or `real` word happened to equal its id.
     pub gc_enabled: bool,
     pub(crate) gc_counter: usize,
     /// Index of the currently executing loaded module (None = main module).
@@ -61,8 +71,24 @@ pub(crate) struct VmState<'m> {
     /// Set by recv/alt when channel has no data; the run loop suspends the thread.
     pub(crate) blocked_channel: Option<heap::HeapId>,
 
+    /// Lowest frame base the exception unwinder may unwind past. A nested
+    /// cross-module call (mcall/mspawn into a main or loaded module) runs its
+    /// own interpreter loop over the callee's code, so an exception must not
+    /// escape into a caller whose code that loop is not executing.
+    pub(crate) unwind_floor: usize,
+
     /// Queue of suspended threads for cooperative scheduling.
     pub(crate) thread_queue: std::collections::VecDeque<SuspendedThread>,
+
+    /// Pid of the thread currently running. `sys->pctl` reports it, and a
+    /// program that spawns children uses it to tell them apart.
+    pub(crate) current_pid: i32,
+    /// Source of pids for threads spawned from here.
+    pub(crate) next_pid: i32,
+    /// Exit records for threads that have finished, oldest first, in the form
+    /// the reference writes them: `pid "module":cause`, with an empty cause on
+    /// success (emu/port/dis.c:438). A read of `/prog/N/wait` takes one.
+    pub(crate) wait_records: std::collections::VecDeque<String>,
 }
 
 /// Per-thread state saved when a thread is suspended.
@@ -71,6 +97,8 @@ pub(crate) struct SuspendedThread {
     pub frames: FrameStack,
     pub mp: Vec<u8>,
     pub pc: usize,
+    /// Pid this thread reports through `sys->pctl` and names in its exit record.
+    pub pid: i32,
     pub heap_refs: Vec<(heap::HeapId, usize)>,
     pub last_error: String,
     pub current_loaded_module: Option<usize>,
@@ -490,21 +518,63 @@ impl<'m> VmState<'m> {
             imm_dst: 0,
             caller_mp_stack: Vec::new(),
             blocked_channel: None,
+            unwind_floor: 0,
             thread_queue: std::collections::VecDeque::new(),
+            current_pid: 1,
+            next_pid: 2,
+            wait_records: std::collections::VecDeque::new(),
             heap_refs: Vec::new(),
         })
     }
 
     /// Get the type descriptor size for the currently executing module.
     pub(crate) fn current_type_size(&self, type_idx: usize) -> Option<usize> {
+        self.current_type(type_idx).map(|td| td.size as usize)
+    }
+
+    /// Get a type descriptor of the currently executing module.
+    fn current_type(&self, type_idx: usize) -> Option<&ricevm_core::TypeDescriptor> {
         if let Some(lm_idx) = self.current_loaded_module {
             self.loaded_modules
                 .get(lm_idx)
                 .and_then(|lm| lm.module.types.get(type_idx))
-                .map(|td| td.size as usize)
         } else {
-            self.module.types.get(type_idx).map(|td| td.size as usize)
+            self.module.types.get(type_idx)
         }
+    }
+
+    /// The pointer map of a type of the currently executing module.
+    ///
+    /// A `HeapObject`'s type index cannot be resolved after the fact -- index 3
+    /// means one thing in the main module and another in each loaded one -- so
+    /// an allocation resolves its descriptor here, while the module is still
+    /// known, and carries the resulting map. Maps are interned per
+    /// `(module, type)` so the many objects of one type share one.
+    pub(crate) fn trace_map_for_type(
+        &mut self,
+        type_idx: usize,
+    ) -> Option<std::sync::Arc<heap::TraceMap>> {
+        let key = (self.current_module_virt_idx(), type_idx as u32);
+        if let Some(map) = self.heap.trace_map(key) {
+            return Some(map);
+        }
+        let td = self.current_type(type_idx)?;
+        let map = heap::TraceMap::new(&td.pointer_map.bytes, td.size as usize);
+        Some(self.heap.intern_trace_map(key, map))
+    }
+
+    /// Run a mark-and-sweep pass over this thread's and every suspended
+    /// thread's roots.
+    pub(crate) fn collect_garbage(&mut self) {
+        crate::gc::collect(
+            &mut self.heap,
+            &self.frames,
+            &self.mp,
+            &self.loaded_modules,
+            &self.thread_queue,
+            &self.caller_mp_stack,
+            &self.heap_refs,
+        );
     }
 
     /// Check if a type (by index) contains any pointer fields.
@@ -520,11 +590,18 @@ impl<'m> VmState<'m> {
 
         loop {
             if self.halted {
+                // This thread is done; leave its exit record for whoever is
+                // waiting on it before handing the VM to the next thread.
+                self.record_thread_exit("");
                 // Current thread halted: check for other threads
                 if self.thread_queue.is_empty() {
                     return Ok(());
                 }
-                self.resume_next_thread();
+                if !self.resume_next_ready_thread() {
+                    // Every remaining thread waits for a channel operation that
+                    // no runnable thread will ever perform.
+                    return Err(deadlock_fault());
+                }
                 continue;
             }
 
@@ -567,14 +644,16 @@ impl<'m> VmState<'m> {
 
             // Check if the instruction blocked on a channel (recv/alt with no data)
             if let Some(chan_id) = self.blocked_channel.take() {
-                // Don't advance PC; will re-execute the recv/alt when unblocked
-                if self.thread_queue.is_empty() {
-                    // No other threads; can't block, just continue (return zeros)
-                    self.pc = self.next_pc;
-                } else {
-                    self.suspend_as_blocked(chan_id);
-                    self.resume_next_ready_thread();
+                // Only another runnable thread can ever wake this one, so if
+                // there is none the program cannot make progress. Report the
+                // deadlock before suspending, leaving the faulting thread's
+                // state intact for the caller.
+                if !self.thread_queue.iter().any(|t| t.blocked_on.is_none()) {
+                    return Err(deadlock_fault());
                 }
+                // Don't advance PC; will re-execute the recv/alt when unblocked
+                self.suspend_as_blocked(chan_id);
+                self.resume_next_ready_thread();
                 continue;
             }
 
@@ -592,14 +671,7 @@ impl<'m> VmState<'m> {
                 self.gc_counter += 1;
                 if self.gc_counter >= GC_INTERVAL {
                     self.gc_counter = 0;
-                    crate::gc::collect(
-                        &mut self.heap,
-                        &self.frames,
-                        &self.mp,
-                        &self.loaded_modules,
-                        &self.thread_queue,
-                        &self.caller_mp_stack,
-                    );
+                    self.collect_garbage();
                 }
             }
         }
@@ -611,6 +683,7 @@ impl<'m> VmState<'m> {
             frames: std::mem::replace(&mut self.frames, FrameStack::new()),
             mp: std::mem::take(&mut self.mp),
             pc: self.pc,
+            pid: self.current_pid,
             heap_refs: std::mem::take(&mut self.heap_refs),
             last_error: std::mem::take(&mut self.last_error),
             current_loaded_module: self.current_loaded_module.take(),
@@ -626,6 +699,7 @@ impl<'m> VmState<'m> {
         let suspended = SuspendedThread {
             frames: std::mem::replace(&mut self.frames, FrameStack::new()),
             mp: std::mem::take(&mut self.mp),
+            pid: self.current_pid,
             pc: self.pc, // DON'T advance; will re-execute recv/alt when unblocked
             heap_refs: std::mem::take(&mut self.heap_refs),
             last_error: std::mem::take(&mut self.last_error),
@@ -636,43 +710,50 @@ impl<'m> VmState<'m> {
         self.thread_queue.push_back(suspended);
     }
 
-    /// Unblock threads waiting on a specific channel (called after send).
-    /// Raise a VM exception. Searches the current module's handler table
-    /// for a matching handler at the current PC. If found, jumps to the handler.
-    /// If not found, returns a ThreadFault error.
+    /// Raise a VM exception with a freshly allocated exception string.
+    /// See [`VmState::raise_exception_with_value`] for the lookup rules.
     pub(crate) fn raise_exception(&mut self, msg: &str) -> Result<(), ExecError> {
-        let current_pc = self.pc as i32;
         let str_id = self.heap.alloc(0, heap::HeapData::Str(msg.to_string()));
+        self.raise_exception_with_value(msg, str_id)
+    }
 
-        // Search current module's handler table
-        let handlers = if let Some(lm_idx) = self.current_loaded_module {
-            self.loaded_modules
-                .get(lm_idx)
-                .map(|lm| &lm.module.handlers)
-        } else {
-            Some(&self.module.handlers)
-        };
+    /// Raise a VM exception carrying an existing exception value (the `raise`
+    /// opcode raises a string the guest already allocated).
+    ///
+    /// Searches the currently executing module's handler table for a handler
+    /// covering the current PC, then walks the frame chain outwards so an
+    /// exception raised inside a callee is caught by a caller's `try` block,
+    /// as the reference `handler()` does. On a match the frames between the
+    /// raise site and the handler are popped and execution continues at the
+    /// handler; otherwise the exception is fatal and the frame stack is left
+    /// untouched.
+    pub(crate) fn raise_exception_with_value(
+        &mut self,
+        msg: &str,
+        str_id: HeapId,
+    ) -> Result<(), ExecError> {
+        let mut pc = self.pc as i32;
+        let mut frame_base = self.frames.current_base;
 
-        if let Some(handlers) = handlers {
-            for handler in handlers {
-                if current_pc < handler.begin_pc || current_pc >= handler.end_pc {
-                    continue;
+        loop {
+            if let Some((handler_pc, exception_offset)) = self.find_handler(pc, msg) {
+                // Unwind the frames between the raise site and the handler.
+                while self.frames.current_base > frame_base {
+                    self.frames.pop()?;
                 }
-                for case in &handler.cases {
-                    let matches = match &case.name {
-                        Some(name) => msg.starts_with(name.as_str()),
-                        None => true, // wildcard
-                    };
-                    if matches {
-                        self.next_pc = case.pc as usize;
-                        let frame_base = self.frames.current_data_offset();
-                        let off = frame_base + handler.exception_offset as usize;
-                        if off + 4 <= self.frames.data.len() {
-                            crate::memory::write_word(&mut self.frames.data, off, str_id as i32);
-                        }
-                        return Ok(());
-                    }
+                self.next_pc = handler_pc;
+                let off = self.frames.current_data_offset() + exception_offset;
+                if off + 4 <= self.frames.data.len() {
+                    memory::write_word(&mut self.frames.data, off, str_id as Word);
                 }
+                return Ok(());
+            }
+            match self.caller_frame(frame_base) {
+                Some((caller_pc, caller_base)) => {
+                    pc = caller_pc;
+                    frame_base = caller_base;
+                }
+                None => break,
             }
         }
 
@@ -681,6 +762,81 @@ impl<'m> VmState<'m> {
         )))
     }
 
+    /// Find a handler of the currently executing module that covers `pc` and
+    /// matches `msg`. Returns the case's target PC and the handler's exception
+    /// offset within its frame.
+    fn find_handler(&self, pc: i32, msg: &str) -> Option<(usize, usize)> {
+        let handlers = match self.current_loaded_module {
+            Some(lm_idx) => &self.loaded_modules.get(lm_idx)?.module.handlers,
+            None => &self.module.handlers,
+        };
+        for handler in handlers {
+            if pc < handler.begin_pc || pc >= handler.end_pc {
+                continue;
+            }
+            for case in &handler.cases {
+                let matches = match &case.name {
+                    Some(name) => msg.starts_with(name.as_str()),
+                    None => true, // wildcard
+                };
+                if matches {
+                    // A case can carry the `NOPC` sentinel instead of a
+                    // landing pc, which means this handler does not take the
+                    // exception after all; the reference guards the same way
+                    // with `if(newpc != NOPC)` (emu/port/exception.c:126).
+                    // Keep looking, and let the caller unwind if nothing else
+                    // matches.
+                    if case.pc < 0 {
+                        continue;
+                    }
+                    return Some((case.pc as usize, handler.exception_offset.max(0) as usize));
+                }
+            }
+        }
+        None
+    }
+
+    /// The caller of the frame based at `frame_base`: the PC of the `call` that
+    /// created the frame, plus the caller's frame base. Returns `None` at a
+    /// thread entry frame (saved-PC sentinel) and at the frame a nested
+    /// cross-module call started from, because the caller's handler table
+    /// belongs to a module that is not the one currently executing.
+    fn caller_frame(&self, frame_base: usize) -> Option<(i32, usize)> {
+        if frame_base <= self.unwind_floor
+            || frame_base + crate::frame::FRAME_HEADER_SIZE > self.frames.data.len()
+        {
+            return None;
+        }
+        // Frame header: [0] = caller's saved (return) PC, [4] = caller's base.
+        let saved_pc = memory::read_word(&self.frames.data, frame_base);
+        if saved_pc <= 0 {
+            return None; // thread/entry frame sentinel
+        }
+        let caller_base = memory::read_word(&self.frames.data, frame_base + 4) as usize;
+        if caller_base >= frame_base {
+            return None; // malformed chain; never walk sideways or upwards
+        }
+        // The saved PC is the return address, so the `call` instruction a
+        // caller's handler range covers sits one instruction earlier.
+        Some((saved_pc - 1, caller_base))
+    }
+
+    /// Report a channel operation that wants to block inside a nested
+    /// cross-module call. Such a call runs the callee on the host stack, so the
+    /// thread cannot be suspended and resumed the way the main run loop does;
+    /// continuing would leave a receive destination unwritten or drop a sent
+    /// value. Callers of a nested interpreter loop use this after each
+    /// instruction.
+    pub(crate) fn fault_on_nested_block(&mut self) -> Result<(), ExecError> {
+        match self.blocked_channel.take() {
+            Some(_) => Err(ExecError::ThreadFault(
+                "deadlock: blocking channel operation inside a cross-module call".to_string(),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Unblock threads waiting on a specific channel (called after send/recv).
     pub(crate) fn unblock_channel(&mut self, chan_id: heap::HeapId) {
         for thread in self.thread_queue.iter_mut() {
             if let Some(blocked_id) = thread.blocked_on {
@@ -693,28 +849,25 @@ impl<'m> VmState<'m> {
     }
 
     /// Resume the next READY (non-blocked) thread from the queue.
-    fn resume_next_ready_thread(&mut self) {
+    /// Returns false when every queued thread is blocked, which means the
+    /// program is deadlocked: a blocked thread is only ever woken by another
+    /// thread's channel operation.
+    fn resume_next_ready_thread(&mut self) -> bool {
         let len = self.thread_queue.len();
         for _ in 0..len {
             if let Some(thread) = self.thread_queue.pop_front() {
                 if thread.blocked_on.is_none() {
                     // Ready: resume it
                     self.load_thread(thread);
-                    return;
+                    return true;
                 }
                 // Still blocked; put back
                 self.thread_queue.push_back(thread);
             }
         }
-        // No ready threads: deadlock or all blocked
+        // No ready threads: every thread is blocked.
         self.halted = true;
-    }
-
-    /// Resume the next thread from the queue (any state).
-    fn resume_next_thread(&mut self) {
-        if let Some(thread) = self.thread_queue.pop_front() {
-            self.load_thread(thread);
-        }
+        false
     }
 
     fn load_thread(&mut self, thread: SuspendedThread) {
@@ -725,7 +878,23 @@ impl<'m> VmState<'m> {
         self.last_error = thread.last_error;
         self.current_loaded_module = thread.current_loaded_module;
         self.caller_mp_stack = thread.caller_mp_stack;
+        self.current_pid = thread.pid;
         self.halted = false;
+    }
+
+    /// Record that the running thread finished, in the form a read of
+    /// `/prog/N/wait` returns: `pid "module":cause`, the cause empty when the
+    /// thread ran to completion (emu/port/dis.c:438). A shell spawns a command
+    /// and then reads that file to learn how the command ended, so a thread
+    /// that exits without leaving a record hangs the shell -- or, since the
+    /// record is parsed positionally, walks it off the end of an empty string.
+    pub(crate) fn record_thread_exit(&mut self, cause: &str) {
+        let name = match self.current_loaded_module {
+            Some(idx) => self.loaded_modules[idx].module.name.clone(),
+            None => self.module.name.clone(),
+        };
+        self.wait_records
+            .push_back(format!("{} \"{}\":{}", self.current_pid, name, cause));
     }
 
     pub(crate) fn trace_instruction(&self, inst: &Instruction) {
@@ -788,17 +957,21 @@ impl<'m> VmState<'m> {
             heap::HeapData::Array { data, .. }
             | heap::HeapData::Record(data)
             | heap::HeapData::Adt { data, .. } => {
-                if offset + len <= data.len() {
-                    Some(data[offset..offset + len].to_vec())
-                } else {
-                    Some(vec![0u8; len])
+                // `offset` is bytecode-derived: `offset + len` must not wrap
+                // past the bounds check and produce an invalid slice range.
+                match offset.checked_add(len) {
+                    Some(end) if end <= data.len() => Some(data[offset..end].to_vec()),
+                    _ => Some(vec![0u8; len]),
                 }
             }
             heap::HeapData::ArraySlice {
                 parent_id,
                 byte_start,
                 ..
-            } => self.heap_slice(*parent_id, byte_start + offset, len),
+            } => match byte_start.checked_add(offset) {
+                Some(parent_offset) => self.heap_slice(*parent_id, parent_offset, len),
+                None => Some(vec![0u8; len]),
+            },
             _ => Some(vec![0u8; len]),
         }
     }
@@ -815,17 +988,22 @@ impl<'m> VmState<'m> {
         {
             let pid = *parent_id;
             let bs = *byte_start;
-            self.heap_write(pid, bs + offset, bytes);
+            if let Some(parent_offset) = bs.checked_add(offset) {
+                self.heap_write(pid, parent_offset, bytes);
+            }
             return;
         }
+        let Some(end) = offset.checked_add(bytes.len()) else {
+            return;
+        };
         if let Some(obj) = self.heap.get_mut(id) {
             match &mut obj.data {
                 heap::HeapData::Array { data, .. }
                 | heap::HeapData::Record(data)
                 | heap::HeapData::Adt { data, .. }
-                    if offset + bytes.len() <= data.len() =>
+                    if end <= data.len() =>
                 {
-                    data[offset..offset + bytes.len()].copy_from_slice(bytes);
+                    data[offset..end].copy_from_slice(bytes);
                 }
                 _ => {}
             }
@@ -1228,6 +1406,12 @@ impl<'m> VmState<'m> {
     }
 }
 
+/// The fault reported when no thread can run because every one of them is
+/// waiting for a channel operation no other thread will ever perform.
+pub(crate) fn deadlock_fault() -> ExecError {
+    ExecError::ThreadFault("deadlock: all threads are blocked on channels".to_string())
+}
+
 fn format_operand(label: &str, op: &ricevm_core::Operand) -> String {
     use ricevm_core::AddressMode;
     match op.mode {
@@ -1484,6 +1668,80 @@ mod tests {
         let result = vm.raise_exception("anything");
         assert!(result.is_ok(), "wildcard should match");
         assert_eq!(vm.next_pc, 99);
+    }
+
+    /// A wildcard case whose pc is the `NOPC` sentinel (-1) means "no handler
+    /// here, keep unwinding" -- the reference checks `if(newpc != NOPC)` before
+    /// taking it (emu/port/exception.c:126). Treating it as a jump target sends
+    /// the thread to pc -1; running `echo` under the shipped Inferno shell hit
+    /// exactly that.
+    #[test]
+    fn raise_exception_skips_a_wildcard_case_with_no_pc() {
+        use ricevm_core::{ExceptionCase, Handler};
+
+        let mut module = test_module();
+        module.handlers = vec![Handler {
+            exception_offset: 0,
+            begin_pc: 0,
+            end_pc: 10,
+            type_descriptor: None,
+            cases: vec![ExceptionCase {
+                name: None, // wildcard, but with no landing pc
+                pc: -1,
+            }],
+        }];
+
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.pc = 5;
+
+        let result = vm.raise_exception("anything");
+        assert!(
+            result.is_err(),
+            "a NOPC wildcard must not be taken as a handler; got next_pc={}",
+            vm.next_pc
+        );
+    }
+
+    /// The record a waiter reads has to be exactly the shape the reference
+    /// writes, `pid "module":cause` (emu/port/dis.c:438) -- consumers parse it
+    /// positionally, looking for the space, the quotes and the colon in turn.
+    #[test]
+    fn thread_exit_record_matches_the_reference_format() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        vm.current_pid = 7;
+
+        vm.record_thread_exit("");
+        let record = vm.wait_records.pop_front().expect("a record");
+        assert_eq!(record, format!("7 \"{}\":", module.name));
+
+        vm.record_thread_exit("some failure");
+        assert_eq!(
+            vm.wait_records.pop_front().expect("a record"),
+            format!("7 \"{}\":some failure", module.name)
+        );
+    }
+
+    /// `sys->pctl` reports the running thread's own pid; a shell uses it both
+    /// to name its children and to find its own `/prog/<pid>/wait`.
+    #[test]
+    fn a_resumed_thread_reports_its_own_pid() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        assert_eq!(vm.current_pid, 1, "the first thread is pid 1");
+
+        vm.load_thread(SuspendedThread {
+            frames: FrameStack::new(),
+            mp: Vec::new(),
+            pc: 0,
+            pid: 42,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            current_loaded_module: None,
+            caller_mp_stack: Vec::new(),
+            blocked_on: None,
+        });
+        assert_eq!(vm.current_pid, 42);
     }
 
     #[test]
@@ -1762,5 +2020,241 @@ mod tests {
             .array_read(digest_id, 0, expected.len())
             .expect("digest array should exist");
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn heap_slice_with_huge_offset_returns_zeros() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let id = alloc_byte_array(&mut vm, &[1, 2, 3, 4]);
+        // `offset + len` must not wrap past the bounds check.
+        let out = vm.heap_slice(id, usize::MAX - 1, 4);
+        assert_eq!(out, Some(vec![0u8; 4]));
+    }
+
+    #[test]
+    fn heap_write_with_huge_offset_is_ignored() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let id = alloc_byte_array(&mut vm, &[1, 2, 3, 4]);
+        vm.heap_write(id, usize::MAX - 1, &[9, 9, 9, 9]);
+        assert_eq!(vm.heap.array_read(id, 0, 4), Some(vec![1, 2, 3, 4]));
+    }
+
+    /// A module whose entry function receives from the channel in `fp[0]` into
+    /// `fp[8]` and then exits.
+    fn recv_then_exit_module(name: &str) -> Module {
+        use ricevm_core::AddressMode;
+
+        let fp_operand = |offset: i32| Operand {
+            mode: AddressMode::OffsetIndirectFp,
+            register1: offset,
+            register2: 0,
+        };
+        Module {
+            header: Header {
+                magic: XMAGIC,
+                signature: vec![],
+                runtime_flags: RuntimeFlags(0),
+                stack_extent: 0,
+                code_size: 2,
+                data_size: 0,
+                type_size: 1,
+                export_size: 0,
+                entry_pc: 0,
+                entry_type: 0,
+            },
+            code: vec![
+                Instruction {
+                    opcode: Opcode::Recv,
+                    source: fp_operand(0),
+                    middle: MiddleOperand::UNUSED,
+                    destination: fp_operand(8),
+                },
+                Instruction {
+                    opcode: Opcode::Exit,
+                    source: Operand::UNUSED,
+                    middle: MiddleOperand::UNUSED,
+                    destination: Operand::UNUSED,
+                },
+            ],
+            types: vec![TypeDescriptor {
+                id: 0,
+                size: 64,
+                pointer_map: PointerMap { bytes: vec![] },
+                pointer_count: 0,
+            }],
+            data: vec![],
+            name: name.to_string(),
+            exports: vec![],
+            imports: vec![],
+            handlers: vec![],
+        }
+    }
+
+    fn empty_channel(vm: &mut VmState<'_>) -> heap::HeapId {
+        vm.heap.alloc(
+            0,
+            heap::HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        )
+    }
+
+    /// Regression: a lone thread blocking on an empty channel must fault with a
+    /// deadlock. Previously the run loop just advanced the PC, so the receive
+    /// destination kept stale bytes and the program carried on regardless.
+    #[test]
+    fn run_faults_when_the_only_thread_blocks_on_a_channel() {
+        let module = recv_then_exit_module("deadlock_single");
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+        let chan = empty_channel(&mut vm);
+        memory::write_word(&mut vm.frames.data, fp, chan as i32);
+        memory::write_word(&mut vm.frames.data, fp + 8, 0x5eed); // stale value
+
+        match vm.run() {
+            Err(ExecError::ThreadFault(msg)) => {
+                assert!(msg.contains("deadlock"), "expected a deadlock fault: {msg}");
+            }
+            other => panic!("blocked recv with no peer must deadlock, got {other:?}"),
+        }
+        assert_eq!(
+            memory::read_word(&vm.frames.data, fp + 8),
+            0x5eed,
+            "a blocked recv must not pretend to have delivered a value"
+        );
+    }
+
+    /// Regression: when every thread is blocked the run loop must report a
+    /// deadlock. Previously it resumed a blocked thread anyway, which
+    /// re-executed its receive, re-blocked, and span at 100% CPU forever.
+    #[test]
+    fn run_faults_when_every_thread_is_blocked() {
+        let module = recv_then_exit_module("deadlock_multi");
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp = vm.frames.current_data_offset();
+        let main_chan = empty_channel(&mut vm);
+        memory::write_word(&mut vm.frames.data, fp, main_chan as i32);
+
+        // A peer thread that receives from a second, equally empty channel.
+        let child_chan = empty_channel(&mut vm);
+        let mut child_frames = FrameStack::new();
+        child_frames.push_entry(64, -1);
+        let child_fp = child_frames.current_data_offset();
+        memory::write_word(&mut child_frames.data, child_fp, child_chan as i32);
+        vm.thread_queue.push_back(SuspendedThread {
+            pid: 0,
+            frames: child_frames,
+            mp: Vec::new(),
+            pc: 0,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            current_loaded_module: None,
+            caller_mp_stack: Vec::new(),
+            blocked_on: None,
+        });
+
+        match vm.run() {
+            Err(ExecError::ThreadFault(msg)) => {
+                assert!(msg.contains("deadlock"), "expected a deadlock fault: {msg}");
+            }
+            other => panic!("all threads blocked must deadlock, got {other:?}"),
+        }
+    }
+
+    /// A one-handler module used by the unwinding tests.
+    fn module_with_handler(
+        begin_pc: i32,
+        end_pc: i32,
+        exception_offset: i32,
+        cases: Vec<ricevm_core::ExceptionCase>,
+    ) -> Module {
+        use ricevm_core::Handler;
+
+        let mut module = test_module();
+        module.name = "unwind_test".to_string();
+        module.handlers = vec![Handler {
+            exception_offset,
+            begin_pc,
+            end_pc,
+            type_descriptor: None,
+            cases,
+        }];
+        module
+    }
+
+    /// Regression: an exception raised inside a callee must unwind the frame
+    /// chain until a handler covering a caller's call site is found, instead of
+    /// being reported as unhandled.
+    #[test]
+    fn raise_exception_unwinds_to_a_caller_handler() {
+        use ricevm_core::ExceptionCase;
+
+        let exc_off = 8;
+        let module = module_with_handler(
+            0,
+            5,
+            exc_off,
+            vec![ExceptionCase {
+                name: Some("fail:oops".to_string()),
+                pc: 42,
+            }],
+        );
+        let mut vm = VmState::new(&module).expect("vm init");
+        let caller_base = vm.frames.current_base;
+
+        // Simulate `call`: the callee frame saves the caller's return pc (3),
+        // so the call instruction sits at pc 2, inside the handler's range.
+        let callee = vm.frames.alloc_pending(64).expect("alloc_pending");
+        vm.frames.activate_pending(callee, 3).expect("activate");
+        vm.pc = 20; // executing in the callee, outside the handler's range
+
+        vm.raise_exception("fail:oops")
+            .expect("the caller's handler should catch the exception");
+
+        assert_eq!(vm.next_pc, 42, "should resume at the caller's handler");
+        assert_eq!(
+            vm.frames.current_base, caller_base,
+            "frames must unwind to the handler's frame"
+        );
+        let stored = memory::read_word(
+            &vm.frames.data,
+            vm.frames.current_data_offset() + exc_off as usize,
+        ) as heap::HeapId;
+        assert_eq!(
+            vm.heap.get_string(stored),
+            Some("fail:oops"),
+            "the exception string must land in the handler's frame"
+        );
+    }
+
+    /// Unwinding stops at the thread's entry frame: with no handler anywhere in
+    /// the chain the exception is fatal, and the frames are left untouched so
+    /// the fault can still be reported against the faulting frame.
+    #[test]
+    fn raise_exception_without_any_handler_leaves_frames_intact() {
+        use ricevm_core::ExceptionCase;
+
+        let module = module_with_handler(0, 5, 0, vec![ExceptionCase { name: None, pc: 7 }]);
+        let mut vm = VmState::new(&module).expect("vm init");
+
+        let callee = vm.frames.alloc_pending(64).expect("alloc_pending");
+        // Return pc 100 => the call instruction at pc 99 is outside [0, 5).
+        vm.frames.activate_pending(callee, 100).expect("activate");
+        let base = vm.frames.current_base;
+        let len = vm.frames.data.len();
+        vm.pc = 20;
+
+        assert!(
+            vm.raise_exception("boom").is_err(),
+            "no handler covers any frame in the chain"
+        );
+        assert_eq!(
+            vm.frames.current_base, base,
+            "a failed search must not unwind"
+        );
+        assert_eq!(vm.frames.data.len(), len);
     }
 }

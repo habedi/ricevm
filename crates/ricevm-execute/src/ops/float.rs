@@ -184,11 +184,11 @@ mod tests {
         let module = test_module();
         let mut vm = VmState::new(&module).expect("vm init");
         let fp = vm.frames.current_data_offset();
-        memory::write_real(&mut vm.frames.data, fp, 3.14);
+        memory::write_real(&mut vm.frames.data, fp, 3.75);
         vm.src = AddrTarget::Frame(fp);
         vm.dst = AddrTarget::Frame(fp + 8);
         op_negf(&mut vm).expect("negf should succeed");
-        assert!((memory::read_real(&vm.frames.data, fp + 8) + 3.14).abs() < f64::EPSILON);
+        assert!((memory::read_real(&vm.frames.data, fp + 8) + 3.75).abs() < f64::EPSILON);
     }
 
     #[test]

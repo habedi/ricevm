@@ -87,8 +87,8 @@ mod tests {
     #[test]
     fn real_roundtrip() {
         let mut buf = [0u8; 8];
-        write_real(&mut buf, 0, 3.14);
-        assert!((read_real(&buf, 0) - 3.14).abs() < f64::EPSILON);
+        write_real(&mut buf, 0, 3.75);
+        assert!((read_real(&buf, 0) - 3.75).abs() < f64::EPSILON);
     }
 
     #[test]

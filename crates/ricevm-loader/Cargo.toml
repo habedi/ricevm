@@ -1,14 +1,13 @@
 [package]
 name = "ricevm-loader"
+description = "The binary format parser for RiceVM bytecode"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 publish = false
 license.workspace = true
-description = "The binary format parser for RiceVM bytecode"
 
 [dependencies]
 ricevm_core.workspace = true
-anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true

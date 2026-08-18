@@ -39,59 +39,38 @@ pub(crate) fn op_movm(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 /// The actual size to copy comes from types[mid].size.
 pub(crate) fn op_movmp(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let type_idx = vm.mid_word()? as usize;
-    let types = if let Some(lm_idx) = vm.current_loaded_module {
-        vm.loaded_modules.get(lm_idx).map(|lm| &lm.module.types)
-    } else {
-        Some(&vm.module.types)
-    };
-    let (size, ptr_map) = if let Some(td) = types.and_then(|t| t.get(type_idx)) {
-        (td.size as usize, td.pointer_map.bytes.clone())
-    } else {
-        (type_idx, Vec::new()) // fallback to raw value if type not found
-    };
+    // Fall back to the raw value as a byte count if the type is not found,
+    // matching the untyped `movm`; an unknown type has no pointer map either.
+    let size = vm.current_type_size(type_idx).unwrap_or(type_idx);
     if size == 0 {
         return Ok(());
     }
+    // One reading of the pointer map for the whole VM: the same map the
+    // collector traces this type's heap objects with (`heap::TraceMap`).
+    let ptr_map = vm.trace_map_for_type(type_idx);
 
-    // incmem: increment ref counts for pointers in the source (before copy)
     let src_bytes = read_block(vm, vm.src, size);
-    for (byte_idx, &map_byte) in ptr_map.iter().enumerate() {
-        for bit in 0..8u32 {
-            if map_byte & (1 << bit) != 0 {
-                let ptr_offset = (byte_idx * 8 + bit as usize) * 4;
-                if ptr_offset + 4 <= src_bytes.len() {
-                    let ptr_val = crate::memory::read_word(&src_bytes, ptr_offset) as u32;
-                    if ptr_val != crate::heap::NIL
-                        && ptr_val >= crate::heap::HEAP_ID_BASE
-                        && vm.heap.contains(ptr_val)
-                    {
-                        vm.heap.inc_ref(ptr_val);
-                    }
-                }
-            }
-        }
-    }
-
-    // freeptrs: decrement ref counts for pointers in the destination (about to be overwritten)
     let dst_bytes = read_block(vm, vm.dst, size);
-    for (byte_idx, &map_byte) in ptr_map.iter().enumerate() {
-        for bit in 0..8u32 {
-            if map_byte & (1 << bit) != 0 {
-                let ptr_offset = (byte_idx * 8 + bit as usize) * 4;
-                if ptr_offset + 4 <= dst_bytes.len() {
-                    let ptr_val = crate::memory::read_word(&dst_bytes, ptr_offset) as u32;
-                    if ptr_val != crate::heap::NIL
-                        && ptr_val >= crate::heap::HEAP_ID_BASE
-                        && vm.heap.contains(ptr_val)
-                    {
-                        vm.heap.dec_ref(ptr_val);
-                    }
-                }
+
+    if let Some(ptr_map) = ptr_map {
+        // incmem: take a reference for every pointer the copy duplicates.
+        // Before the release below, so that copying a block over itself
+        // cannot drop a field's last reference mid-instruction.
+        for offset in ptr_map.pointer_offsets(size) {
+            let ptr_val = crate::memory::read_word(&src_bytes, offset) as u32;
+            if ptr_val >= crate::heap::HEAP_ID_BASE && vm.heap.contains(ptr_val) {
+                vm.heap.inc_ref(ptr_val);
+            }
+        }
+        // freeptrs: release the pointers the copy overwrites.
+        for offset in ptr_map.pointer_offsets(size) {
+            let ptr_val = crate::memory::read_word(&dst_bytes, offset) as u32;
+            if ptr_val >= crate::heap::HEAP_ID_BASE && vm.heap.contains(ptr_val) {
+                vm.heap.dec_ref(ptr_val);
             }
         }
     }
 
-    // Copy the bytes
     write_block(vm, vm.dst, &src_bytes);
     Ok(())
 }
@@ -429,6 +408,63 @@ mod tests {
         );
     }
 
+    /// `movmp` ref counts the block it copies through the type's pointer map.
+    /// The map is most-significant-bit first (`limbo/types.c` writes
+    /// `1 << (7 - (offset/4) % 8)`), so reading it the other way round counts
+    /// words that are not pointers -- and, on the destination side, releases a
+    /// reference that was never acquired.
+    #[test]
+    fn movmp_counts_the_pointer_field_the_descriptor_names() {
+        let mut module = test_module();
+        module.types.push(TypeDescriptor {
+            id: 1,
+            size: 8,
+            // Two words; only the second is a pointer.
+            pointer_map: PointerMap { bytes: vec![0x40] },
+            pointer_count: 1,
+        });
+
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let fp = vm.frames.current_data_offset();
+
+        let src_data = vm.heap.alloc(0, HeapData::Str("src word 0".to_string()));
+        let src_ptr = vm.heap.alloc(0, HeapData::Str("src word 1".to_string()));
+        let dst_data = vm.heap.alloc(0, HeapData::Str("dst word 0".to_string()));
+        let dst_ptr = vm.heap.alloc(0, HeapData::Str("dst word 1".to_string()));
+
+        crate::memory::write_word(&mut vm.frames.data, fp, src_data as i32);
+        crate::memory::write_word(&mut vm.frames.data, fp + 4, src_ptr as i32);
+        crate::memory::write_word(&mut vm.frames.data, fp + 16, dst_data as i32);
+        crate::memory::write_word(&mut vm.frames.data, fp + 20, dst_ptr as i32);
+
+        vm.src = AddrTarget::Frame(fp);
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 1;
+        vm.dst = AddrTarget::Frame(fp + 16);
+
+        op_movmp(&mut vm).expect("movmp should succeed");
+
+        assert_eq!(
+            vm.heap.get(src_ptr).map(|o| o.ref_count),
+            Some(2),
+            "the copy holds a second reference to the source's pointer field"
+        );
+        assert!(
+            !vm.heap.contains(dst_ptr),
+            "the overwritten pointer field must be released"
+        );
+        assert_eq!(
+            vm.heap.get(src_data).map(|o| o.ref_count),
+            Some(1),
+            "a non-pointer word must not be counted"
+        );
+        assert_eq!(
+            vm.heap.get(dst_data).map(|o| o.ref_count),
+            Some(1),
+            "an overwritten non-pointer word owns no reference to release"
+        );
+    }
+
     #[test]
     fn movw_copies_word_between_frame_locations() {
         let module = test_module();
@@ -505,13 +541,13 @@ mod tests {
         let mut vm = VmState::new(&module).expect("vm init");
         let fp = vm.frames.current_data_offset();
 
-        crate::memory::write_real(&mut vm.frames.data, fp, 3.14159);
+        crate::memory::write_real(&mut vm.frames.data, fp, 3.75);
         vm.src = AddrTarget::Frame(fp);
         vm.dst = AddrTarget::Frame(fp + 8);
 
         op_movf(&mut vm).expect("movf should succeed");
         let result = crate::memory::read_real(&vm.frames.data, fp + 8);
-        assert!((result - 3.14159).abs() < f64::EPSILON);
+        assert!((result - 3.75).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -520,13 +556,13 @@ mod tests {
         let mut vm = VmState::new(&module).expect("vm init");
         let fp = vm.frames.current_data_offset();
 
-        crate::memory::write_real(&mut vm.frames.data, fp, -2.71828);
+        crate::memory::write_real(&mut vm.frames.data, fp, -4.25);
         vm.src = AddrTarget::Frame(fp);
         vm.dst = AddrTarget::Frame(fp + 8);
 
         op_movf(&mut vm).expect("movf should succeed");
         let result = crate::memory::read_real(&vm.frames.data, fp + 8);
-        assert!((result - (-2.71828)).abs() < f64::EPSILON);
+        assert!((result - (-4.25)).abs() < f64::EPSILON);
     }
 
     #[test]

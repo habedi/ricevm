@@ -6,7 +6,7 @@
 
 use ricevm_core::ExecError;
 
-use super::control::{ModuleKind, resolve_module_ref};
+use super::control::{ModuleKind, call_loaded_module, resolve_module_ref};
 use crate::address::AddrTarget;
 use crate::heap::{self, HeapData, HeapId};
 use crate::memory;
@@ -28,6 +28,9 @@ struct AltEntry {
 enum AltOutcome {
     Selected(usize),
     NoneReady,
+    /// The table was malformed and an exception was raised; `dst` must be left
+    /// alone, since the thread either resumes in a handler or faults.
+    Raised,
 }
 
 /// spawn src, dst:create a new thread in the current module.
@@ -81,10 +84,13 @@ pub(crate) fn op_spawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 
     // Create suspended thread for the child.
+    let pid = vm.next_pid;
+    vm.next_pid += 1;
     let child = crate::vm::SuspendedThread {
         frames: child_frames,
         mp: cloned_mp,
         pc: target_pc,
+        pid,
         heap_refs: Vec::new(),
         last_error: String::new(),
         current_loaded_module: vm.current_loaded_module,
@@ -153,10 +159,13 @@ pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             }
         }
 
+        let pid = vm.next_pid;
+        vm.next_pid += 1;
         let child = crate::vm::SuspendedThread {
             frames: child_frames,
             mp: cloned_mp,
             pc: entry_pc,
+            pid,
             heap_refs: Vec::new(),
             last_error: String::new(),
             current_loaded_module: vm.current_loaded_module,
@@ -220,36 +229,9 @@ pub(crate) fn op_mspawn(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 }
             };
 
-            let saved_loaded_module = vm.current_loaded_module;
-            let caller_virt_idx = vm.current_module_virt_idx();
-            let loaded_mp = std::mem::take(&mut vm.loaded_modules[module_idx].mp);
-            let parent_mp = std::mem::replace(&mut vm.mp, loaded_mp);
-            vm.caller_mp_stack.push((caller_virt_idx, parent_mp));
-
-            let loaded_code_len = vm.loaded_modules[module_idx].module.code.len();
-            vm.current_loaded_module = Some(module_idx);
-            vm.pc = entry_pc;
-            vm.halted = false;
-
-            while !vm.halted && vm.pc < loaded_code_len {
-                let inst = vm.loaded_modules[module_idx].module.code[vm.pc].clone();
-                if vm.trace {
-                    vm.trace_instruction(&inst);
-                }
-                vm.resolve_operands(&inst)?;
-                vm.next_pc = vm.pc + 1;
-                crate::ops::dispatch(vm, &inst)?;
-                vm.pc = vm.next_pc;
-
-                if vm.frames.current_data_offset() < spawn_frame_base {
-                    break;
-                }
-            }
-
-            let (_, parent_mp) = vm.caller_mp_stack.pop().unwrap_or_default();
-            vm.loaded_modules[module_idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
-            vm.current_loaded_module = saved_loaded_module;
-            vm.halted = false;
+            // The nested loop restores the caller's module context (MP, caller
+            // MP stack, current module, pc) on every exit path, error included.
+            call_loaded_module(vm, module_idx, entry_pc, spawn_frame_base)?;
         }
     }
 
@@ -451,7 +433,25 @@ fn parse_alt_table(
     // First nsend entries are send, next nrecv are recv.
     let nsend = read_table_word(vm, base, table_offset).max(0) as usize;
     let nrecv = read_table_word(vm, base, table_offset + 4).max(0) as usize;
-    let count = nsend + nrecv;
+    let count = nsend.saturating_add(nrecv);
+
+    // The counts are guest data: a header claiming more entries than the
+    // containing memory holds must be rejected before space is reserved for
+    // them, otherwise `0x7fffffff, 0x7fffffff` requests tens of gigabytes.
+    let available = match base {
+        TableBase::Frame => vm.frames.data.len(),
+        TableBase::Mp => vm.mp.len(),
+    };
+    let table_end = count
+        .checked_mul(8)
+        .and_then(|entries_size| entries_size.checked_add(8))
+        .and_then(|table_size| table_size.checked_add(table_offset));
+    if table_end.is_none_or(|end| end > available) {
+        return Err(ExecError::Other(format!(
+            "alt table with {nsend} send and {nrecv} recv entries does not fit in memory"
+        )));
+    }
+
     let mut entries = Vec::with_capacity(count);
     for idx in 0..count {
         let base_off = table_offset + 8 + idx * 8;
@@ -468,16 +468,32 @@ fn parse_alt_table(
     Ok((base, nsend, nrecv, entries))
 }
 
-fn execute_alt(vm: &mut VmState<'_>, select_first_if_none: bool) -> Result<AltOutcome, ExecError> {
-    let (base, nsend, nrecv, entries) = parse_alt_table(vm)?;
-    let count = nsend + nrecv;
+fn execute_alt(vm: &mut VmState<'_>, blocking: bool) -> Result<AltOutcome, ExecError> {
+    let (base, _nsend, _nrecv, entries) = parse_alt_table(vm)?;
+
+    // `altrdy` validates the whole table before selecting, and raises even when
+    // some other entry was ready: a nil channel is exNilref, and a send and a
+    // receive on one channel is exAlt (libinterp/alt.c:88-130).
+    let fault = if entries.iter().any(|e| e.channel_id == heap::NIL) {
+        Some("nil dereference")
+    } else if entries.iter().any(|s| {
+        s.is_send
+            && entries
+                .iter()
+                .any(|r| !r.is_send && r.channel_id == s.channel_id)
+    }) {
+        Some("alt send/recv on same chan")
+    } else {
+        None
+    };
+    if let Some(msg) = fault {
+        vm.raise_exception(msg)?;
+        return Ok(AltOutcome::Raised);
+    }
 
     // Collect ready indices first, then pick one (reference picks randomly,
     // we pick the first ready one for determinism in our cooperative model).
     for (idx, entry) in entries.iter().copied().enumerate() {
-        if entry.channel_id == heap::NIL {
-            continue; // skip nil channels (reference skips them in altrdy)
-        }
         let (elem_size, pending) = channel_ref(vm, entry.channel_id)?;
         let ready = if entry.is_send {
             pending.is_none()
@@ -500,14 +516,20 @@ fn execute_alt(vm: &mut VmState<'_>, select_first_if_none: bool) -> Result<AltOu
             write_table_bytes(vm, base, entry.data_offset, &data);
         }
 
+        // Wake threads waiting on the other side of this channel, exactly as
+        // op_send/op_recv do; the alt just performed the same transfer.
+        vm.unblock_channel(entry.channel_id);
         return Ok(AltOutcome::Selected(idx));
     }
 
-    if select_first_if_none && count > 0 {
-        Ok(AltOutcome::Selected(0))
-    } else {
-        Ok(AltOutcome::NoneReady)
+    if blocking {
+        // Nothing ready: suspend the thread instead of inventing a selection.
+        // `Some(NIL)` is the "blocked in alt" marker that any channel
+        // operation clears (see `VmState::unblock_channel`); the run loop
+        // re-executes this alt once the thread is woken.
+        vm.blocked_channel = Some(heap::NIL);
     }
+    Ok(AltOutcome::NoneReady)
 }
 
 /// send src, dst:send data through a channel.
@@ -559,18 +581,19 @@ pub(crate) fn op_recv(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 }
 
-/// alt src, dst:simplified blocking channel select.
+/// alt src, dst:blocking channel select.
 /// The table layout is:
-///   [0] = entry count
-///   [1..] = triples of (channel pointer, send flag, data offset)
+///   [0] = nsend, [1] = nrecv
+///   [2..] = pairs of (channel pointer, data offset)
 ///
 /// Send entries are ready when the single-slot channel buffer is empty.
 /// Receive entries are ready when the channel has a pending payload.
-/// If none are ready, this simplified implementation returns index 0.
+/// If none are ready the thread blocks; the run loop re-executes the alt
+/// once another thread makes an entry ready, so `dst` is left untouched.
 pub(crate) fn op_alt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     match execute_alt(vm, true)? {
         AltOutcome::Selected(idx) => vm.set_dst_word(idx as i32),
-        AltOutcome::NoneReady => vm.set_dst_word(0),
+        AltOutcome::NoneReady | AltOutcome::Raised => Ok(()),
     }
 }
 
@@ -585,6 +608,7 @@ pub(crate) fn op_nbalt(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     match execute_alt(vm, false)? {
         AltOutcome::Selected(idx) => vm.set_dst_word(idx as i32),
         AltOutcome::NoneReady => vm.set_dst_word(count as i32),
+        AltOutcome::Raised => Ok(()),
     }
 }
 
@@ -629,6 +653,89 @@ mod tests {
             imports: vec![],
             handlers: vec![],
         }
+    }
+
+    /// Regression: `mspawn` runs a loaded module's function inline, and used to
+    /// return before swapping the module context back when that function
+    /// failed. The caller was then left with the callee's MP, the loaded
+    /// module's MP emptied by `mem::take`, a stale caller-MP-stack entry and the
+    /// callee still marked current.
+    #[test]
+    fn mspawn_restores_the_module_context_when_the_callee_fails() {
+        use crate::vm::LoadedModule;
+        use ricevm_core::AddressMode;
+        use ricevm_core::module::ExportEntry;
+
+        let fp_operand = |offset: i32| Operand {
+            mode: AddressMode::OffsetIndirectFp,
+            register1: offset,
+            register2: 0,
+        };
+        let mut loaded = test_module();
+        loaded.name = "failing_callee".to_string();
+        loaded.code = vec![Instruction {
+            opcode: Opcode::Raise,
+            source: fp_operand(0),
+            middle: MiddleOperand::UNUSED,
+            destination: Operand::UNUSED,
+        }];
+        loaded.exports = vec![ExportEntry {
+            pc: 0,
+            frame_type: 0,
+            signature: 0,
+            name: "boom".to_string(),
+        }];
+
+        let main = test_module();
+        let mut vm = VmState::new(&main).expect("vm should initialize");
+        let loaded_mp = vec![0xABu8; 32];
+        vm.loaded_modules.push(LoadedModule {
+            module: loaded,
+            mp: loaded_mp.clone(),
+        });
+        let caller_mp = vec![0xCDu8; 16];
+        vm.mp = caller_mp.clone();
+
+        let mod_ref = vm.heap.alloc(
+            0,
+            HeapData::LoadedModule {
+                module_idx: 0,
+                func_map: vec![Some(0)],
+            },
+        );
+        let exception = vm.heap.alloc(0, HeapData::Str("fail:oops".to_string()));
+        let pending = vm.frames.alloc_pending(64).expect("alloc_pending");
+        memory::write_word(&mut vm.frames.data, pending, exception as i32);
+
+        vm.pc = 7;
+        vm.next_pc = 8;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref as i32;
+
+        assert!(
+            op_mspawn(&mut vm).is_err(),
+            "an unhandled exception in the callee must fail"
+        );
+        assert_eq!(
+            vm.current_loaded_module, None,
+            "the caller's module must be current again"
+        );
+        assert_eq!(vm.mp, caller_mp, "the caller's MP must be restored");
+        assert_eq!(
+            vm.loaded_modules[0].mp, loaded_mp,
+            "the loaded module's MP must be written back, not left empty"
+        );
+        assert!(
+            vm.caller_mp_stack.is_empty(),
+            "the pushed caller MP entry must be popped"
+        );
+        assert_eq!(vm.pc, 7, "the caller's pc must be restored");
+        assert_eq!(vm.next_pc, 8, "the caller's next_pc must be restored");
+        assert_eq!(vm.unwind_floor, 0, "the unwind floor must be restored");
     }
 
     #[test]
@@ -700,6 +807,71 @@ mod tests {
 
         assert_eq!(memory::read_word(&vm.frames.data, fp_base), 1);
         assert_eq!(memory::read_word(&vm.frames.data, fp_base + 44), 77);
+    }
+
+    #[test]
+    fn alt_with_a_nil_channel_raises_even_when_another_entry_is_ready() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let ready = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: Some(77_i32.to_ne_bytes().to_vec()),
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        memory::write_word(&mut vm.frames.data, table_off, 0); // nsend = 0
+        memory::write_word(&mut vm.frames.data, table_off + 4, 2); // nrecv = 2
+        // Entry 0 (recv): nil channel
+        memory::write_word(&mut vm.frames.data, table_off + 8, heap::NIL as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+        // Entry 1 (recv): a channel that is ready
+        memory::write_word(&mut vm.frames.data, table_off + 16, ready as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 20, (fp_base + 44) as i32);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+
+        // `altrdy` records exNilref and raises after scanning the whole table,
+        // even though entry 1 was ready (libinterp/alt.c:88-130).
+        assert!(op_nbalt(&mut vm).is_err(), "a nil channel must fault");
+    }
+
+    #[test]
+    fn alt_sending_and_receiving_on_one_channel_raises() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm should initialize");
+        let chan = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        memory::write_word(&mut vm.frames.data, table_off, 1); // nsend = 1
+        memory::write_word(&mut vm.frames.data, table_off + 4, 1); // nrecv = 1
+        // The send entry is ready (empty slot), so without the check the alt
+        // would happily select it.
+        memory::write_word(&mut vm.frames.data, table_off + 8, chan as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 16, chan as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 20, (fp_base + 44) as i32);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+
+        // Reference raises exAlt for a send and a receive on one channel
+        // (libinterp/alt.c:117-120).
+        assert!(
+            op_nbalt(&mut vm).is_err(),
+            "send and recv on one channel must fault"
+        );
     }
 
     #[test]
@@ -1213,6 +1385,125 @@ mod tests {
         vm.dst = AddrTarget::Frame(fp_base + 4);
         op_recv(&mut vm).expect("second recv");
         assert_eq!(memory::read_word(&vm.frames.data, fp_base + 4), 88);
+    }
+
+    /// Regression: a blocking `alt` with no ready entry must suspend the thread
+    /// (by setting `blocked_channel`) instead of claiming entry 0 was selected.
+    /// Reporting a selection makes the thread read an unwritten receive buffer
+    /// and drops any value a peer sends later.
+    #[test]
+    fn alt_blocks_when_no_entry_is_ready() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let chan = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        // One recv entry on an empty channel: nothing is ready.
+        memory::write_word(&mut vm.frames.data, table_off, 0); // nsend = 0
+        memory::write_word(&mut vm.frames.data, table_off + 4, 1); // nrecv = 1
+        memory::write_word(&mut vm.frames.data, table_off + 8, chan as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+
+        // Sentinel: a blocked alt must not report a selection.
+        memory::write_word(&mut vm.frames.data, fp_base, -1);
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+
+        op_alt(&mut vm).expect("alt should not error");
+
+        assert_eq!(
+            vm.blocked_channel,
+            Some(heap::NIL),
+            "a blocking alt with nothing ready must block the thread"
+        );
+        assert_eq!(
+            memory::read_word(&vm.frames.data, fp_base),
+            -1,
+            "a blocked alt must not write a selection index"
+        );
+    }
+
+    /// Regression: an `alt` that drains a channel must wake threads blocked on
+    /// it, exactly like `recv` does. Otherwise a thread blocked sending on a
+    /// full channel stays blocked forever after alt empties it.
+    #[test]
+    fn alt_recv_unblocks_thread_waiting_on_that_channel() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let chan = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: Some(5_i32.to_ne_bytes().to_vec()),
+            },
+        );
+
+        // A peer thread suspended trying to send on the (full) channel.
+        vm.thread_queue.push_back(crate::vm::SuspendedThread {
+            pid: 0,
+            frames: crate::frame::FrameStack::new(),
+            mp: Vec::new(),
+            pc: 0,
+            heap_refs: Vec::new(),
+            last_error: String::new(),
+            current_loaded_module: None,
+            caller_mp_stack: Vec::new(),
+            blocked_on: Some(chan),
+        });
+
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+        memory::write_word(&mut vm.frames.data, table_off, 0); // nsend = 0
+        memory::write_word(&mut vm.frames.data, table_off + 4, 1); // nrecv = 1
+        memory::write_word(&mut vm.frames.data, table_off + 8, chan as i32);
+        memory::write_word(&mut vm.frames.data, table_off + 12, (fp_base + 40) as i32);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+        op_alt(&mut vm).expect("alt should succeed");
+
+        assert_eq!(
+            memory::read_word(&vm.frames.data, fp_base + 40),
+            5,
+            "alt should have received the pending value"
+        );
+        assert!(
+            vm.thread_queue[0].blocked_on.is_none(),
+            "draining a channel via alt must wake threads blocked on it"
+        );
+    }
+
+    /// Regression: `nsend`/`nrecv` come from guest memory. A header claiming
+    /// billions of entries must be rejected instead of reserving a table that
+    /// cannot fit in the frame (which aborts the process on allocation).
+    #[test]
+    fn alt_table_with_absurd_entry_counts_is_rejected() {
+        let module = test_module();
+        let mut vm = VmState::new(&module).expect("vm init");
+        let fp_base = vm.frames.current_data_offset();
+        let table_off = fp_base + 8;
+
+        memory::write_word(&mut vm.frames.data, table_off, i32::MAX);
+        memory::write_word(&mut vm.frames.data, table_off + 4, i32::MAX);
+
+        vm.src = AddrTarget::Frame(table_off);
+        vm.dst = AddrTarget::Frame(fp_base);
+
+        assert!(
+            op_alt(&mut vm).is_err(),
+            "an alt table larger than its containing memory must be rejected"
+        );
+        assert!(
+            op_nbalt(&mut vm).is_err(),
+            "nbalt must reject the same oversized table"
+        );
     }
 
     #[test]

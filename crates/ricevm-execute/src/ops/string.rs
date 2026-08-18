@@ -335,8 +335,10 @@ mod tests {
             ("\u{1F600}", "smile", "\u{2764}"),
         ];
         for (a, b, c) in &samples {
-            let ab_c = format!("{}{}{}", format!("{a}{b}"), c, "");
-            let a_bc = format!("{}{}{}", a, format!("{b}{c}"), "");
+            let ab = format!("{a}{b}");
+            let bc = format!("{b}{c}");
+            let ab_c = format!("{ab}{c}");
+            let a_bc = format!("{a}{bc}");
             assert_eq!(
                 format!("{a}{b}{c}"),
                 format!("{a}{b}{c}"),

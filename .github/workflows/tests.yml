@@ -33,9 +33,9 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
-        # Define the Rust versions to test against
-        rust-version: [ "1.92.0", "stable" ]
+        rust-version: [ "1.90.0", "stable" ]
 
     steps:
       - name: Checkout repository
@@ -53,14 +53,23 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y make
-          make install-deps
+          rustup component add rustfmt clippy
 
-      - name: Run tests and generate coverage report
+      - name: Install coverage tooling
+        if: matrix.rust-version == 'stable'
+        run: make install-deps
+
+      - name: Run tests
         run: |
           make test-limbo
-          make coverage
+          make test
+
+      - name: Generate coverage report
+        if: matrix.rust-version == 'stable'
+        run: make coverage
 
       - name: Upload coverage reports to Codecov
+        if: matrix.rust-version == 'stable'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

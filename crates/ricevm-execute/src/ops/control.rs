@@ -155,49 +155,7 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     }
 
     // 3. Try loading from filesystem
-    let mut candidates = vec![path.clone(), format!("{path}.dis")];
-
-    // If a root path is configured, resolve absolute Inferno paths through it.
-    let root = &vm.root_path;
-    if !root.is_empty() && path.starts_with('/') {
-        candidates.insert(0, format!("{root}{path}"));
-        candidates.insert(1, format!("{root}{path}.dis"));
-    }
-
-    // Strip common Inferno prefixes for relative resolution
-    let stripped_paths: Vec<String> = ["/dis/lib/", "/dis/", "/"]
-        .iter()
-        .filter_map(|prefix| path.strip_prefix(prefix).map(|s| s.to_string()))
-        .collect();
-
-    // Add probe paths from RICEVM_PROBE env var
-    if let Ok(probe) = std::env::var("RICEVM_PROBE") {
-        for dir in probe.split(':') {
-            if !dir.is_empty() {
-                candidates.push(format!("{dir}/{path}"));
-                candidates.push(format!("{dir}/{path}.dis"));
-                // Also try stripped paths
-                for sp in &stripped_paths {
-                    candidates.push(format!("{dir}/{sp}"));
-                    candidates.push(format!("{dir}/{sp}.dis"));
-                }
-            }
-        }
-    }
-    // Also try root + stripped paths
-    if !root.is_empty() {
-        for sp in &stripped_paths {
-            candidates.push(format!("{root}/dis/{sp}"));
-            candidates.push(format!("{root}/dis/{sp}.dis"));
-            candidates.push(format!("{root}/dis/lib/{sp}"));
-            candidates.push(format!("{root}/dis/lib/{sp}.dis"));
-        }
-    }
-    candidates.push(format!("./{path}.dis"));
-    for sp in &stripped_paths {
-        candidates.push(sp.clone());
-        candidates.push(format!("{sp}.dis"));
-    }
+    let candidates = module_candidates(&path, &vm.root_path, std::env::var("RICEVM_PROBE").ok());
 
     for candidate in &candidates {
         if let Ok(bytes) = std::fs::read(candidate)
@@ -253,6 +211,58 @@ pub(crate) fn op_load(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 
     // Module not found: set dst to nil
     vm.move_ptr_to_dst(heap::NIL)
+}
+
+/// Filesystem paths to try for a module, most specific first.
+///
+/// Inferno paths are absolute (`/dis/lib/env.dis`) but the tree they name may
+/// be mounted anywhere, so each probe directory is tried with the leading
+/// `/dis/lib/`, `/dis/` or `/` removed. Order matters more than it looks:
+/// `/dis/lib/env.dis` and `/dis/env.dis` are *different modules* (`Env`, five
+/// exports; `Envcmd`, one), and several other names collide the same way. The
+/// prefixes are therefore stripped shortest-first, so the candidate that keeps
+/// the most of the original path is tried first and a probe directory pointing
+/// at `dis/` cannot answer a request for `dis/lib/`.
+fn module_candidates(path: &str, root: &str, probe: Option<String>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if !root.is_empty() && path.starts_with('/') {
+        candidates.push(format!("{root}{path}"));
+        candidates.push(format!("{root}{path}.dis"));
+    }
+    candidates.push(path.to_string());
+    candidates.push(format!("{path}.dis"));
+
+    // Shortest prefix first: "/" keeps `dis/lib/env.dis`, "/dis/lib/" keeps
+    // only `env.dis`. Trying them in that order prefers the specific match.
+    let stripped: Vec<String> = ["/", "/dis/", "/dis/lib/"]
+        .iter()
+        .filter_map(|p| path.strip_prefix(p).map(str::to_string))
+        .collect();
+
+    if let Some(probe) = probe {
+        for dir in probe.split(':').filter(|d| !d.is_empty()) {
+            candidates.push(format!("{dir}/{path}"));
+            candidates.push(format!("{dir}/{path}.dis"));
+            for sp in &stripped {
+                candidates.push(format!("{dir}/{sp}"));
+                candidates.push(format!("{dir}/{sp}.dis"));
+            }
+        }
+    }
+    if !root.is_empty() {
+        for sp in &stripped {
+            candidates.push(format!("{root}/dis/{sp}"));
+            candidates.push(format!("{root}/dis/{sp}.dis"));
+            candidates.push(format!("{root}/dis/lib/{sp}"));
+            candidates.push(format!("{root}/dis/lib/{sp}.dis"));
+        }
+    }
+    candidates.push(format!("./{path}.dis"));
+    for sp in &stripped {
+        candidates.push(sp.clone());
+        candidates.push(format!("{sp}.dis"));
+    }
+    candidates
 }
 
 /// Resolved module reference: either a built-in or a loaded .dis module.
@@ -396,6 +406,128 @@ pub(crate) fn op_mframe(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     vm.set_dst_word(pending_data_offset as i32)
 }
 
+/// Run `entry_pc` on a nested interpreter loop over another module's code.
+/// `module_idx` selects a loaded module, `None` the main module.
+///
+/// The loop returns when the callee's frame is popped, when the callee halts,
+/// or with the first error it hits. Every module-context change this makes --
+/// the swapped MP, the caller MP stack entry, the current module, the pc and
+/// the unwind floor -- is undone on ALL exit paths. Restoring only on success
+/// leaves the caller running against the callee's (mem::take'd, hence empty) MP
+/// and the callee's handler table, which corrupts every later call into that
+/// module: exception unwinding then resumes the caller with the callee's
+/// module context still installed.
+fn run_nested_module_call(
+    vm: &mut VmState<'_>,
+    module_idx: Option<usize>,
+    entry_pc: usize,
+    call_frame_base: usize,
+) -> Result<(), ExecError> {
+    let saved_pc = vm.pc;
+    let saved_next_pc = vm.next_pc;
+    let saved_loaded_module = vm.current_loaded_module;
+    // An exception raised in the callee must not unwind into the caller's
+    // frames: their handler table belongs to another module, and this loop --
+    // not the caller -- decides where execution resumes.
+    let saved_unwind_floor = std::mem::replace(&mut vm.unwind_floor, vm.frames.current_base);
+
+    // Swap in the callee's own data so anything it stores persists across
+    // calls, and park the caller's where cross-module virtual addresses can
+    // still resolve to it.
+    //
+    // A loaded module's data rests in `LoadedModule::mp`; the main module's
+    // rests on the caller stack, put there when it called into the module that
+    // is now calling back. Both are found the same way, so a loaded module
+    // holding a `$self` reference can call the program that loaded it.
+    let entering = module_idx != saved_loaded_module;
+    let parked_slot = vm.caller_mp_stack.iter().rposition(|(virt, _)| *virt == 0);
+    if entering {
+        let caller_virt_idx = vm.current_module_virt_idx();
+        let callee_mp = match module_idx {
+            Some(idx) => std::mem::take(&mut vm.loaded_modules[idx].mp),
+            None => match parked_slot {
+                Some(slot) => std::mem::take(&mut vm.caller_mp_stack[slot].1),
+                None => std::mem::take(&mut vm.mp),
+            },
+        };
+        let parent_mp = std::mem::replace(&mut vm.mp, callee_mp);
+        vm.caller_mp_stack.push((caller_virt_idx, parent_mp));
+        vm.current_loaded_module = module_idx;
+    }
+    vm.pc = entry_pc;
+    vm.halted = false;
+
+    let nested = nested_interpreter_loop(vm, module_idx, call_frame_base);
+
+    vm.unwind_floor = saved_unwind_floor;
+    if entering {
+        // Hand the callee's data back to its home (keeping any changes), then
+        // restore the caller's from the stack.
+        let (_, parent_mp) = vm.caller_mp_stack.pop().unwrap_or_default();
+        let callee_mp = std::mem::replace(&mut vm.mp, parent_mp);
+        match module_idx {
+            Some(idx) => vm.loaded_modules[idx].mp = callee_mp,
+            None => match parked_slot {
+                Some(slot) => vm.caller_mp_stack[slot].1 = callee_mp,
+                None => vm.mp = callee_mp,
+            },
+        }
+    }
+    vm.pc = saved_pc;
+    vm.next_pc = saved_next_pc;
+    vm.current_loaded_module = saved_loaded_module;
+    vm.halted = false;
+
+    nested
+}
+
+/// The instruction loop of [`run_nested_module_call`]. Errors propagate to that
+/// function, which restores the caller's context before returning them.
+fn nested_interpreter_loop(
+    vm: &mut VmState<'_>,
+    module_idx: Option<usize>,
+    call_frame_base: usize,
+) -> Result<(), ExecError> {
+    let code_len = match module_idx {
+        Some(idx) => vm.loaded_modules[idx].module.code.len(),
+        None => vm.module.code.len(),
+    };
+    while !vm.halted && vm.pc < code_len {
+        let inst = match module_idx {
+            Some(idx) => vm.loaded_modules[idx].module.code[vm.pc].clone(),
+            None => vm.module.code[vm.pc].clone(),
+        };
+        if vm.trace {
+            vm.trace_instruction(&inst);
+        }
+        vm.resolve_operands(&inst)?;
+        vm.next_pc = vm.pc + 1;
+        crate::ops::dispatch(vm, &inst)?;
+        // A channel operation cannot suspend this thread while the callee runs
+        // on the host stack.
+        vm.fault_on_nested_block()?;
+        vm.pc = vm.next_pc;
+
+        // If Ret popped the call's frame (the current frame's data area is now
+        // below where we started), the function returned.
+        if vm.frames.current_data_offset() < call_frame_base {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Enter a loaded module for a nested call, restoring the caller's module
+/// context on every exit path. Shared by `mcall` and `mspawn`.
+pub(crate) fn call_loaded_module(
+    vm: &mut VmState<'_>,
+    module_idx: usize,
+    entry_pc: usize,
+    call_frame_base: usize,
+) -> Result<(), ExecError> {
+    run_nested_module_call(vm, Some(module_idx), entry_pc, call_frame_base)
+}
+
 /// mcall src, mid, dst:call function in loaded module
 /// src = frame pointer, mid = function index, dst = module ref pointer
 pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
@@ -445,12 +577,6 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
             }
         }
         ModuleKind::Main { func_map } => {
-            if vm.current_loaded_module.is_some() {
-                return Err(ExecError::Other(
-                    "calling main-module refs from loaded modules is unsupported".to_string(),
-                ));
-            }
-
             let export_idx = func_map
                 .get(func_idx as usize)
                 .copied()
@@ -464,31 +590,8 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 )));
             };
 
-            let saved_pc = vm.pc;
-            let saved_next_pc = vm.next_pc;
-
-            vm.pc = entry_pc;
-            vm.halted = false;
             let mcall_frame_base = vm.frames.current_data_offset();
-
-            while !vm.halted && vm.pc < vm.module.code.len() {
-                let inst = vm.module.code[vm.pc].clone();
-                if vm.trace {
-                    vm.trace_instruction(&inst);
-                }
-                vm.resolve_operands(&inst)?;
-                vm.next_pc = vm.pc + 1;
-                crate::ops::dispatch(vm, &inst)?;
-                vm.pc = vm.next_pc;
-
-                if vm.frames.current_data_offset() < mcall_frame_base {
-                    break;
-                }
-            }
-
-            vm.pc = saved_pc;
-            vm.next_pc = saved_next_pc;
-            vm.halted = false;
+            run_nested_module_call(vm, None, entry_pc, mcall_frame_base)?;
         }
         ModuleKind::Loaded {
             module_idx,
@@ -511,57 +614,11 @@ pub(crate) fn op_mcall(vm: &mut VmState<'_>) -> Result<(), ExecError> {
                 }
             };
 
-            // Save current execution context
-            let saved_pc = vm.pc;
-            let saved_next_pc = vm.next_pc;
-            let saved_loaded_module = vm.current_loaded_module;
-
-            // Swap MP with the loaded module's persistent MP.
-            // This ensures module refs stored during execution persist
-            // in the loaded module's MP for subsequent calls.
-            let caller_virt_idx = vm.current_module_virt_idx();
-            let loaded_mp = std::mem::take(&mut vm.loaded_modules[module_idx].mp);
-            let parent_mp = std::mem::replace(&mut vm.mp, loaded_mp);
-            // Push the caller's MP onto the stack so cross-module virtual
-            // addresses can resolve to it during execution.
-            vm.caller_mp_stack.push((caller_virt_idx, parent_mp));
-
-            let loaded_code_len = vm.loaded_modules[module_idx].module.code.len();
-            vm.current_loaded_module = Some(module_idx);
-            vm.pc = entry_pc;
-            vm.halted = false;
-
             // Track the frame stack state before entering the loaded module.
             // The mcall frame was already activated above. Record the current
             // frame base so we can detect when Ret pops past it.
             let mcall_frame_base = vm.frames.current_data_offset();
-
-            // Execute the loaded module's code
-            while !vm.halted && vm.pc < loaded_code_len {
-                let inst = vm.loaded_modules[module_idx].module.code[vm.pc].clone();
-                if vm.trace {
-                    vm.trace_instruction(&inst);
-                }
-                vm.resolve_operands(&inst)?;
-                vm.next_pc = vm.pc + 1;
-                crate::ops::dispatch(vm, &inst)?;
-                vm.pc = vm.next_pc;
-
-                // If Ret popped our mcall frame (current frame's data area
-                // is now below where we started), the function returned.
-                if vm.frames.current_data_offset() < mcall_frame_base {
-                    break;
-                }
-            }
-
-            // Write back the loaded module's MP (preserving any changes),
-            // then restore the parent's MP from the stack.
-            let (_, parent_mp) = vm.caller_mp_stack.pop().unwrap_or_default();
-            vm.loaded_modules[module_idx].mp = std::mem::replace(&mut vm.mp, parent_mp);
-            vm.pc = saved_pc;
-            vm.next_pc = saved_next_pc;
-            vm.current_loaded_module = saved_loaded_module;
-            vm.halted = false;
+            call_loaded_module(vm, module_idx, entry_pc, mcall_frame_base)?;
         }
     }
 
@@ -777,8 +834,9 @@ pub(crate) fn op_casel(vm: &mut VmState<'_>) -> Result<(), ExecError> {
 }
 
 /// raise src:raise an exception.
-/// Searches the handler table for a matching handler at the current PC.
-/// If found, jumps to the handler. If not, returns a ThreadFault.
+/// Dispatches through the same handler search as every VM-raised exception:
+/// the executing module's handler table, walking out through the frame chain
+/// to the caller's `try` blocks. If nothing handles it, returns a ThreadFault.
 pub(crate) fn op_raise(vm: &mut VmState<'_>) -> Result<(), ExecError> {
     let str_id = vm.src_ptr()?;
     let msg = vm
@@ -787,44 +845,9 @@ pub(crate) fn op_raise(vm: &mut VmState<'_>) -> Result<(), ExecError> {
         .unwrap_or("unknown exception")
         .to_string();
 
-    let current_pc = vm.pc as i32;
-
-    // Search the handler table for a matching handler
-    for handler in &vm.module.handlers {
-        if current_pc < handler.begin_pc || current_pc >= handler.end_pc {
-            continue;
-        }
-        // Found a handler covering this PC. Search cases.
-        for case in &handler.cases {
-            match &case.name {
-                Some(name) if *name == msg => {
-                    vm.next_pc = case.pc as usize;
-                    let frame_base = vm.frames.current_data_offset();
-                    let off = frame_base + handler.exception_offset as usize;
-                    if off + 4 <= vm.frames.data.len() {
-                        crate::memory::write_word(&mut vm.frames.data, off, str_id as i32);
-                    }
-                    return Ok(());
-                }
-                None => {
-                    // Wildcard handler
-                    vm.next_pc = case.pc as usize;
-                    let frame_base = vm.frames.current_data_offset();
-                    let off = frame_base + handler.exception_offset as usize;
-                    if off + 4 <= vm.frames.data.len() {
-                        crate::memory::write_word(&mut vm.frames.data, off, str_id as i32);
-                    }
-                    return Ok(());
-                }
-                _ => continue,
-            }
-        }
-    }
-
-    // No handler found
-    Err(ExecError::ThreadFault(format!(
-        "unhandled exception: {msg}"
-    )))
+    // Pass the guest's own exception value through rather than a copy, so the
+    // handler sees the object it raised.
+    vm.raise_exception_with_value(&msg, str_id)
 }
 
 /// runt src:runtime check (module type validation). Stub: no-op.
@@ -856,6 +879,39 @@ mod tests {
     use crate::builtin::{BuiltinFunc, BuiltinModule};
     use crate::heap::HeapData;
     use crate::memory;
+
+    /// `/dis/lib/env.dis` is `Env` (five exports) and `/dis/env.dis` is
+    /// `Envcmd` (one). A probe directory pointing at `dis/` must not answer a
+    /// request for `dis/lib/` -- `sh` asks for `Env` and then calls its second
+    /// export, which fails outright against `Envcmd`.
+    #[test]
+    fn module_candidates_prefer_the_directory_the_path_names() {
+        let c = module_candidates(
+            "/dis/lib/env.dis",
+            "",
+            Some("/probe/dis:/probe/dis/lib".into()),
+        );
+        let specific = c
+            .iter()
+            .position(|p| p == "/probe/dis/lib/env.dis")
+            .expect("the lib/ path must be a candidate");
+        let generic = c
+            .iter()
+            .position(|p| p == "/probe/dis/env.dis")
+            .expect("the stripped path stays a fallback");
+        assert!(
+            specific < generic,
+            "dis/lib/env.dis must be tried before dis/env.dis, got {c:#?}"
+        );
+    }
+
+    #[test]
+    fn module_candidates_still_strip_for_a_flat_probe_dir() {
+        // A probe directory holding the modules directly still resolves, which
+        // is what the stripped forms are for.
+        let c = module_candidates("/dis/lib/string.dis", "", Some("/flat".into()));
+        assert!(c.contains(&"/flat/string.dis".to_string()));
+    }
 
     fn test_module() -> Module {
         Module {
@@ -1642,6 +1698,406 @@ mod tests {
             }
             other => panic!("expected ThreadFault, got {other:?}"),
         }
+    }
+
+    /// Regression: `raise` inside a loaded .dis module must search that
+    /// module's handler table. Searching the main module's table instead makes
+    /// the loaded module's own handlers unreachable, and can jump to a
+    /// main-module PC while the loaded module's code is executing.
+    #[test]
+    fn raise_uses_the_executing_loaded_modules_handler_table() {
+        use crate::vm::LoadedModule;
+
+        let main = module_with_handler(0, 10, 0, vec![ExceptionCase { name: None, pc: 42 }]);
+        let loaded = module_with_handler(
+            0,
+            10,
+            0,
+            vec![ExceptionCase {
+                name: None,
+                pc: 777,
+            }],
+        );
+
+        let mut vm = VmState::new(&main).expect("vm init");
+        vm.loaded_modules.push(LoadedModule {
+            module: loaded,
+            mp: Vec::new(),
+        });
+        vm.current_loaded_module = Some(0);
+
+        let msg_id = vm.heap.alloc(0, HeapData::Str("boom".to_string()));
+        vm.pc = 5;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = msg_id as i32;
+
+        op_raise(&mut vm).expect("the loaded module's handler should catch");
+        assert_eq!(
+            vm.next_pc, 777,
+            "raise must dispatch through the executing module's handler table"
+        );
+    }
+
+    /// A cross-module call runs the callee on the host stack, so a receive
+    /// with no data cannot suspend the thread. It must fault rather than run
+    /// on with the receive destination left unwritten.
+    #[test]
+    fn mcall_faults_when_the_callee_blocks_on_a_channel() {
+        use crate::vm::LoadedModule;
+        use ricevm_core::module::ExportEntry;
+        use ricevm_core::{AddressMode, Operand as CoreOperand};
+
+        let fp_operand = |offset: i32| CoreOperand {
+            mode: AddressMode::OffsetIndirectFp,
+            register1: offset,
+            register2: 0,
+        };
+        let mut loaded = test_module();
+        loaded.name = "blocking_callee".to_string();
+        loaded.code = vec![Instruction {
+            opcode: Opcode::Recv,
+            source: fp_operand(0),
+            middle: MiddleOperand::UNUSED,
+            destination: fp_operand(8),
+        }];
+        loaded.exports = vec![ExportEntry {
+            pc: 0,
+            frame_type: 0,
+            signature: 0,
+            name: "blocks".to_string(),
+        }];
+
+        let main = test_module();
+        let mut vm = VmState::new(&main).expect("vm init");
+        vm.loaded_modules.push(LoadedModule {
+            module: loaded,
+            mp: Vec::new(),
+        });
+        let mod_ref = vm.heap.alloc(
+            0,
+            HeapData::LoadedModule {
+                module_idx: 0,
+                func_map: vec![Some(0)],
+            },
+        );
+        let chan = vm.heap.alloc(
+            0,
+            HeapData::Channel {
+                elem_size: 4,
+                pending: None,
+            },
+        );
+
+        // The callee's frame holds the channel at fp[0].
+        let pending = vm.frames.alloc_pending(64).expect("alloc_pending");
+        memory::write_word(&mut vm.frames.data, pending, chan as i32);
+
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref as i32;
+
+        match op_mcall(&mut vm) {
+            Err(ExecError::ThreadFault(msg)) => {
+                assert!(msg.contains("deadlock"), "expected a deadlock fault: {msg}");
+            }
+            other => panic!("a blocked callee must fault, got {other:?}"),
+        }
+        assert!(
+            vm.blocked_channel.is_none(),
+            "the blocked marker must not leak into the caller's run loop"
+        );
+    }
+
+    /// A loaded module can hold a reference to the program that loaded it and
+    /// call back into it, which is how the shipped Inferno shell hands its own
+    /// functions to the modules it loads. The call has to find the main
+    /// module's data, which is parked on the caller stack while the loaded
+    /// module runs, and hand it back afterwards.
+    #[test]
+    fn a_loaded_module_can_call_back_into_the_main_module() {
+        use crate::vm::LoadedModule;
+        use ricevm_core::module::ExportEntry;
+
+        // The main module's export writes a marker into its own data, so the
+        // test can tell that it ran with the right data swapped in.
+        let mut main = test_module();
+        main.name = "the_program".to_string();
+        main.code = vec![
+            Instruction {
+                opcode: Opcode::Movw,
+                source: Operand {
+                    mode: ricevm_core::AddressMode::Immediate,
+                    register1: 99,
+                    register2: 0,
+                },
+                middle: MiddleOperand::UNUSED,
+                destination: Operand {
+                    mode: ricevm_core::AddressMode::OffsetIndirectMp,
+                    register1: 0,
+                    register2: 0,
+                },
+            },
+            Instruction {
+                opcode: Opcode::Ret,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            },
+        ];
+        main.exports = vec![ExportEntry {
+            pc: 0,
+            frame_type: 0,
+            signature: 0,
+            name: "callback".to_string(),
+        }];
+
+        let mut vm = VmState::new(&main).expect("vm init");
+        let main_mp = vec![0u8; 16];
+        vm.mp = main_mp.clone();
+
+        // Run as if a loaded module is executing: its own data is current and
+        // the main module's is parked on the caller stack, exactly as
+        // `run_nested_module_call` leaves things.
+        let loaded_mp = vec![0xABu8; 32];
+        vm.loaded_modules.push(LoadedModule {
+            module: test_module(),
+            mp: Vec::new(),
+        });
+        vm.current_loaded_module = Some(0);
+        vm.mp = loaded_mp.clone();
+        vm.caller_mp_stack.push((0, main_mp));
+
+        let mod_ref = vm.heap.alloc(
+            0,
+            HeapData::MainModule {
+                func_map: vec![Some(0)],
+            },
+        );
+        let pending = vm.frames.alloc_pending(64).expect("alloc_pending");
+
+        vm.pc = 5;
+        vm.next_pc = 6;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref as i32;
+
+        op_mcall(&mut vm).expect("a call back into the main module must be allowed");
+
+        // The main module's code ran against the main module's data.
+        let restored = vm
+            .caller_mp_stack
+            .first()
+            .map(|(_, mp)| mp.clone())
+            .expect("the main module's data must be back on the caller stack");
+        assert_eq!(
+            memory::read_word(&restored, 0),
+            99,
+            "the callback must write into the main module's own data"
+        );
+
+        // The loaded module is current again and holds its own data.
+        assert_eq!(vm.current_loaded_module, Some(0));
+        assert_eq!(vm.mp, loaded_mp, "the caller's data must be restored");
+        assert_eq!(vm.pc, 5, "the caller's pc must be restored");
+        assert_eq!(vm.next_pc, 6, "the caller's next_pc must be restored");
+    }
+
+    /// Regression: when a callee in a loaded module fails, `mcall` used to
+    /// return before swapping the module context back. The caller was left
+    /// running with the callee's module current, its own MP replaced by the
+    /// callee's, the loaded module's MP an empty `mem::take` leftover, and a
+    /// stale caller-MP-stack entry -- so exception unwinding resumed the caller
+    /// against the callee's module and every later call into it saw an empty MP.
+    #[test]
+    fn mcall_restores_the_module_context_when_the_callee_fails() {
+        use crate::vm::LoadedModule;
+        use ricevm_core::module::ExportEntry;
+        use ricevm_core::{AddressMode, Operand as CoreOperand};
+
+        let fp_operand = |offset: i32| CoreOperand {
+            mode: AddressMode::OffsetIndirectFp,
+            register1: offset,
+            register2: 0,
+        };
+        // The callee raises an exception no handler catches.
+        let mut loaded = test_module();
+        loaded.name = "failing_callee".to_string();
+        loaded.code = vec![Instruction {
+            opcode: Opcode::Raise,
+            source: fp_operand(0),
+            middle: MiddleOperand::UNUSED,
+            destination: Operand::UNUSED,
+        }];
+        loaded.exports = vec![ExportEntry {
+            pc: 0,
+            frame_type: 0,
+            signature: 0,
+            name: "boom".to_string(),
+        }];
+
+        let main = test_module();
+        let mut vm = VmState::new(&main).expect("vm init");
+        let loaded_mp = vec![0xABu8; 32];
+        vm.loaded_modules.push(LoadedModule {
+            module: loaded,
+            mp: loaded_mp.clone(),
+        });
+        let caller_mp = vec![0xCDu8; 16];
+        vm.mp = caller_mp.clone();
+
+        let mod_ref = vm.heap.alloc(
+            0,
+            HeapData::LoadedModule {
+                module_idx: 0,
+                func_map: vec![Some(0)],
+            },
+        );
+        let exception = vm.heap.alloc(0, HeapData::Str("fail:oops".to_string()));
+
+        let pending = vm.frames.alloc_pending(64).expect("alloc_pending");
+        memory::write_word(&mut vm.frames.data, pending, exception as i32);
+
+        vm.pc = 7;
+        vm.next_pc = 8;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref as i32;
+
+        match op_mcall(&mut vm) {
+            Err(ExecError::ThreadFault(msg)) => {
+                assert!(msg.contains("fail:oops"), "unexpected fault: {msg}");
+            }
+            other => panic!("an unhandled exception in the callee must fail, got {other:?}"),
+        }
+
+        assert_eq!(
+            vm.current_loaded_module, None,
+            "the caller's module must be current again"
+        );
+        assert_eq!(vm.mp, caller_mp, "the caller's MP must be restored");
+        assert_eq!(
+            vm.loaded_modules[0].mp, loaded_mp,
+            "the loaded module's MP must be written back, not left empty"
+        );
+        assert!(
+            vm.caller_mp_stack.is_empty(),
+            "the pushed caller MP entry must be popped"
+        );
+        assert_eq!(vm.pc, 7, "the caller's pc must be restored");
+        assert_eq!(vm.next_pc, 8, "the caller's next_pc must be restored");
+        assert_eq!(vm.unwind_floor, 0, "the unwind floor must be restored");
+    }
+
+    /// The same for the main-module branch, which never restored `pc`/`next_pc`
+    /// when the nested call failed.
+    #[test]
+    fn mcall_restores_the_callers_pc_when_a_main_module_callee_fails() {
+        use ricevm_core::module::ExportEntry;
+        use ricevm_core::{AddressMode, Operand as CoreOperand};
+
+        let fp_operand = |offset: i32| CoreOperand {
+            mode: AddressMode::OffsetIndirectFp,
+            register1: offset,
+            register2: 0,
+        };
+        let mut main = test_module();
+        main.code = vec![
+            Instruction {
+                opcode: Opcode::Exit,
+                source: Operand::UNUSED,
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            },
+            Instruction {
+                opcode: Opcode::Raise,
+                source: fp_operand(0),
+                middle: MiddleOperand::UNUSED,
+                destination: Operand::UNUSED,
+            },
+        ];
+        main.exports = vec![ExportEntry {
+            pc: 1,
+            frame_type: 0,
+            signature: 0,
+            name: "boom".to_string(),
+        }];
+
+        let mut vm = VmState::new(&main).expect("vm init");
+        let mod_ref = vm.heap.alloc(
+            0,
+            HeapData::MainModule {
+                func_map: vec![Some(0)],
+            },
+        );
+        let exception = vm.heap.alloc(0, HeapData::Str("fail:oops".to_string()));
+        let pending = vm.frames.alloc_pending(64).expect("alloc_pending");
+        memory::write_word(&mut vm.frames.data, pending, exception as i32);
+
+        vm.pc = 0;
+        vm.next_pc = 1;
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = pending as i32;
+        vm.mid = AddrTarget::Immediate;
+        vm.imm_mid = 0;
+        vm.dst = AddrTarget::Immediate;
+        vm.imm_dst = mod_ref as i32;
+
+        assert!(
+            op_mcall(&mut vm).is_err(),
+            "an unhandled exception in the callee must fail"
+        );
+        assert_eq!(vm.pc, 0, "the caller's pc must be restored");
+        assert_eq!(vm.next_pc, 1, "the caller's next_pc must be restored");
+        assert_eq!(vm.unwind_floor, 0, "the unwind floor must be restored");
+    }
+
+    /// Regression: an exception raised in a callee must unwind to a handler
+    /// covering the caller's call site instead of being reported as unhandled.
+    #[test]
+    fn raise_unwinds_to_a_caller_handler() {
+        let module = module_with_handler(
+            0,
+            5,
+            0,
+            vec![ExceptionCase {
+                name: Some("fail:oops".to_string()),
+                pc: 21,
+            }],
+        );
+        let mut vm = VmState::new(&module).expect("vm init");
+        let caller_base = vm.frames.current_base;
+
+        // Simulate `call`: the callee frame saves return pc 3, so the call
+        // instruction at pc 2 lies inside the handler's range.
+        let callee = vm.frames.alloc_pending(64).expect("alloc_pending");
+        vm.frames.activate_pending(callee, 3).expect("activate");
+        vm.pc = 20; // inside the callee, outside the handler's range
+
+        let msg_id = vm.heap.alloc(0, HeapData::Str("fail:oops".to_string()));
+        vm.src = AddrTarget::Immediate;
+        vm.imm_src = msg_id as i32;
+
+        op_raise(&mut vm).expect("the caller's handler should catch");
+
+        assert_eq!(vm.next_pc, 21, "should resume in the caller's handler");
+        assert_eq!(
+            vm.frames.current_base, caller_base,
+            "frames must unwind to the handler's frame"
+        );
+        assert_eq!(
+            memory::read_word(&vm.frames.data, vm.frames.current_data_offset()),
+            msg_id as i32,
+            "raise must pass the guest's own exception value to the handler"
+        );
     }
 
     /// op_raise must skip handlers whose PC range does not cover the current PC.

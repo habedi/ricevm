@@ -1,12 +1,12 @@
 [package]
 name = "ricevm-limbo"
+description = "The Limbo programming language compiler for RiceVM"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 publish = false
 license.workspace = true
-description = "The Limbo programming language compiler for RiceVM"
 
 [dependencies]
 ricevm_core.workspace = true

@@ -109,7 +109,7 @@ impl AudioState {
         };
         let buffer = Arc::clone(&self.buffer);
         let stream = device.build_output_stream(
-            &config,
+            config,
             move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                 let mut buf = buffer.lock().unwrap_or_else(|e| e.into_inner());
                 for sample in data.iter_mut() {

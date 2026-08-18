@@ -33,11 +33,8 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
-      # One entry failing must not cancel the other, or a green run on
-      # stable is reported as cancelled and its result is lost.
       fail-fast: false
       matrix:
-        # Define the Rust versions to test against
         rust-version: [ "1.90.0", "stable" ]
 
     steps:
@@ -58,12 +55,6 @@ jobs:
           sudo apt-get install -y make
           rustup component add rustfmt clippy
 
-      # Coverage runs once, on stable. `make install-deps` builds cargo-tarpaulin
-      # from source, and that tool's dependency tree needs a newer compiler than
-      # the minimum supported version, so installing it on the MSRV entry fails
-      # before a single test runs. The MSRV entry is there to prove the code
-      # builds and passes its tests on the oldest supported compiler, which it
-      # does without any of these tools.
       - name: Install coverage tooling
         if: matrix.rust-version == 'stable'
         run: make install-deps

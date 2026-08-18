@@ -33,7 +33,7 @@ jobs:
 
     strategy:
       matrix:
-        rust-version: [ "1.90.0", "stable" ]
+        rust-version: [ "1.92.0", "stable" ]
 
     steps:
       - name: Checkout code

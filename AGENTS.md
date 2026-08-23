@@ -29,7 +29,7 @@ reference compiler from Inferno OS. Priorities, in order:
 
 ## Writing Style
 
-- Write in simple, plain English. Use short sentences and everyday words. Keep every fact, name, number, link, and file path.
+- Write in simple, plain English. Use short sentences and everyday words.
 - Write correct and complete sentences. Start each sentence with a capital letter, capitalize proper nouns (Rust, Limbo, Inferno, and Dis), and leave
   common nouns lowercase in the middle of a sentence.
 - Avoid made-up words. Use participial phrases and abbreviations sparingly.

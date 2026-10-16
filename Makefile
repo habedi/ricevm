@@ -1,7 +1,6 @@
 # Variables
 BINARY_NAME := ricevm-cli
 BINARY := target/release/$(BINARY_NAME)
-PATH := /snap/bin:$(PATH)
 DEBUG_PROJ := 0
 RUST_BACKTRACE := 1
 ASSET_DIR := assets

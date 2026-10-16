@@ -65,7 +65,7 @@ reference compiler from Inferno OS. Priorities, in order:
 - `external/inferno-os/`: Git submodule of the Inferno OS repository (866 pre-compiled `.dis` files, Limbo source, and reference VM source in
   `libinterp/xec.c` for correctness validation).
 - `Makefile`: GNU Make wrapper around `cargo` commands (`make test`, `make build`, `make lint`, etc.).
-- `rust-toolchain.toml`: Pinned Rust toolchain (1.97.1) with `rustfmt`, `clippy`, and `rust-analyzer`. Everyone who builds through rustup gets this
+- `rust-toolchain.toml`: Pinned Rust toolchain (1.99.1) with `rustfmt`, `clippy`, and `rust-analyzer`. Everyone who builds through rustup gets this
   version, which keeps builds and lint output reproducible.
 - The workspace's `rust-version` (1.90.0) is the minimum supported version, and it is deliberately lower than the pinned toolchain. It records the
   oldest compiler the code actually builds on, which is what a packager building against a distribution's own rustc needs; edition 2024 puts a hard

@@ -2,77 +2,73 @@
   description = "RiceVM: A Dis virtual machine and Limbo compiler in Rust";
 
   inputs = {
+    self.submodules = true;
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
-      supportedSystems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
-      forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
+      forAllSystems = f: nixpkgs.lib.genAttrs supportedSystems (system:
+        let
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ rust-overlay.overlays.default ];
+          };
+          rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        in
+        f pkgs rustToolchain
+      );
     in
     {
-      devShells = forAllSystems (system:
-        let
-          pkgs = nixpkgs.legacyPackages.${system};
-        in
+      devShells = forAllSystems (pkgs: rustToolchain:
         {
           default = pkgs.mkShell {
             packages = with pkgs; [
-              # Rust toolchain
-              rustup
-
-              # Build dependencies
+              rustToolchain
+              gnumake
               pkg-config
-              openssl
-
-              # Optional: GUI support (SDL2)
               SDL2
-              SDL2_ttf
-
-              # Optional: audio support
-              alsa-lib
-
-              # Development tools
-              cargo-nextest
-              cargo-tarpaulin
               cargo-audit
-
-              # Documentation
-              python3Packages.mkdocs-material
-
-              # Git hooks
+              cargo-nextest
               pre-commit
+              uv
+              (python3.withPackages (ps: with ps; [ mkdocs mkdocs-material mkdocstrings-python ]))
+            ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              pkgs.alsa-lib
+              pkgs.cargo-tarpaulin
+              pkgs.gdb
             ];
-
-            # Ensure the linker can find SDL2 and OpenSSL
-            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [
-              SDL2
-              SDL2_ttf
-              openssl
-              alsa-lib
-            ]);
           };
         }
       );
 
-      packages = forAllSystems (system:
+      packages = forAllSystems (pkgs: rustToolchain:
         let
-          pkgs = nixpkgs.legacyPackages.${system};
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = rustToolchain;
+            rustc = rustToolchain;
+          };
         in
         {
-          default = pkgs.rustPlatform.buildRustPackage rec {
+          default = rustPlatform.buildRustPackage {
             pname = "ricevm";
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
-            src = ./.;
+            src = pkgs.lib.cleanSource self;
             cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [ "-p" "ricevm-cli" ];
 
-            nativeBuildInputs = with pkgs; [
-              pkg-config
-            ];
-
-            buildInputs = with pkgs; [
-              openssl
-            ];
+            meta = {
+              description = "A Dis virtual machine and Limbo compiler";
+              homepage = "https://github.com/habedi/ricevm";
+              license = with pkgs.lib.licenses; [ mit asl20 ];
+              mainProgram = "ricevm-cli";
+              platforms = supportedSystems;
+            };
           };
         }
       );

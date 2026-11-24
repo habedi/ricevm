@@ -35,7 +35,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust-version: [ "1.90.0", "stable" ]
+        rust-version: [ "1.99.1", "stable" ]
 
     steps:
       - name: Checkout repository
